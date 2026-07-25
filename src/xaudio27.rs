@@ -1,5 +1,4 @@
 use windows::core::{implement, IUnknown, IUnknown_Vtbl, GUID, HRESULT};
-use windows_interface::interface;
 use windows::Win32::Foundation::{BOOL, E_FAIL, S_OK};
 use windows::Win32::Media::Audio::XAudio2::{
     IXAudio2, IXAudio2MasteringVoice, IXAudio2SourceVoice, IXAudio2SubmixVoice, IXAudio2Voice,
@@ -11,6 +10,7 @@ use windows::Win32::Media::Audio::{
     AudioCategory_GameMedia, XAudio2, WAVEFORMATEX, WAVEFORMATEXTENSIBLE, WAVE_FORMAT_PCM,
 };
 use windows::Win32::System::SystemInformation::NTDDI_WIN10;
+use windows_interface::interface;
 
 use paste::paste;
 use std::ffi::c_void;

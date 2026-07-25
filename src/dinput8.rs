@@ -1,6 +1,6 @@
 //! This module handles functionality related to the original dinput8.dll
 use windows::{
-    core::{IUnknown, ComInterface, GUID, HRESULT},
+    core::{ComInterface, IUnknown, GUID, HRESULT},
     Win32::{
         Devices::HumanInterfaceDevice::{CLSID_DirectInput8, IDirectInput8A, IDirectInput8W},
         Foundation::{E_NOINTERFACE, HINSTANCE, S_OK},
@@ -9,7 +9,6 @@ use windows::{
 };
 
 /// This function simply redirects the one and only DirectInput8Create call to the real dinput8 DLL.
-#[no_mangle]
 #[export_name = "DirectInput8Create"]
 pub unsafe extern "C" fn directinput8_create(
     hinst: HINSTANCE,

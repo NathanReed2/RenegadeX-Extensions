@@ -126,7 +126,7 @@ pub fn init() -> anyhow::Result<()> {
         .context("failed to adjust memory protection for CreateFX")?;
 
         // Overwrite xapofx!CreateFX pointer with our hook.
-        (udk.add(UDK_CREATEFX_PTR_OFFSET) as *mut usize).write(createfx_hook as usize);
+        (udk.add(UDK_CREATEFX_PTR_OFFSET) as *mut usize).write(createfx_hook as *const () as usize);
     }
 
     Ok(())
