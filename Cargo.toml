@@ -36,13 +36,12 @@ features = [
     "Win32_System_SystemInformation",
     "Win32_System_SystemServices",
     "Win32_System_Threading",
+	"Win32_Graphics_Gdi",
+	"Win32_UI_WindowsAndMessaging",
 	"Win32_Media_Audio",
 	"Win32_Media_Audio_XAudio2",
 	"Win32_Media_Multimedia",
 ]
-
-[dependencies.windows-interface]
-version = "0.52.0"
 
 [dependencies.windows-interface]
 version = "0.52.0"

@@ -1,0 +1,5 @@
+# `retour`'s `static-detour` feature requires nightly (`unboxed_closures`, `tuple_trait`),
+# so the whole crate must be built on nightly. This matches CI (.github/workflows/Windows.yml).
+[toolchain]
+channel = "nightly"
+targets = ["x86_64-pc-windows-msvc"]
