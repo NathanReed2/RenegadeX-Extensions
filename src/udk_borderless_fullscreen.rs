@@ -485,75 +485,34 @@ fn monitor_bounds(window: HWND) -> Option<RECT> {
 /// +0xA8 right after it.
 #[cfg(all(target_arch = "x86_64", debug_assertions))]
 const VIEWPORT_RHI_OFFSET: usize = 0x9C;
-/// `FD3D11Viewport` members, matching the layout `udk_flip_model` relies on.
-#[cfg(all(target_arch = "x86_64", debug_assertions))]
-const D3D11_VIEWPORT_SIZE_X_OFFSET: usize = 0x1C;
-#[cfg(all(target_arch = "x86_64", debug_assertions))]
-const D3D11_VIEWPORT_SWAP_CHAIN_OFFSET: usize = 0x2C;
-#[cfg(all(target_arch = "x86_64", debug_assertions))]
-const IDXGI_SWAP_CHAIN_GET_DESC_INDEX: usize = 12;
 
-/// Reports the RHI's own idea of the viewport size and, decisively, the size DXGI
-/// thinks the back buffer is. If those disagree with the client area we know
-/// whether `Present` is being asked to scale at all.
+/// Reports whether the viewport currently owns an RHI resource.
+///
+/// This deliberately does not walk into the RHI object. The target build runs
+/// the D3D9 RHI, so `ViewportRHI` is an `FD3D9Viewport`; an earlier version of
+/// this function read it as an `FD3D11Viewport` and called vtable slot 12 of the
+/// pointer at +0x2C as `IDXGISwapChain::GetDesc`, which on D3D9 is an indirect
+/// call through an unrelated object.
+///
+/// The back-buffer size does not need to be read here anyway. D3D9 builds it in
+/// `FD3D9DynamicRHI::UpdateD3DDeviceFromViewports` (`D3D9Device.cpp`) as the
+/// per-axis maximum of every viewport's `SizeX`/`SizeY`, so it always equals the
+/// render resolution that `trace_geometry` already prints as `FViewport=`. What
+/// actually needs checking is the *client* area next to it, which is pure Win32.
 #[cfg(all(target_arch = "x86_64", debug_assertions))]
 fn trace_swap_chain(frame: *mut c_void) {
-    // Diagnostic-only pointer walk; compiled out of the release profile.
-    #[repr(C)]
-    #[derive(Default)]
-    struct BufferDesc {
-        width: u32,
-        height: u32,
-        refresh_numerator: u32,
-        refresh_denominator: u32,
-        format: i32,
-        scanline_ordering: i32,
-        scaling: i32,
-    }
-    type GetDesc = extern "system" fn(*mut c_void, *mut u8) -> i32;
-
     unsafe {
         if frame.is_null() {
             return;
         }
-        let rhi_viewport =
-            *((frame as *const u8).add(VIEWPORT_RHI_OFFSET) as *const *mut c_void);
-        if rhi_viewport.is_null() {
-            debug_log!("[borderless]   rhi: ViewportRHI is null");
-            return;
-        }
-        let rhi_size_x =
-            *((rhi_viewport as *const u8).add(D3D11_VIEWPORT_SIZE_X_OFFSET) as *const u32);
-        let rhi_size_y =
-            *((rhi_viewport as *const u8).add(D3D11_VIEWPORT_SIZE_X_OFFSET + 4) as *const u32);
-        let swap_chain =
-            *((rhi_viewport as *const u8).add(D3D11_VIEWPORT_SWAP_CHAIN_OFFSET)
-                as *const *mut c_void);
-        if swap_chain.is_null() {
-            debug_log!("[borderless]   rhi: FD3D11Viewport={rhi_size_x}x{rhi_size_y} swapchain=null");
-            return;
-        }
-
-        // DXGI_SWAP_CHAIN_DESC starts with DXGI_MODE_DESC.
-        let mut desc = [0u8; 128];
-        let vtable = *(swap_chain as *const *const *mut c_void);
-        let get_desc: GetDesc = std::mem::transmute(*vtable.add(IDXGI_SWAP_CHAIN_GET_DESC_INDEX));
-        let hr = get_desc(swap_chain, desc.as_mut_ptr());
-        if hr < 0 {
-            debug_log!(
-                "[borderless]   rhi: FD3D11Viewport={rhi_size_x}x{rhi_size_y} GetDesc failed {hr:#010X}"
-            );
-            return;
-        }
-        let buffer = &*(desc.as_ptr() as *const BufferDesc);
-        // Offsets after DXGI_MODE_DESC (28) + DXGI_SAMPLE_DESC (8) + usage/count (8).
-        let windowed = *(desc.as_ptr().add(48) as *const i32);
-        let swap_effect = *(desc.as_ptr().add(52) as *const i32);
+        let rhi_viewport = *((frame as *const u8).add(VIEWPORT_RHI_OFFSET) as *const *mut c_void);
         debug_log!(
-            "[borderless]   rhi: FD3D11Viewport={rhi_size_x}x{rhi_size_y} backbuffer={}x{} scaling={} windowed={windowed} swap_effect={swap_effect}",
-            buffer.width,
-            buffer.height,
-            buffer.scaling
+            "[borderless]   rhi: ViewportRHI={}",
+            if rhi_viewport.is_null() {
+                "null".to_string()
+            } else {
+                format!("{rhi_viewport:p}")
+            }
         );
     }
 }
