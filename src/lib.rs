@@ -7,8 +7,12 @@ mod xaudio27;
 
 mod dll;
 mod patch_utils;
+#[cfg(target_arch = "x86_64")]
+mod udk_array_append;
 mod udk_audio_channels;
 mod udk_borderless_fullscreen;
+mod udk_bulk_data_count;
+mod udk_compress_from_memory;
 mod udk_cook;
 #[cfg(target_arch = "x86_64")]
 mod udk_d3d9_flipex;
@@ -18,6 +22,7 @@ mod udk_fog_light_direction;
 mod udk_log;
 #[cfg(target_arch = "x86_64")]
 mod udk_mcp;
+mod udk_package_size_limit;
 mod udk_substance;
 mod udk_xaudio;
 
@@ -37,6 +42,26 @@ mod udk_xaudio;
 ///   actually take effect above 64.
 /// - `udk_filename_length`: disables the "filename is too long for cooking"
 ///   check (30-character limit) in `UObject::SavePackage`.
+/// - `udk_compress_from_memory`: forces `UObject::SavePackage` to stage cooked
+///   seekfree packages through a temp file instead of a 32-bit-indexed
+///   in-RAM `FBufferArchive`, so the combined `Startup.upk` no longer
+///   overflows that buffer's `INT` bookkeeping while being written.
+/// - `udk_bulk_data_count`: clamps an invalid (negative or overflowing)
+///   `FUntypedBulkData::ElementCount` to zero at the entry to
+///   `FUntypedBulkData::Serialize`, before it is written to disk. Fixes a PC
+///   cook crash where a texture's editor-only `SourceArt` had
+///   `ElementCount == INDEX_NONE`, so `ElementCount * GetElementSize()` came
+///   out `-1` and reached `appMemcpy` as a byte count. Names the offending
+///   object in the UDK log.
+/// - `udk_package_size_limit`: warns, naming the package and its remaining
+///   headroom, as a cooked package approaches the 2 GiB ceiling imposed by
+///   UE3's `INT` archive offsets, and explains the cause if one crosses it.
+///   Without this the only symptom is `Error seeking file` followed by a
+///   missing cooked file, which names neither the package nor the limit.
+/// - `udk_array_append`: backstop for the crash the above overflow produced
+///   (`FMemoryWriter::Serialize` with a negative byte count). With
+///   `udk_compress_from_memory` in place this should never fire; if it does,
+///   the package being written is genuinely too large and the log tells you so.
 /// - `udk_borderless_fullscreen`: borderless fullscreen window support.
 /// - `udk_d3d9_flipex`: opt-in D3D9Ex/FlipEx presentation path, enabled only
 ///   by the `-D3D9EX`/`-D3D9FLIPEX` command line switches; installs no hooks
@@ -50,6 +75,11 @@ pub fn post_udk_init() -> anyhow::Result<()> {
     udk_substance::init()?;
     udk_audio_channels::init()?;
     udk_filename_length::init()?;
+    udk_compress_from_memory::init()?;
+    udk_bulk_data_count::init()?;
+    udk_package_size_limit::init()?;
+    #[cfg(target_arch = "x86_64")]
+    udk_array_append::init()?;
     udk_borderless_fullscreen::init()?;
     #[cfg(target_arch = "x86_64")]
     udk_d3d9_flipex::init()?;

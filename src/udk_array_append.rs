@@ -117,11 +117,98 @@ fn find_fun_1401a2a00_offset() -> Option<usize> {
 /// below it fails and the game asserts/crashes. A legitimate call should
 /// never pass a negative byte count, so this hook treats that case as a
 /// no-op (skips the append) instead of letting it crash.
+/// Field offsets confirmed by disassembling `FUN_1401a2a00`
+/// (udk.exe+0x1A2A00..0x1A2A76) in the 12791 x64 build:
+///
+/// ```asm
+/// MOV RBX, qword ptr [RCX + 0x8c]   ; FMemoryWriter::Bytes (TArray<BYTE>*)
+/// MOV EAX, dword ptr [RCX + 0x88]   ; FMemoryWriter::Offset (INT)
+/// SUB EAX, dword ptr [RBX + 0x8]    ; - Bytes.ArrayNum
+/// ...
+/// MOV EDX, dword ptr [RBX + 0xc]    ; Bytes.ArrayMax
+/// ```
+///
+/// Note the `Bytes` reference sits at `+0x8c`, i.e. immediately after the
+/// 4-byte `Offset` with no padding, so it is an unaligned qword load.
+const OFFSET_FIELD: usize = 0x88;
+const BYTES_FIELD: usize = 0x8C;
+const ARRAY_NUM_FIELD: usize = 0x08;
+const ARRAY_MAX_FIELD: usize = 0x0C;
+
+/// Snapshot of the writer's 32-bit bookkeeping, for logging.
+struct WriterState {
+    offset: i32,
+    array_num: i32,
+    array_max: i32,
+}
+
+/// Reads `Offset` and the target array's `ArrayNum`/`ArrayMax`. Returns `None`
+/// if `this` or the array reference is not safely readable.
+fn read_writer_state(this: i64) -> Option<WriterState> {
+    if this <= 0 {
+        return None;
+    }
+
+    unsafe {
+        let base = this as usize;
+        let offset = (base + OFFSET_FIELD) as *const i32;
+        let bytes = ((base + BYTES_FIELD) as *const usize).read_unaligned();
+        if bytes == 0 {
+            return None;
+        }
+
+        Some(WriterState {
+            offset: offset.read_unaligned(),
+            array_num: ((bytes + ARRAY_NUM_FIELD) as *const i32).read_unaligned(),
+            array_max: ((bytes + ARRAY_MAX_FIELD) as *const i32).read_unaligned(),
+        })
+    }
+}
+
+/// Hook for `FMemoryWriter::Serialize`.
+///
+/// Two distinct 32-bit overflows can reach the `Bytes( Offset )` bounds
+/// check, and only the first was previously guarded:
+///
+/// * `count` (`Num`) negative - a caller asked to append a negative number of
+///   bytes.
+/// * `Offset` negative - the writer has already accumulated more than
+///   `INT_MAX` bytes, so `Offset += Num` has wrapped. `count` is perfectly
+///   valid in this case, which is why a `count < 0` test alone misses it.
+///
+/// `ArrayNum` wrapping negative also suppresses the `ArrayNum > ArrayMax`
+/// realloc (`JLE` is taken), so the buffer silently stops growing before the
+/// bounds check trips.
+///
+/// Skipping the append avoids the crash but *loses data* - anything logged
+/// here means the package being written is truncated and must not be shipped.
+/// The state dump exists to tell you which overflow you hit and how far over
+/// the limit you are.
 fn fun_1401a2a00_hook(this: i64, src: *mut c_void, count: i32) {
-    if count < 0 {
+    let state = read_writer_state(this);
+    let bad_offset = state.as_ref().is_some_and(|s| s.offset < 0);
+    let bad_num = state.as_ref().is_some_and(|s| s.array_num < 0);
+
+    if count < 0 || bad_offset || bad_num {
+        let detail = match &state {
+            Some(s) => format!(
+                "Offset={} ArrayNum={} ArrayMax={} (Offset+count would be {})",
+                s.offset,
+                s.array_num,
+                s.array_max,
+                (s.offset as i64) + (count as i64)
+            ),
+            None => String::from("<writer state unreadable>"),
+        };
+
         debug_log(&format!(
-            "FUN_1401a2a00 hook fired: count == {count} (negative), skipping append instead of crashing"
+            "FUN_1401a2a00 hook fired: count={count} bad_offset={bad_offset} bad_array_num={bad_num} {detail} \
+             -- 32-bit overflow in FMemoryWriter; skipping append to avoid the crash. \
+             THE PACKAGE BEING WRITTEN IS NOW TRUNCATED AND MUST NOT BE SHIPPED. \
+             If udk_compress_from_memory is active, this means the package genuinely exceeds \
+             the engine's 2 GB archive limit and its content must be reduced."
         ));
+
         return;
     }
 
