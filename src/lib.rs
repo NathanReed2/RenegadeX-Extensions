@@ -10,6 +10,8 @@ mod patch_utils;
 mod udk_audio_channels;
 mod udk_borderless_fullscreen;
 mod udk_cook;
+#[cfg(target_arch = "x86_64")]
+mod udk_d3d9_flipex;
 mod udk_filename_length;
 #[cfg(target_arch = "x86_64")]
 mod udk_fog_light_direction;
@@ -36,6 +38,9 @@ mod udk_xaudio;
 /// - `udk_filename_length`: disables the "filename is too long for cooking"
 ///   check (30-character limit) in `UObject::SavePackage`.
 /// - `udk_borderless_fullscreen`: borderless fullscreen window support.
+/// - `udk_d3d9_flipex`: opt-in D3D9Ex/FlipEx presentation path, enabled only
+///   by the `-D3D9EX`/`-D3D9FLIPEX` command line switches; installs no hooks
+///   otherwise.
 /// - `udk_fog_light_direction`: makes exponential height fog's two-tone
 ///   inscattering follow the fog actor's rotation when `InitFogConstants`
 ///   finds no dominant directional light, instead of falling back to world up.
@@ -46,6 +51,8 @@ pub fn post_udk_init() -> anyhow::Result<()> {
     udk_audio_channels::init()?;
     udk_filename_length::init()?;
     udk_borderless_fullscreen::init()?;
+    #[cfg(target_arch = "x86_64")]
+    udk_d3d9_flipex::init()?;
     #[cfg(target_arch = "x86_64")]
     udk_fog_light_direction::init()?;
     #[cfg(target_arch = "x86_64")]
