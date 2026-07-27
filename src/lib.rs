@@ -8,7 +8,6 @@ mod xaudio27;
 mod dll;
 mod patch_utils;
 #[cfg(target_arch = "x86_64")]
-mod udk_array_append;
 mod udk_audio_channels;
 mod udk_borderless_fullscreen;
 mod udk_bulk_data_count;
@@ -104,8 +103,6 @@ pub fn post_udk_init() -> anyhow::Result<()> {
     udk_pc_map_cook::init()?;
     #[cfg(target_arch = "x86_64")]
     udk_pcserver_script_cook::init()?;
-    // Do not enable udk_array_append for production cooks: if it fires, it
-    // deliberately truncates the package and the result cannot be shipped.
     udk_borderless_fullscreen::init()?;
     //#[cfg(target_arch = "x86_64")]
     //udk_d3d9_flipex::init()?;
