@@ -46,7 +46,9 @@
 //! *content* package `Engine`. The cooker writes both halves to one file and the
 //! last writer wins, so cooked script is silently replaced by cooked content.
 //!
-//! The compiled branch (`this + 0xC4` is the commandlet's `Platform`):
+//! ## Why the platform test is *not* widened
+//!
+//! The compiled branch (`this + 0xC4` is the commandlet's `Platform`) is:
 //!
 //! ```asm
 //! MOV  R8D, dword ptr [RCX + 0xC4]   ; this->Platform
@@ -57,18 +59,48 @@
 //! ...                                ; flatten + force platform extension
 //! ```
 //!
-//! Rewriting the first comparison to `CMP R8D, 2` / `JBE` makes the range
-//! `0..=2` take the preserving branch, adding `PLATFORM_WindowsServer` (2) while
-//! leaving `PLATFORM_Windows` (1) exactly as it was. `PLATFORM_Unknown` (0) is
-//! also swept in, but a cook never reaches here with it - the commandlet rejects
-//! an unparsed platform up front ("Unknown platform (%s) specified").
-//! `PLATFORM_MacOSX` keeps its own comparison, now only reached when the first
-//! falls through.
+//! Rewriting the first comparison to `CMP R8D,2` / `JBE` does fix script, and was
+//! the first thing tried. But the preserving branch keeps the *whole* source path,
+//! not just the extension, so it also relocates every **content** package from the
+//! cooked root into subdirectories mirroring the source tree
+//! (`CookedPCServer\UT3\Environments\Foo.upk`), the way `CookedPC` is laid out.
 //!
-//! Both edits are same-length and in place: the `imm8` of the `CMP`, and the
-//! second opcode byte of the two-byte `0F 8x rel32` jump (`JZ` `0x84` -> `JBE`
-//! `0x86`). The `rel32` displacement is untouched, so both conditional jumps
-//! keep pointing at the same label.
+//! Script does not need that. A script source is only one directory deep
+//! (`..\..\UDKGame\Script\Core.u`), and the preserving branch strips
+//! `appGameDir()` plus the first subdirectory, so script lands at the cooked root
+//! either way. The nesting is pure collateral, and it is harmful: stock PCServer
+//! writes content flat, so on any pre-existing deployment the newly nested copies
+//! do not overwrite the old flat ones. Both then sit in the cooked directory and
+//! every duplicated package triggers a blocking
+//! `Ambiguous package name: Using '...\UT3\Environments\Foo.upk', not
+//! '...\Foo.upk'` message box at server start - 800 of them on the SDK this was
+//! first tried against. `-full` does not clean them up either: it deletes the
+//! files the cooker is about to write, keyed on the *new* nested `DstFilename`,
+//! so the old flat names are never in the delete set.
+//!
+//! ## What is done instead
+//!
+//! The platform test is left alone, so PCServer keeps taking the `else` branch and
+//! content stays flat exactly as a stock PCServer cook writes it. Only the
+//! forced extension is corrected, by detouring `GetCookedPackageFilename` and
+//! rewriting the result's extension to `u` when the *source* was a `.u` script
+//! package and the target is `PLATFORM_WindowsServer`.
+//!
+//! The compiled signature is
+//! `FFilename __fastcall(UCookPackagesCommandlet* this, FFilename* result, const FFilename& Src)`
+//! - MSVC x64 puts the hidden return-buffer pointer in the second slot for a
+//! member function returning by value, which the prologue confirms:
+//!
+//! ```asm
+//! MOV  RDI, R8                       ; R8  = &SrcFilename
+//! MOV  R12, RDX                      ; RDX = return buffer
+//! MOV  R15, RCX                      ; RCX = this
+//! MOV  qword ptr [RDX], R14          ; result->Data     = NULL
+//! MOV  qword ptr [RDX + 8], R14      ; result->Num/Max  = 0
+//! ```
+//!
+//! Rewriting `...\Core.upk` to `...\Core.u` only ever shortens the string, so it
+//! is done in place - no reallocation, and the `FString`'s capacity is untouched.
 //!
 //! # Patch 2: `UClass::Serialize` writes fewer fields than it reads
 //!
@@ -351,6 +383,10 @@ use crate::patch_utils::debug_log;
 #[cfg(target_arch = "x86_64")]
 use crate::patch_utils::find_signature_offset;
 use anyhow::Context;
+#[cfg(target_arch = "x86_64")]
+use retour::static_detour;
+#[cfg(target_arch = "x86_64")]
+use std::ffi::c_void;
 
 /// Known offset (from the `udk.exe` module base) of the `MOV R8D,[RCX+0xC4]`
 /// that begins the platform test, taken from the 12791 (UDK-2015-01,
@@ -370,23 +406,146 @@ const COOKED_FILENAME_PLATFORM_SIG: [u8; 17] = [
     0x0F, 0x84, 0xC8, 0x00, 0x00, 0x00, // JZ LAB_preserve
 ];
 
-/// Offset of the `CMP` immediate within [`COOKED_FILENAME_PLATFORM_SIG`].
-#[cfg(target_arch = "x86_64")]
-const SIG_CMP_IMMEDIATE_SKEW: usize = 10;
-
-/// Offset of the jump's second opcode byte within
-/// [`COOKED_FILENAME_PLATFORM_SIG`].
-#[cfg(target_arch = "x86_64")]
-const SIG_JUMP_OPCODE_SKEW: usize = 12;
-
-/// `PLATFORM_WindowsServer`, the highest platform value that should reach the
-/// path-preserving branch once the comparison becomes `JBE`.
+/// `UE3::PLATFORM_WindowsServer`.
 #[cfg(target_arch = "x86_64")]
 const PLATFORM_WINDOWS_SERVER: u8 = 2;
 
-/// Second opcode byte of `JBE rel32`, replacing `JZ rel32`'s `0x84`.
+/// Known offset (from the `udk.exe` module base) of
+/// `UCookPackagesCommandlet::GetCookedPackageFilename`'s entry point, taken from
+/// the 12791 x64 build's exception directory.
 #[cfg(target_arch = "x86_64")]
-const JBE_REL32_OPCODE: u8 = 0x86;
+const GET_COOKED_PACKAGE_FILENAME_OFFSET: usize = 0x011B_1070;
+
+/// Distance from the function's entry to [`COOKED_FILENAME_PLATFORM_SIG`]. The
+/// prologue is boilerplate that appears all over the image, so the entry is
+/// located by scanning for the (unique) platform test inside the function and
+/// stepping back. Passed to `find_signature_offset` as its `skew`.
+#[cfg(target_arch = "x86_64")]
+const SIG_TO_FUNCTION_START_SKEW: usize =
+    COOKED_FILENAME_PLATFORM_TEST_OFFSET - GET_COOKED_PACKAGE_FILENAME_OFFSET;
+
+/// Byte offset of `UCookPackagesCommandlet::Platform` within the commandlet, as
+/// read by the platform test itself (`[RCX + 0xC4]`).
+#[cfg(target_arch = "x86_64")]
+const COMMANDLET_PLATFORM_FIELD_OFFSET: usize = 0xC4;
+
+/// UE3's `FString` (and therefore `FFilename`) is a `TArray<TCHAR>`: a heap
+/// pointer plus element count and capacity. `num` counts the terminating NUL,
+/// which `GetCookedPackageExtension` confirms - it builds `".upk"` with
+/// `num == 5`.
+#[cfg(target_arch = "x86_64")]
+#[repr(C)]
+struct UnrealString {
+    data: *mut u16,
+    num: i32,
+    max: i32,
+}
+
+#[cfg(target_arch = "x86_64")]
+// `FFilename UCookPackagesCommandlet::GetCookedPackageFilename(const FFilename&)`.
+//
+// MSVC x64 returns the `FFilename` through a hidden buffer pointer, which for a
+// member function lands in the *second* argument slot, so the real argument
+// arrives in `R8`.
+static_detour! {
+    static GetCookedPackageFilenameHook: extern "C" fn(*mut c_void, *mut UnrealString, *const UnrealString) -> *mut UnrealString;
+}
+
+/// Reads `this->Platform`.
+#[cfg(target_arch = "x86_64")]
+fn commandlet_platform(commandlet: *mut c_void) -> u32 {
+    if commandlet.is_null() {
+        return 0;
+    }
+
+    unsafe {
+        (commandlet as *const u8)
+            .add(COMMANDLET_PLATFORM_FIELD_OFFSET)
+            .cast::<u32>()
+            .read_unaligned()
+    }
+}
+
+/// The string's characters, excluding the terminating NUL.
+#[cfg(target_arch = "x86_64")]
+unsafe fn string_chars<'a>(string: *const UnrealString) -> Option<&'a [u16]> {
+    let string = unsafe { string.as_ref() }?;
+    if string.data.is_null() || string.num <= 1 {
+        return None;
+    }
+    Some(unsafe { std::slice::from_raw_parts(string.data, (string.num - 1) as usize) })
+}
+
+/// Index of the last `.` in `chars`.
+#[cfg(target_arch = "x86_64")]
+fn extension_dot(chars: &[u16]) -> Option<usize> {
+    chars.iter().rposition(|&c| c == b'.' as u16)
+}
+
+/// Whether the cooker was handed a compiled script package, i.e. one whose
+/// extension is exactly `u`. Content is `.upk` and maps are `.udk`, so neither
+/// matches.
+#[cfg(target_arch = "x86_64")]
+fn is_script_source(source: *const UnrealString) -> bool {
+    let Some(chars) = (unsafe { string_chars(source) }) else {
+        return false;
+    };
+    let Some(dot) = extension_dot(chars) else {
+        return false;
+    };
+
+    chars.len() == dot + 2 && (chars[dot + 1] | 0x20) == b'u' as u16
+}
+
+/// Rewrites the destination's extension to `u` in place. Only ever shortens the
+/// string (`.upk` -> `.u`), so the existing allocation is reused and the
+/// capacity is left alone.
+#[cfg(target_arch = "x86_64")]
+unsafe fn force_script_extension(destination: *mut UnrealString) {
+    let Some(destination) = (unsafe { destination.as_mut() }) else {
+        return;
+    };
+    if destination.data.is_null() || destination.num <= 1 {
+        return;
+    }
+
+    let length = (destination.num - 1) as usize;
+    let Some(dot) = extension_dot(unsafe { std::slice::from_raw_parts(destination.data, length) })
+    else {
+        return;
+    };
+
+    // '.', 'u', NUL
+    let wanted = dot + 3;
+    if wanted > destination.max as usize {
+        return;
+    }
+
+    unsafe {
+        destination.data.add(dot + 1).write(b'u' as u16);
+        destination.data.add(dot + 2).write(0);
+    }
+    destination.num = wanted as i32;
+}
+
+/// Restores the `.u` extension that the flattening branch replaces with the
+/// platform's content extension, without disturbing where the file is written.
+#[cfg(target_arch = "x86_64")]
+fn on_get_cooked_package_filename(
+    commandlet: *mut c_void,
+    destination: *mut UnrealString,
+    source: *const UnrealString,
+) -> *mut UnrealString {
+    let returned = GetCookedPackageFilenameHook.call(commandlet, destination, source);
+
+    if commandlet_platform(commandlet) == u32::from(PLATFORM_WINDOWS_SERVER)
+        && is_script_source(source)
+    {
+        unsafe { force_script_extension(destination) };
+    }
+
+    returned
+}
 
 /// Known offset (from the `udk.exe` module base) of the `TEST ebx,ebx` that
 /// begins `UClass::Serialize`'s editor-only field guard, taken from the 12791
@@ -524,35 +683,36 @@ pub fn init() -> anyhow::Result<()> {
     {
         let range = UDK_RANGE.get().context("UDK_RANGE not set")?;
 
-        let (filename_offset, filename_count) = find_signature_offset(
+        let (function_offset, function_count) = find_signature_offset(
             &COOKED_FILENAME_PLATFORM_SIG,
-            COOKED_FILENAME_PLATFORM_TEST_OFFSET,
-            0,
+            GET_COOKED_PACKAGE_FILENAME_OFFSET,
+            SIG_TO_FUNCTION_START_SKEW,
         );
-        debug_log!("pcserver-script-cook filename signature matches: {filename_count}");
+        debug_log!("pcserver-script-cook filename signature matches: {function_count}");
 
-        let filename_offset = filename_offset
+        let function_offset = function_offset
             .context("Failed to find GetCookedPackageFilename platform test signature")?;
-        let test_address = range.start.saturating_add(filename_offset);
+        let function_address = range.start.saturating_add(function_offset);
 
         debug_log!(
-            "udk_pcserver_script_cook: patching platform test at 0x{test_address:X} (sig offset 0x{filename_offset:X}) to CMP R8D,2 / JBE, so PCServer cooks keep script package paths and extensions"
+            "udk_pcserver_script_cook: hooking GetCookedPackageFilename at 0x{function_address:X} (offset 0x{function_offset:X}), so PCServer cooks keep the .u extension on script while content keeps its flat stock layout"
         );
 
         unsafe {
-            write_byte(
-                test_address.saturating_add(SIG_CMP_IMMEDIATE_SKEW),
-                PLATFORM_WINDOWS_SERVER,
-                "the platform test immediate",
-            )?;
-            write_byte(
-                test_address.saturating_add(SIG_JUMP_OPCODE_SKEW),
-                JBE_REL32_OPCODE,
-                "the platform test jump opcode",
-            )?;
+            let target = std::mem::transmute::<
+                usize,
+                extern "C" fn(*mut c_void, *mut UnrealString, *const UnrealString) -> *mut UnrealString,
+            >(function_address);
+
+            GetCookedPackageFilenameHook
+                .initialize(target, on_get_cooked_package_filename)
+                .context("Failed to initialize the GetCookedPackageFilename hook")?;
+            GetCookedPackageFilenameHook
+                .enable()
+                .context("Failed to enable the GetCookedPackageFilename hook")?;
         }
 
-        debug_log!("udk_pcserver_script_cook: filename patch applied successfully");
+        debug_log!("udk_pcserver_script_cook: filename hook installed successfully");
 
         let (guard_offset, guard_count) = find_signature_offset(
             &CLASS_SERIALIZE_GUARD_SIG,
