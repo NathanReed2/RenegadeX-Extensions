@@ -307,26 +307,36 @@
 //! On a console that is harmless: those packages exist only to carry texture
 //! mips, and the objects themselves are re-cooked into the combined
 //! `Startup.xxx`. A PCServer cook builds no combined startup package
-//! (`[Engine.StartupPackages]` is empty in the generated platform ini), so the
-//! stripped objects simply cease to exist and the engine cannot resolve the
-//! special materials named in `[Engine.Engine]`.
+//! (`[Engine.StartupPackages]` has no `+Package=` entries in this game's config),
+//! so the stripped objects simply cease to exist and the engine cannot resolve
+//! the special materials named in `[Engine.Engine]`.
 //!
-//! Widening the `PLATFORM_Windows` test is the right fix rather than just forcing
-//! the flag, because all three things the block does are wanted for a dedicated
-//! server: keep the non-texture objects, create the destination directory (patch
-//! 1 gives PCServer the same nested output paths PC uses, so this is now load
-//! bearing), and keep shader caches from being dragged into other packages. It
-//! also subsumes the `bStripEverythingButTextures` expression above, which is
-//! only read after this block.
+//! ## Why this is *not* fixed by widening the platform test
 //!
-//! ```asm
-//! CMP  dword ptr [R13 + 0xC4], 1     ; this->Platform == PLATFORM_Windows
-//! JNZ  LAB_skip
-//! MOV  dword ptr [RBP + 8], 0        ; bStripEverythingButTextures = FALSE
-//! ```
+//! Rewriting that `CMP` to `2`/`JA` like the others does make the server boot,
+//! and it is tempting because the block's other two jobs (create the destination
+//! directory, keep shader caches out of other packages) are wanted here too. It
+//! was tried and reverted, because it is catastrophic for size:
 //!
-//! Same rewrite again: `CMP ..., 2` / `JA`. Here the jump is a `rel32`, so the
-//! edited byte is the second of its two opcode bytes (`0F 85` -> `0F 87`).
+//! | package | stock PCServer | with the test widened | `-platform=PC` |
+//! |---|---|---|---|
+//! | `RX_Field_2025.upk` | 14 KB | 226 MB | 32 MB |
+//! | `RX_jukebox_02.upk` | (stub) | 290 MB | 16 MB |
+//! | whole cook | ~90 MB | **6.4 GB** | 7.6 GB |
+//!
+//! Worse than merely "unstripped": the result is *larger than the PC cook*.
+//! Every `SoundNodeWave` comes out ~18x its PC size because the platform-keyed
+//! sound path leaves the raw PCM in place instead of the Ogg Vorbis
+//! `CompressedPCData` a PC cook keeps, and nothing then strips it. A dedicated
+//! server needs neither.
+//!
+//! The point of `-platform=PCServer` is a small, low-RAM data set, so the
+//! stripping has to stay. The engine's handful of required startup objects are
+//! instead kept alive through config, by naming them in
+//! `[Engine.PackagesToAlwaysCook]` as `SeekFreePackage=` entries. That makes them
+//! `bIsStandaloneSeekfree`, which puts them outside the "not required" list that
+//! the texture-only stripping applies to, so they cook intact while everything
+//! else stays stubbed. See `UDKGame\Config\PCServer\PCServerEngine.ini`.
 //!
 //! # What is deliberately *not* patched
 //!
@@ -494,36 +504,6 @@ const NON_NATIVE_SORT_SIG: [u8; 10] = [
     0x85, 0xC0, // TEST EAX, EAX
 ];
 
-/// Known offset (from the `udk.exe` module base) of the
-/// `CMP dword ptr [R13+0xC4], 1` that opens the PC-only branch of
-/// `SaveCookedPackage`, taken from the 12791 x64 build.
-#[cfg(target_arch = "x86_64")]
-const SAVE_COOKED_PC_BRANCH_OFFSET: usize = 0x011E_96F4;
-
-/// Signature covering the platform test and the first opcode byte of the jump
-/// that skips the PC-only block:
-/// `CMP dword ptr [R13+0xC4],1; JNZ rel32`.
-///
-/// Verified unique in the 12791 x64 image (exactly one match).
-#[cfg(target_arch = "x86_64")]
-const SAVE_COOKED_PC_BRANCH_SIG: [u8; 10] = [
-    0x41, 0x83, 0xBD, 0xC4, 0x00, 0x00, 0x00, 0x01, // CMP dword ptr [R13 + 0xC4], 1
-    0x0F, 0x85, // JNZ rel32 (skip the PC-only block)
-];
-
-/// Offset of the `CMP`'s `imm8` within [`SAVE_COOKED_PC_BRANCH_SIG`].
-#[cfg(target_arch = "x86_64")]
-const SIG_SAVE_COOKED_IMMEDIATE_SKEW: usize = 7;
-
-/// Offset of the second opcode byte of the `rel32` jump within
-/// [`SAVE_COOKED_PC_BRANCH_SIG`].
-#[cfg(target_arch = "x86_64")]
-const SIG_SAVE_COOKED_JUMP_OPCODE_SKEW: usize = 9;
-
-/// Second opcode byte of `JA rel32`, replacing `JNZ rel32`'s `0x85`.
-#[cfg(target_arch = "x86_64")]
-const JA_REL32_OPCODE: u8 = 0x87;
-
 /// Overwrites a single byte inside `udk.exe`'s image.
 #[cfg(target_arch = "x86_64")]
 unsafe fn write_byte(address: usize, value: u8, what: &'static str) -> anyhow::Result<()> {
@@ -681,35 +661,6 @@ pub fn init() -> anyhow::Result<()> {
 
         debug_log!("udk_pcserver_script_cook: non-native script sort patch applied successfully");
 
-        let (save_offset, save_count) = find_signature_offset(
-            &SAVE_COOKED_PC_BRANCH_SIG,
-            SAVE_COOKED_PC_BRANCH_OFFSET,
-            0,
-        );
-        debug_log!("pcserver-script-cook SaveCookedPackage branch matches: {save_count}");
-
-        let save_offset = save_offset
-            .context("Failed to find the SaveCookedPackage platform branch signature")?;
-        let save_address = range.start.saturating_add(save_offset);
-
-        debug_log!(
-            "udk_pcserver_script_cook: patching SaveCookedPackage's platform branch at 0x{save_address:X} (sig offset 0x{save_offset:X}) to CMP 2 / JA, so a PCServer cook keeps non-texture objects, creates nested output directories and excludes shader caches"
-        );
-
-        unsafe {
-            write_byte(
-                save_address.saturating_add(SIG_SAVE_COOKED_IMMEDIATE_SKEW),
-                PLATFORM_WINDOWS_SERVER,
-                "the SaveCookedPackage platform branch immediate",
-            )?;
-            write_byte(
-                save_address.saturating_add(SIG_SAVE_COOKED_JUMP_OPCODE_SKEW),
-                JA_REL32_OPCODE,
-                "the SaveCookedPackage platform branch jump opcode",
-            )?;
-        }
-
-        debug_log!("udk_pcserver_script_cook: SaveCookedPackage patch applied successfully");
     }
 
     debug_log!("udk_pcserver_script_cook::init done");

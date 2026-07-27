@@ -24,6 +24,8 @@ mod udk_log;
 mod udk_mcp;
 mod udk_package_size_limit;
 mod udk_pc_map_cook;
+#[cfg(target_arch = "x86_64")]
+mod udk_pcserver_script_cook;
 mod udk_substance;
 mod udk_xaudio;
 
@@ -62,6 +64,19 @@ mod udk_xaudio;
 /// - `udk_pc_map_cook`: preserves separately cooked content-package imports
 ///   for explicit `-platform=PC` map cooks instead of force-exporting every
 ///   dependency into one map, while retaining the caller's seek-free handling.
+/// - `udk_pcserver_script_cook`: makes a `-platform=PCServer` cook produce
+///   script a `-seekfreeloadingserver` dedicated server can load, by removing
+///   four places where `PLATFORM_WindowsServer` is treated as console-like even
+///   though the cook is written and read back by this same non-console binary:
+///   the path/extension test in `GetCookedPackageFilename` (script was written
+///   as `.upk` and overwritten by same-named content), `UClass::Serialize`'s
+///   editor-only field guard (written against `GCookingTarget` but read against
+///   `GPatchingTarget`, so 28 fewer bytes per class were written than read -
+///   `Bad name index -1/822`), `PLATFORM_FilterEditorOnly` (which drops
+///   editor-only `UProperty` objects that this binary's native class layout
+///   still has, so class defaults deserialise onto native fields), and the two
+///   gates that discard non-native (mod) script. Needs
+///   `UDKGame\Config\PCServer\PCServerEngine.ini` - see the module docs.
 /// - `udk_array_append`: backstop for the crash the above overflow produced
 ///   (`FMemoryWriter::Serialize` with a negative byte count). With
 ///   `udk_compress_from_memory` in place this should never fire; if it does,
@@ -83,6 +98,8 @@ pub fn post_udk_init() -> anyhow::Result<()> {
     udk_bulk_data_count::init()?;
     udk_package_size_limit::init()?;
     udk_pc_map_cook::init()?;
+    #[cfg(target_arch = "x86_64")]
+    udk_pcserver_script_cook::init()?;
     // Do not enable udk_array_append for production cooks: if it fires, it
     // deliberately truncates the package and the result cannot be shipped.
     udk_borderless_fullscreen::init()?;
