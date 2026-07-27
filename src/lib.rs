@@ -21,6 +21,7 @@ mod udk_fog_light_direction;
 mod udk_log;
 #[cfg(target_arch = "x86_64")]
 mod udk_mcp;
+mod udk_mt_shader_sandbox;
 mod udk_package_size_limit;
 mod udk_pc_map_cook;
 #[cfg(target_arch = "x86_64")]
@@ -60,6 +61,13 @@ mod udk_xaudio;
 ///   UE3's `INT` archive offsets, and explains the cause if one crosses it.
 ///   Without this the only symptom is `Error seeking file` followed by a
 ///   missing cooked file, which names neither the package nor the limit.
+/// - `udk_mt_shader_sandbox`: stages the shader subdirectories that
+///   `UCookPackagesCommandlet::PrepareShaderFiles` leaves out of each
+///   multithreaded cook child's private sandbox. It copies `Shaders\Binaries`
+///   non-recursively, so `Binaries\RealD` never arrives and any map needing
+///   `RealD/CommonDepth.usf` dies with `Couldn't load shader file` - which then
+///   takes down every sibling child, and with them the whole `-Processes=N`
+///   cook, behind the parent's uninformative `Child process crashed:`.
 /// - `udk_pc_map_cook`: preserves separately cooked content-package imports
 ///   for explicit `-platform=PC` map cooks instead of force-exporting every
 ///   dependency into one map, while retaining the caller's seek-free handling.
@@ -100,6 +108,7 @@ pub fn post_udk_init() -> anyhow::Result<()> {
     udk_compress_from_memory::init()?;
     udk_bulk_data_count::init()?;
     udk_package_size_limit::init()?;
+    udk_mt_shader_sandbox::init()?;
     udk_pc_map_cook::init()?;
     #[cfg(target_arch = "x86_64")]
     udk_pcserver_script_cook::init()?;
