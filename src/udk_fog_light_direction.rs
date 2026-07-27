@@ -1,4 +1,5 @@
-//! Drives exponential height fog's two-tone inscattering from the fog actor's rotation.
+//! Drives exponential height fog's two-tone inscattering from a dedicated
+//! `HeightFog` actor's rotation.
 //!
 //! `FSceneRenderer::InitFogConstants` picks the direction that blends
 //! `LightInscatteringColor` into `OppositeLightColor` by scanning the scene's
@@ -19,9 +20,45 @@
 //!    light environment when `GSystemSettings.bAllowDynamicLights` is FALSE.
 //!    The light is then absent from the list whatever its type.
 //!
-//! This module detours `InitFogConstants`, lets it run, and replaces only that
-//! world-up fallback with the fog actor's own rotation. A level that already
-//! resolves a dominant directional light is left untouched.
+//! This module detours `InitFogConstants`, lets it run, and then overwrites that
+//! direction with the rotation of a **separate** fog actor, so the direction is
+//! authored independently of the `ExponentialHeightFog` actor that supplies
+//! every other fog parameter.
+//!
+//! # The direction actor
+//!
+//! Place a legacy `HeightFog` actor (`Engine.HeightFog`, ClassGroup `Fog`,
+//! `showcategories(Movement)`) anywhere in the level and rotate it. Its rotation
+//! is the only thing read; nothing else about it matters.
+//!
+//! `HeightFog` is the right carrier because in a level that also has an
+//! `ExponentialHeightFog` it is provably inert on PC:
+//!
+//!  * `SetFogShaders` takes the `Scene->ExponentialFogs.Num() > 0` branch and
+//!    binds `TExponentialHeightFogPixelShader`, so the four-layer height fog
+//!    shaders that would consume `Scene->Fogs` are never selected;
+//!  * the vertex shader that branch does bind, `THeightFogVertexShader<1>`,
+//!    passes the layer heights down in `OutTexCoordAndHeightRelativeZ.zw`, and
+//!    `ExponentialPixelMain` reads only `.xy` and `ScreenVector` - the layer
+//!    values reach no arithmetic; and
+//!  * the one path that renders one-layer height fog outside `RenderFog`,
+//!    `RenderQuarterDownsampledDepthAndFog` behind ambient occlusion, has its
+//!    whole body inside `#if XBOX` and returns FALSE here, so
+//!    `bOneLayerHeightFogRenderedInAO` stays FALSE.
+//!
+//! `UHeightFogComponent::SetParentToWorld` only reads the origin's Z, so
+//! rotating the actor has no effect on the engine either. The actor is a pure
+//! marker.
+//!
+//! The corollary is worth stating: in a level with **no** `ExponentialHeightFog`
+//! a `HeightFog` actor renders normally, as it always has. This module writes
+//! nothing in that case - `DominantDirectionalLightDirection` only reaches a
+//! shader through the exponential fog path.
+//!
+//! When the level has no `HeightFog` actor, the engine's own result is left
+//! alone, so this hook is inert until a direction actor is placed. When one is
+//! present its rotation always wins, including over a `DominantDirectionalLight`
+//! the renderer did resolve; placing the actor is the opt-in.
 //!
 //! Rotating the fog actor is exactly equivalent to rotating the dominant light.
 //! `ULightComponent::SetParentToWorld` builds `WorldToLight` as
@@ -32,14 +69,14 @@
 //! rotation, i.e. `Rotation.Vector()`. So the engine's `-GetDirection()` and
 //! this module's `-Rotation.Vector()` are the same vector.
 //!
-//! RVAs and offsets were read in Ghidra from `RenXSDK/UDK.exe`, whose `.text`
-//! hash is pinned in `dll.rs`. The object offsets are additionally proven at
-//! runtime before anything is written - see [`fog_actor_rotation`].
+//! RVAs and offsets were read from `Firestorm/Binaries/Win64/UDK.exe`, whose
+//! `.text` hash is pinned in `dll.rs`. The object offsets are additionally
+//! proven at runtime before anything is written - see [`owning_actor_rotation`].
 
 #![cfg(target_arch = "x86_64")]
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use anyhow::{bail, Context};
 use retour::static_detour;
@@ -47,19 +84,15 @@ use retour::static_detour;
 use crate::dll::UDK_RANGE;
 use crate::patch_utils::debug_log;
 
-/// Forces the fog actor's rotation to win even when the renderer did resolve a
-/// dominant directional light. Without it the actor's rotation only replaces
-/// the world-up fallback, which means a level that still has a working dominant
-/// light shows no change - useful in production, useless for checking the hook.
-const FORCE_OPTION: &str = "-FogActorRotation";
-
-/// TRUE when [`FORCE_OPTION`] was passed.
-static FORCE_ACTOR_ROTATION: AtomicBool = AtomicBool::new(false);
-
 /// Last (pitch, yaw) that was applied, packed, so the log records changes
 /// instead of one line per view per frame. Starts at a value no rotation
 /// produces, because both halves are masked to 16 bits before packing.
 static LAST_LOGGED_ROTATION: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Stored in [`LAST_LOGGED_ROTATION`] once the "no direction actor" line has
+/// been logged, so a level without one does not repeat it every frame. No real
+/// rotation packs this high; the packed form fits in 32 bits.
+const NO_DIRECTION_ACTOR: u64 = u64::MAX - 1;
 
 /// `FSceneRenderer::InitFogConstants`.
 const INIT_FOG_CONSTANTS_RVA: usize = 0x00AF_5E90;
@@ -82,11 +115,22 @@ const VIEW_FOG_LIGHT_DIRECTION: usize = 0x1138;
 const VIEW_FOG_FLAGS: usize = 0x1148;
 const RENDER_EXPONENTIAL_FOG_BIT: u32 = 1;
 
-/// `FScene::ExponentialFogs`, a `TArray<FExponentialHeightFogSceneInfo>`.
-const SCENE_EXPONENTIAL_FOGS_DATA: usize = 0x4EC8;
+/// `FScene::Fogs`, a `TArray<FHeightFogSceneInfo>` - the legacy `HeightFog`
+/// components, and so where the direction actor is found. Confirmed by
+/// `mov ecx,[rax+0x4EC0]` feeding the `Min(Scene->Fogs.Num(),4)` clamp and
+/// `mov rax,[rdi+0x4EB8]` loading the array that the layer loop indexes.
+const SCENE_FOGS_DATA: usize = 0x4EB8;
+const SCENE_FOGS_NUM: usize = 0x4EC0;
+/// `sizeof(FHeightFogSceneInfo)`, from the layer loop's `lea rsi,[rax+rax*4];
+/// shl rsi,3` index scaling and its matching `sub rsi,0x28` step.
+const HEIGHT_FOG_STRIDE: usize = 0x28;
+/// `FHeightFogSceneInfo::Component`, at the very start of the struct: the same
+/// loop reads `Height` at `[rax+rsi+8]`, one pointer in.
+const HEIGHT_FOG_COMPONENT: usize = 0x00;
+
+/// `FScene::ExponentialFogs`, a `TArray<FExponentialHeightFogSceneInfo>`,
+/// declared immediately after `Fogs` - hence exactly one `TArray` (0x10) later.
 const SCENE_EXPONENTIAL_FOGS_NUM: usize = 0x4ED0;
-/// `FExponentialHeightFogSceneInfo::Component`, at the very start of the struct.
-const FOG_COMPONENT: usize = 0x00;
 
 /// `UActorComponent::Owner`.
 const ACTOR_COMPONENT_OWNER: usize = 0x78;
@@ -99,6 +143,10 @@ const ACTOR_ROTATION: usize = 0x8C;
 /// An actor with more components than this is treated as a bad read rather than
 /// walked, so a wrong offset cannot turn into a long scan over arbitrary memory.
 const MAX_PLAUSIBLE_COMPONENTS: i32 = 4096;
+
+/// Likewise for the fog array: `InitFogConstants` itself only ever looks at the
+/// first four layers, so a count past this is a bad read, not a level.
+const MAX_PLAUSIBLE_FOGS: i32 = 256;
 
 type InitFogConstants = extern "C" fn(*mut c_void);
 
@@ -132,7 +180,7 @@ unsafe fn read_u32(base: *mut c_void, offset: usize) -> u32 {
 /// That second check can only pass when `Owner` and `AllComponents` are both
 /// where this module thinks they are, so a build that moved either one bails
 /// out here and leaves the engine's own result in place.
-unsafe fn fog_actor_rotation(component: *mut c_void) -> Option<[i32; 3]> {
+unsafe fn owning_actor_rotation(component: *mut c_void) -> Option<[i32; 3]> {
     if component.is_null() {
         return None;
     }
@@ -162,6 +210,33 @@ unsafe fn fog_actor_rotation(component: *mut c_void) -> Option<[i32; 3]> {
     Some([rotation.read(), rotation.add(1).read(), rotation.add(2).read()])
 }
 
+/// Rotation of the level's direction actor, i.e. the first `HeightFog` in
+/// `FScene::Fogs` whose actor layout checks out.
+///
+/// The array is sorted by height, so with more than one `HeightFog` the highest
+/// wins. Levels are expected to carry a single one; the log names the count so
+/// an accidental second actor is visible.
+unsafe fn direction_actor_rotation(scene: *mut c_void) -> Option<[i32; 3]> {
+    let count = read_i32(scene, SCENE_FOGS_NUM);
+    if count <= 0 {
+        return None;
+    }
+    if count > MAX_PLAUSIBLE_FOGS {
+        debug_log!("[fog] implausible Fogs count ({count}); leaving fog alone");
+        return None;
+    }
+
+    let fogs = read_ptr(scene, SCENE_FOGS_DATA);
+    if fogs.is_null() {
+        return None;
+    }
+
+    (0..count).find_map(|index| {
+        let info = (fogs as *mut u8).add(index as usize * HEIGHT_FOG_STRIDE) as *mut c_void;
+        owning_actor_rotation(read_ptr(info, HEIGHT_FOG_COMPONENT))
+    })
+}
+
 /// `FRotator::Vector()`: the rotation's forward axis.
 ///
 /// UE3 angles are 16-bit, 65536 to the turn. Roll does not affect the forward
@@ -181,11 +256,9 @@ fn rotator_to_vector(rotation: [i32; 3]) -> [f32; 3] {
     ]
 }
 
-/// TRUE when the engine wrote its `FVector(0,0,1)` fallback, i.e. when it found
-/// no dominant directional light. The constants are stored verbatim, so an
-/// exact comparison is the reliable test.
-fn is_world_up(direction: [f32; 3]) -> bool {
-    direction == [0.0, 0.0, 1.0]
+/// Packs (pitch, yaw) for [`LAST_LOGGED_ROTATION`].
+fn pack_rotation(rotation: [i32; 3]) -> u64 {
+    (u64::from(rotation[0] as u32 & 0xFFFF) << 16) | u64::from(rotation[1] as u32 & 0xFFFF)
 }
 
 unsafe fn override_fog_direction(scene_renderer: *mut c_void) {
@@ -197,27 +270,27 @@ unsafe fn override_fog_direction(scene_renderer: *mut c_void) {
         return;
     }
 
-    // InitFogConstants only ever reads ExponentialFogs(0).
+    // The direction only reaches a shader through the exponential fog path, and
+    // that path is also what keeps the direction actor from rendering. Without
+    // an exponential fog there is nothing to steer and nothing to correct.
     if read_i32(scene, SCENE_EXPONENTIAL_FOGS_NUM) <= 0 {
         return;
     }
-    let fog = read_ptr(scene, SCENE_EXPONENTIAL_FOGS_DATA);
-    if fog.is_null() {
-        return;
-    }
 
-    let Some(rotation) = fog_actor_rotation(read_ptr(fog, FOG_COMPONENT)) else {
+    let Some(rotation) = direction_actor_rotation(scene) else {
+        if LAST_LOGGED_ROTATION.swap(NO_DIRECTION_ACTOR, Ordering::Relaxed) != NO_DIRECTION_ACTOR {
+            debug_log!("[fog] no HeightFog direction actor in this level; keeping the engine's fog direction");
+        }
         return;
     };
     let forward = rotator_to_vector(rotation);
     // The engine stores the direction *toward* the light, hence -GetDirection().
     let direction = [-forward[0], -forward[1], -forward[2]];
 
-    let force = FORCE_ACTOR_ROTATION.load(Ordering::Relaxed);
-    let packed = (u64::from(rotation[0] as u32 & 0xFFFF) << 16) | u64::from(rotation[1] as u32 & 0xFFFF);
+    let packed = pack_rotation(rotation);
     if LAST_LOGGED_ROTATION.swap(packed, Ordering::Relaxed) != packed {
         debug_log!(
-            "[fog] actor rotation pitch={} yaw={} roll={} -> direction ({:.3},{:.3},{:.3}) force={force}",
+            "[fog] direction actor rotation pitch={} yaw={} roll={} -> direction ({:.3},{:.3},{:.3})",
             rotation[0],
             rotation[1],
             rotation[2],
@@ -240,12 +313,6 @@ unsafe fn override_fog_direction(scene_renderer: *mut c_void) {
         }
 
         let slot = (view as *mut u8).add(VIEW_FOG_LIGHT_DIRECTION) as *mut f32;
-        let current = [slot.read(), slot.add(1).read(), slot.add(2).read()];
-        if !force && !is_world_up(current) {
-            // A dominant directional light was found; leave the engine's answer.
-            continue;
-        }
-
         slot.write(direction[0]);
         slot.add(1).write(direction[1]);
         slot.add(2).write(direction[2]);
@@ -290,18 +357,16 @@ pub fn init() -> anyhow::Result<()> {
             .context("failed to enable FSceneRenderer::InitFogConstants hook")?;
     }
 
-    let force = std::env::args_os()
-        .skip(1)
-        .any(|arg| arg.to_string_lossy().eq_ignore_ascii_case(FORCE_OPTION));
-    FORCE_ACTOR_ROTATION.store(force, Ordering::Relaxed);
-
-    debug_log!("exponential fog light direction hook enabled (force actor rotation: {force})");
+    debug_log!("exponential fog light direction hook enabled (rotate a HeightFog actor to aim it)");
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{is_world_up, rotator_to_vector};
+    use super::{
+        pack_rotation, rotator_to_vector, NO_DIRECTION_ACTOR, SCENE_EXPONENTIAL_FOGS_NUM,
+        SCENE_FOGS_DATA, SCENE_FOGS_NUM,
+    };
 
     fn close(actual: [f32; 3], expected: [f32; 3]) {
         for (a, e) in actual.iter().zip(expected.iter()) {
@@ -334,9 +399,21 @@ mod tests {
     }
 
     #[test]
-    fn only_the_exact_fallback_is_replaced() {
-        assert!(is_world_up([0.0, 0.0, 1.0]));
-        assert!(!is_world_up([0.0, 0.0, -1.0]));
-        assert!(!is_world_up([0.0, 0.0, 0.9999]));
+    fn no_rotation_collides_with_the_missing_actor_sentinel() {
+        // Both halves are masked to 16 bits, so a packed rotation cannot reach
+        // the high sentinel however far out of range the actor's angles are.
+        for rotation in [[0, 0, 0], [-1, -1, -1], [i32::MAX, i32::MIN, 0]] {
+            assert!(pack_rotation(rotation) <= u64::from(u32::MAX));
+            assert_ne!(pack_rotation(rotation), NO_DIRECTION_ACTOR);
+        }
+    }
+
+    #[test]
+    fn the_two_fog_arrays_are_one_tarray_apart() {
+        // FScene declares ExponentialFogs immediately after Fogs, and a TArray
+        // is 16 bytes. If a future build moves one, this pins the other.
+        const TARRAY_SIZE: usize = 0x10;
+        assert_eq!(SCENE_FOGS_DATA + 8, SCENE_FOGS_NUM);
+        assert_eq!(SCENE_FOGS_NUM + TARRAY_SIZE, SCENE_EXPONENTIAL_FOGS_NUM);
     }
 }

@@ -86,8 +86,12 @@ mod udk_xaudio;
 ///   by the `-D3D9EX`/`-D3D9FLIPEX` command line switches; installs no hooks
 ///   otherwise.
 /// - `udk_fog_light_direction`: makes exponential height fog's two-tone
-///   inscattering follow the fog actor's rotation when `InitFogConstants`
-///   finds no dominant directional light, instead of falling back to world up.
+///   inscattering follow the rotation of a dedicated `HeightFog` actor placed
+///   in the level, instead of the world-up direction `InitFogConstants` falls
+///   back to when it finds no dominant directional light. The `HeightFog`
+///   renders nothing while an `ExponentialHeightFog` is present, so it is a
+///   pure direction marker and the `ExponentialHeightFog` itself is untouched.
+///   No level marker, no change - see the module docs.
 pub fn post_udk_init() -> anyhow::Result<()> {
     udk_xaudio::init()?;
     udk_cook::init()?;
@@ -103,10 +107,10 @@ pub fn post_udk_init() -> anyhow::Result<()> {
     // Do not enable udk_array_append for production cooks: if it fires, it
     // deliberately truncates the package and the result cannot be shipped.
     udk_borderless_fullscreen::init()?;
-    #[cfg(target_arch = "x86_64")]
-    udk_d3d9_flipex::init()?;
     //#[cfg(target_arch = "x86_64")]
-    //udk_fog_light_direction::init()?;
+    //udk_d3d9_flipex::init()?;
+    #[cfg(target_arch = "x86_64")]
+    udk_fog_light_direction::init()?;
     //#[cfg(target_arch = "x86_64")]
     //udk_mcp::init()?;
     Ok(())
