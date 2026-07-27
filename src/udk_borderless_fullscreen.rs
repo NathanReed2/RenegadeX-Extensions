@@ -22,6 +22,27 @@
 //! fill it, and the mouse accessors map the larger client area back into
 //! viewport space so the cursor and UI hit-testing stay aligned.
 //!
+//! Growing the window is only half of a downscale on the D3D9 RHI this build
+//! actually runs. `FD3D9DynamicRHI::EndDrawingViewport` picks its `Present` call
+//! from `FD3D9Viewport::bIsFullscreen`, not from the device's windowed flag:
+//!
+//! ```text
+//! if( Viewport->IsFullscreen() ) Present(NULL,NULL,NULL,NULL);
+//! else { GetClientRect(Viewport->GetWindowHandle(),&DestRect);
+//!        SourceRect = {0,0,Viewport->GetSizeX(),Viewport->GetSizeY()};
+//!        Present(&SourceRect,NULL,Viewport->GetWindowHandle(),NULL); }
+//! ```
+//!
+//! Only the second branch names the region the scene was drawn into. The back
+//! buffer is shared by every viewport and sized to the largest of them, and
+//! `UpdateD3DDeviceFromViewports` deliberately does not shrink it while
+//! windowed, so after a downscale the scene occupies the top-left corner of a
+//! back buffer that is still desktop-sized. Presenting all of it - the
+//! fullscreen branch - stretched that whole stale surface across the monitor,
+//! which drew the game at 1:1 in the corner. `bIsFullscreen` is therefore
+//! cleared on the D3D9 viewport too, so `Present` scales exactly the rendered
+//! rectangle up to the client area.
+//!
 //! RVAs were mapped in Ghidra from the symbol-bearing 2013
 //! `UDK Build W Simplygon/UDK.exe` to `RenXSDK/UDK.exe`. The target's
 //! `.text` hash is pinned in `dll.rs`, and every instruction is validated
@@ -151,6 +172,18 @@ const GET_SUPPORTED_RESOLUTION: HookTarget = HookTarget {
     ],
 };
 
+/// The RHI is chosen at launch, so both drivers' copies need the same
+/// treatment. `-d3d9` is what the shipped launch scripts use.
+#[cfg(target_arch = "x86_64")]
+const GET_SUPPORTED_RESOLUTION_D3D9: HookTarget = HookTarget {
+    name: "FD3D9DynamicRHI::GetSupportedResolution",
+    rva: 0x016B_3D70,
+    prologue: &[
+        0x48, 0x89, 0x5C, 0x24, 0x20, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41,
+        0x57, 0x48, 0x83, 0xEC, 0x60,
+    ],
+};
+
 /// `FWindowsViewport` derives from `FViewportFrame` first, so a `Resize` `this`
 /// points at the object base while the `FViewport` virtuals receive base + 8.
 #[cfg(target_arch = "x86_64")]
@@ -207,6 +240,22 @@ const BORDERLESS_PATCHES: &[CodePatch] = &[
         rva: 0x016B_BFB3,
         expected: &[0x0F, 0x95, 0xC0],
         replacement: &[0x90, 0x90, 0x90],
+    },
+    CodePatch {
+        name: "D3D9 viewport constructor fullscreen state",
+        // FD3D9Viewport::FD3D9Viewport loads bInIsFullscreen off the stack into
+        // EAX for the store into bIsFullscreen at +0x24. Load zero instead.
+        rva: 0x016C_0C07,
+        expected: &[0x8B, 0x44, 0x24, 0x68],
+        replacement: &[0x31, 0xC0, 0x90, 0x90],
+    },
+    CodePatch {
+        name: "D3D9 viewport resize fullscreen state",
+        // Same store in FD3D9DynamicRHI::ResizeViewport, which is what a SETRES
+        // goes through once the viewport exists.
+        rva: 0x016C_0D3D,
+        expected: &[0x8B, 0x44, 0x24, 0x28],
+        replacement: &[0x31, 0xC0, 0x90, 0x90],
     },
     CodePatch {
         name: "fullscreen SetWindowPos",
@@ -277,6 +326,11 @@ static_detour! {
 #[cfg(target_arch = "x86_64")]
 static_detour! {
     static GetSupportedResolutionHook: extern "C" fn(*mut c_void, *mut u32, *mut u32);
+}
+
+#[cfg(target_arch = "x86_64")]
+static_detour! {
+    static GetSupportedResolutionD3D9Hook: extern "C" fn(*mut c_void, *mut u32, *mut u32);
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -987,6 +1041,18 @@ extern "C" fn get_supported_resolution_hook(
     GetSupportedResolutionHook.call(rhi, width, height);
 }
 
+#[cfg(target_arch = "x86_64")]
+extern "C" fn get_supported_resolution_d3d9_hook(
+    rhi: *mut c_void,
+    width: *mut u32,
+    height: *mut u32,
+) {
+    if BORDERLESS_ACTIVE.load(Ordering::Relaxed) {
+        return;
+    }
+    GetSupportedResolutionD3D9Hook.call(rhi, width, height);
+}
+
 pub fn init() -> anyhow::Result<()> {
     debug_log!("udk_borderless_fullscreen::init start");
 
@@ -1002,6 +1068,7 @@ pub fn init() -> anyhow::Result<()> {
         let get_mouse_pos_address = GET_MOUSE_POS.resolve()?;
         let set_mouse_address = SET_MOUSE.resolve()?;
         let supported_resolution_address = GET_SUPPORTED_RESOLUTION.resolve()?;
+        let supported_resolution_d3d9_address = GET_SUPPORTED_RESOLUTION_D3D9.resolve()?;
         validate_patch(&STARTUP_FULLSCREEN_PATCH)?;
         for patch in BORDERLESS_PATCHES {
             validate_patch(patch)?;
@@ -1072,6 +1139,13 @@ pub fn init() -> anyhow::Result<()> {
                     get_supported_resolution_hook(rhi, width, height)
                 })
                 .context("failed to set up FD3D11DynamicRHI::GetSupportedResolution hook")?;
+            let supported_resolution_d3d9: GetSupportedResolution =
+                std::mem::transmute(supported_resolution_d3d9_address);
+            GetSupportedResolutionD3D9Hook
+                .initialize(supported_resolution_d3d9, |rhi, width, height| {
+                    get_supported_resolution_d3d9_hook(rhi, width, height)
+                })
+                .context("failed to set up FD3D9DynamicRHI::GetSupportedResolution hook")?;
 
             GameViewportExecHook
                 .enable()
@@ -1097,6 +1171,9 @@ pub fn init() -> anyhow::Result<()> {
             GetSupportedResolutionHook
                 .enable()
                 .context("failed to enable FD3D11DynamicRHI::GetSupportedResolution hook")?;
+            GetSupportedResolutionD3D9Hook
+                .enable()
+                .context("failed to enable FD3D9DynamicRHI::GetSupportedResolution hook")?;
         }
         debug_log!("borderless fullscreen hooks enabled");
 
