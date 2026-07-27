@@ -11,6 +11,8 @@ mod patch_utils;
 mod udk_audio_channels;
 mod udk_borderless_fullscreen;
 mod udk_bulk_data_count;
+#[cfg(target_arch = "x86_64")]
+mod udk_client_vehicle_physics;
 mod udk_compress_from_memory;
 mod udk_cook;
 #[cfg(target_arch = "x86_64")]
@@ -89,6 +91,13 @@ mod udk_xaudio;
 ///   `udk_compress_from_memory` in place this should never fire; if it does,
 ///   the package being written is genuinely too large and the log tells you so.
 /// - `udk_borderless_fullscreen`: borderless fullscreen window support.
+/// - `udk_client_vehicle_physics`: lets the driving client own its vehicle's
+///   rigid body instead of being corrected to a round-trip-stale server pose,
+///   by presenting `Role` as `ROLE_Authority` to `ASVehicle::physRigidBody` for
+///   the one vehicle a client owns. Inert until `Rx_Vehicle` arms it, which it
+///   only does when the server replicates `bClientPhysicsAuthority`, so a
+///   dedicated server and any client on a server without the matching script
+///   keep stock behaviour - see the module docs.
 /// - `udk_d3d9_flipex`: opt-in D3D9Ex/FlipEx presentation path, enabled only
 ///   by the `-D3D9EX`/`-D3D9FLIPEX` command line switches; installs no hooks
 ///   otherwise.
@@ -113,6 +122,8 @@ pub fn post_udk_init() -> anyhow::Result<()> {
     #[cfg(target_arch = "x86_64")]
     udk_pcserver_script_cook::init()?;
     udk_borderless_fullscreen::init()?;
+    #[cfg(target_arch = "x86_64")]
+    udk_client_vehicle_physics::init()?;
     //#[cfg(target_arch = "x86_64")]
     //udk_d3d9_flipex::init()?;
     #[cfg(target_arch = "x86_64")]
