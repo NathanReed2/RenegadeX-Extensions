@@ -78,14 +78,14 @@ pub fn post_udk_init() -> anyhow::Result<()> {
     udk_compress_from_memory::init()?;
     udk_bulk_data_count::init()?;
     udk_package_size_limit::init()?;
-    #[cfg(target_arch = "x86_64")]
-    udk_array_append::init()?;
+    // Do not enable udk_array_append for production cooks: if it fires, it
+    // deliberately truncates the package and the result cannot be shipped.
     udk_borderless_fullscreen::init()?;
     #[cfg(target_arch = "x86_64")]
     udk_d3d9_flipex::init()?;
-    #[cfg(target_arch = "x86_64")]
-    udk_fog_light_direction::init()?;
-    #[cfg(target_arch = "x86_64")]
-    udk_mcp::init()?;
+    //#[cfg(target_arch = "x86_64")]
+    //udk_fog_light_direction::init()?;
+    //#[cfg(target_arch = "x86_64")]
+    //udk_mcp::init()?;
     Ok(())
 }
