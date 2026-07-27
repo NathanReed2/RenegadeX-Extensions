@@ -23,6 +23,7 @@ mod udk_log;
 #[cfg(target_arch = "x86_64")]
 mod udk_mcp;
 mod udk_package_size_limit;
+mod udk_pc_map_cook;
 mod udk_substance;
 mod udk_xaudio;
 
@@ -58,6 +59,9 @@ mod udk_xaudio;
 ///   UE3's `INT` archive offsets, and explains the cause if one crosses it.
 ///   Without this the only symptom is `Error seeking file` followed by a
 ///   missing cooked file, which names neither the package nor the limit.
+/// - `udk_pc_map_cook`: preserves separately cooked content-package imports
+///   for explicit `-platform=PC` map cooks instead of force-exporting every
+///   dependency into one map, while retaining the caller's seek-free handling.
 /// - `udk_array_append`: backstop for the crash the above overflow produced
 ///   (`FMemoryWriter::Serialize` with a negative byte count). With
 ///   `udk_compress_from_memory` in place this should never fire; if it does,
@@ -78,6 +82,7 @@ pub fn post_udk_init() -> anyhow::Result<()> {
     udk_compress_from_memory::init()?;
     udk_bulk_data_count::init()?;
     udk_package_size_limit::init()?;
+    udk_pc_map_cook::init()?;
     // Do not enable udk_array_append for production cooks: if it fires, it
     // deliberately truncates the package and the result cannot be shipped.
     udk_borderless_fullscreen::init()?;

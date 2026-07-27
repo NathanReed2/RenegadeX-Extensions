@@ -47,7 +47,7 @@ features = [
 version = "0.52.0"
 
 [profile.release]
-opt-level = "z"   # smallest binary; use "s" for size optimization
+opt-level = "s"   # smallest binary; use "s" for size optimization
 lto = "fat"
 codegen-units = 1
 panic = "abort"
