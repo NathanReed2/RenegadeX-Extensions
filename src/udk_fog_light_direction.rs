@@ -1,5 +1,5 @@
-//! Drives exponential height fog's two-tone inscattering from the rotation of a
-//! dedicated `Rx_FogLightDirection` actor.
+//! Lets an exponential height fog actor aim its own two-tone inscattering by
+//! being rotated.
 //!
 //! `FSceneRenderer::InitFogConstants` picks the direction that blends
 //! `LightInscatteringColor` into `OppositeLightColor` by scanning the scene's
@@ -21,45 +21,32 @@
 //!    The light is then absent from the list whatever its type.
 //!
 //! This module detours `InitFogConstants`, lets it run, and then overwrites that
-//! direction with the rotation of a **separate** fog actor, so the direction is
-//! authored independently of the `ExponentialHeightFog` actor that supplies
-//! every other fog parameter.
+//! direction with the fog actor's own rotation.
 //!
-//! # The direction actor
+//! # The fog actor
 //!
-//! `Rx_FogLightDirection`, declared in `RenX_Extra/Classes/Rx_FogLightDirection.uc`.
-//! Place one in the level and rotate it; its rotation is the only thing read.
-//! It is its own class, so nothing that was already in a level changes meaning.
+//! `Rx_ExponentialHeightFog_Rotatable`, declared in
+//! `RenX_Extra/Classes/Rx_ExponentialHeightFog_Rotatable.uc`. It is an
+//! `ExponentialHeightFog` in every respect - same component, same properties,
+//! same defaults - and renders the level's fog exactly as the stock actor does.
+//! It exists as its own class only so that rotating it can be given a meaning
+//! without changing what rotating any existing actor means. Use it in place of
+//! the stock actor, not alongside one.
 //!
-//! A component is what makes the actor reachable from the render thread, and
-//! the actor carries a `HeightFogComponent` purely to be registered into
-//! `FScene::Fogs` - the array this module walks. It renders nothing:
+//! Rotation is free to repurpose because nothing in the engine reads it:
+//! `UExponentialHeightFogComponent::SetParentToWorld` takes only the origin's Z,
+//! into `FogHeight`. So an unhooked build renders the fog normally and simply
+//! ignores the rotation - the actor degrades to a plain `ExponentialHeightFog`
+//! rather than breaking.
 //!
-//!  * whenever the level has an `ExponentialHeightFog`, `SetFogShaders` takes
-//!    the `Scene->ExponentialFogs.Num() > 0` branch and binds
-//!    `TExponentialHeightFogPixelShader`, so the height fog shaders that would
-//!    consume `Scene->Fogs` are never selected;
-//!  * the vertex shader that branch does bind, `THeightFogVertexShader<1>`,
-//!    passes the layer heights down in `OutTexCoordAndHeightRelativeZ.zw`, and
-//!    `ExponentialPixelMain` reads only `.xy` and `ScreenVector` - the layer
-//!    values reach no arithmetic;
-//!  * the one path that renders one-layer height fog outside `RenderFog`,
-//!    `RenderQuarterDownsampledDepthAndFog` behind ambient occlusion, has its
-//!    whole body inside `#if XBOX` and returns FALSE here, so
-//!    `bOneLayerHeightFogRenderedInAO` stays FALSE; and
-//!  * for the remaining case of a level with no exponential fog at all, the
-//!    component's default `StartDistance` puts its layer past any view, so the
-//!    height fog shader discards it pixel by pixel.
-//!
-//! `UHeightFogComponent::SetParentToWorld` only reads the origin's Z, so
-//! rotating the actor has no effect on the engine either. It is a pure marker.
-//!
-//! Every entry in `FScene::Fogs` is class-checked, so an ordinary `HeightFog`
-//! actor that a level already had is passed over rather than hijacked. When the
-//! level has no `Rx_FogLightDirection`, the engine's own result is left alone
-//! and this hook is inert. When one is present its rotation always wins,
-//! including over a `DominantDirectionalLight` the renderer did resolve;
-//! placing the actor is the opt-in.
+//! Only `ExponentialFogs(0)` is examined, which is the one entry
+//! `InitFogConstants` takes every other fog parameter from. Reading the
+//! direction from the same entry is what guarantees the direction and the fog
+//! it steers always come from one actor. The entry's owner is class-checked, so
+//! a level whose rendering fog is a stock `ExponentialHeightFog` keeps the
+//! engine's own direction and this hook stays inert; when it is the rotatable
+//! class, its rotation always wins, including over a `DominantDirectionalLight`
+//! the renderer did resolve. Placing the actor is the opt-in.
 //!
 //! Rotating the fog actor is exactly equivalent to rotating the dominant light.
 //! `ULightComponent::SetParentToWorld` builds `WorldToLight` as
@@ -95,10 +82,10 @@ static LAST_LOGGED_ROTATION: AtomicU64 = AtomicU64::new(u64::MAX);
 /// rotation packs this high; the packed form fits in 32 bits.
 const NO_DIRECTION_ACTOR: u64 = u64::MAX - 1;
 
-/// Class of the direction actor. `UObject::GetFullName` formats as
+/// Class of the rotatable fog actor. `UObject::GetFullName` formats as
 /// `"<ClassName> <PathName>"`, so this is matched against the leading word.
-/// Declared in `RenX_Extra/Classes/Rx_FogLightDirection.uc`.
-const DIRECTION_ACTOR_CLASS: &str = "Rx_FogLightDirection";
+/// Declared in `RenX_Extra/Classes/Rx_ExponentialHeightFog_Rotatable.uc`.
+const DIRECTION_ACTOR_CLASS: &str = "Rx_ExponentialHeightFog_Rotatable";
 
 /// `FSceneRenderer::InitFogConstants`.
 const INIT_FOG_CONSTANTS_RVA: usize = 0x00AF_5E90;
@@ -128,22 +115,13 @@ const VIEW_FOG_LIGHT_DIRECTION: usize = 0x1138;
 const VIEW_FOG_FLAGS: usize = 0x1148;
 const RENDER_EXPONENTIAL_FOG_BIT: u32 = 1;
 
-/// `FScene::Fogs`, a `TArray<FHeightFogSceneInfo>` - the legacy `HeightFog`
-/// components, and so where the direction actor is found. Confirmed by
-/// `mov ecx,[rax+0x4EC0]` feeding the `Min(Scene->Fogs.Num(),4)` clamp and
-/// `mov rax,[rdi+0x4EB8]` loading the array that the layer loop indexes.
-const SCENE_FOGS_DATA: usize = 0x4EB8;
-const SCENE_FOGS_NUM: usize = 0x4EC0;
-/// `sizeof(FHeightFogSceneInfo)`, from the layer loop's `lea rsi,[rax+rax*4];
-/// shl rsi,3` index scaling and its matching `sub rsi,0x28` step.
-const HEIGHT_FOG_STRIDE: usize = 0x28;
-/// `FHeightFogSceneInfo::Component`, at the very start of the struct: the same
-/// loop reads `Height` at `[rax+rsi+8]`, one pointer in.
-const HEIGHT_FOG_COMPONENT: usize = 0x00;
-
-/// `FScene::ExponentialFogs`, a `TArray<FExponentialHeightFogSceneInfo>`,
-/// declared immediately after `Fogs` - hence exactly one `TArray` (0x10) later.
+/// `FScene::ExponentialFogs`, a `TArray<FExponentialHeightFogSceneInfo>`.
+/// Confirmed by `mov rbx,[rbx+0x4EC8]` loading the array and
+/// `cmp [rdx+0x4ED0],edi` guarding the exponential fog block.
+const SCENE_EXPONENTIAL_FOGS_DATA: usize = 0x4EC8;
 const SCENE_EXPONENTIAL_FOGS_NUM: usize = 0x4ED0;
+/// `FExponentialHeightFogSceneInfo::Component`, at the very start of the struct.
+const FOG_COMPONENT: usize = 0x00;
 
 /// `UActorComponent::Owner`.
 const ACTOR_COMPONENT_OWNER: usize = 0x78;
@@ -156,10 +134,6 @@ const ACTOR_ROTATION: usize = 0x8C;
 /// An actor with more components than this is treated as a bad read rather than
 /// walked, so a wrong offset cannot turn into a long scan over arbitrary memory.
 const MAX_PLAUSIBLE_COMPONENTS: i32 = 4096;
-
-/// Likewise for the fog array: `InitFogConstants` itself only ever looks at the
-/// first four layers, so a count past this is a bad read, not a level.
-const MAX_PLAUSIBLE_FOGS: i32 = 256;
 
 type InitFogConstants = extern "C" fn(*mut c_void);
 type UObjectGetFullNameFn =
@@ -259,11 +233,11 @@ fn names_class(full_name: &[u16], class_name: &str) -> bool {
             .all(|(unit, byte)| *unit == u16::from(*byte))
 }
 
-/// TRUE when `actor` is a `Rx_FogLightDirection`.
+/// TRUE when `actor` is a [`DIRECTION_ACTOR_CLASS`].
 ///
-/// Asking the object for its own name is what keeps an ordinary `HeightFog`
-/// that a level already had from being treated as a direction marker. It runs
-/// once per registered height fog per frame, and levels have one or two, so the
+/// Asking the object for its own name is what keeps a stock
+/// `ExponentialHeightFog` - whose rotation has never meant anything - from
+/// having its rotation applied retroactively. It runs once per frame, so the
 /// `FString` the engine hands back is not worth caching.
 unsafe fn is_direction_actor(actor: *mut c_void) -> bool {
     let Some(get_full_name) = image_address(UOBJECT_GET_FULL_NAME_RVA) else {
@@ -295,31 +269,25 @@ unsafe fn is_direction_actor(actor: *mut c_void) -> bool {
     matched
 }
 
-/// Rotation of the level's direction actor, i.e. the first `Rx_FogLightDirection`
-/// registered in `FScene::Fogs` whose actor layout checks out.
+/// Rotation of the fog actor the renderer is actually using, when that actor is
+/// a [`DIRECTION_ACTOR_CLASS`].
 ///
-/// The array is sorted by height, so a level that somehow carries two of them
-/// uses the higher one. It is meant to hold exactly one.
+/// Only `ExponentialFogs(0)` is considered, because that is the single entry
+/// `InitFogConstants` reads every other fog parameter from. Tying the direction
+/// to the same entry means the direction and the fog it steers can never come
+/// from two different actors: a level whose rendering fog is a stock
+/// `ExponentialHeightFog` keeps the engine's own direction.
 unsafe fn direction_actor_rotation(scene: *mut c_void) -> Option<[i32; 3]> {
-    let count = read_i32(scene, SCENE_FOGS_NUM);
-    if count <= 0 {
+    if read_i32(scene, SCENE_EXPONENTIAL_FOGS_NUM) <= 0 {
         return None;
     }
-    if count > MAX_PLAUSIBLE_FOGS {
-        debug_log!("[fog] implausible Fogs count ({count}); leaving fog alone");
-        return None;
-    }
-
-    let fogs = read_ptr(scene, SCENE_FOGS_DATA);
-    if fogs.is_null() {
+    let fog = read_ptr(scene, SCENE_EXPONENTIAL_FOGS_DATA);
+    if fog.is_null() {
         return None;
     }
 
-    (0..count).find_map(|index| {
-        let info = (fogs as *mut u8).add(index as usize * HEIGHT_FOG_STRIDE) as *mut c_void;
-        let owner = validated_owner(read_ptr(info, HEIGHT_FOG_COMPONENT))?;
-        is_direction_actor(owner).then(|| actor_rotation(owner))
-    })
+    let owner = validated_owner(read_ptr(fog, FOG_COMPONENT))?;
+    is_direction_actor(owner).then(|| actor_rotation(owner))
 }
 
 /// `FRotator::Vector()`: the rotation's forward axis.
@@ -355,16 +323,9 @@ unsafe fn override_fog_direction(scene_renderer: *mut c_void) {
         return;
     }
 
-    // The direction only reaches a shader through the exponential fog path, and
-    // that path is also what keeps the direction actor from rendering. Without
-    // an exponential fog there is nothing to steer and nothing to correct.
-    if read_i32(scene, SCENE_EXPONENTIAL_FOGS_NUM) <= 0 {
-        return;
-    }
-
     let Some(rotation) = direction_actor_rotation(scene) else {
         if LAST_LOGGED_ROTATION.swap(NO_DIRECTION_ACTOR, Ordering::Relaxed) != NO_DIRECTION_ACTOR {
-            debug_log!("[fog] no {DIRECTION_ACTOR_CLASS} actor in this level; keeping the engine's fog direction");
+            debug_log!("[fog] the rendering fog is not a {DIRECTION_ACTOR_CLASS}; keeping the engine's fog direction");
         }
         return;
     };
@@ -452,7 +413,7 @@ pub fn init() -> anyhow::Result<()> {
 mod tests {
     use super::{
         names_class, pack_rotation, rotator_to_vector, DIRECTION_ACTOR_CLASS, NO_DIRECTION_ACTOR,
-        SCENE_EXPONENTIAL_FOGS_NUM, SCENE_FOGS_DATA, SCENE_FOGS_NUM,
+        SCENE_EXPONENTIAL_FOGS_DATA, SCENE_EXPONENTIAL_FOGS_NUM,
     };
 
     fn utf16(text: &str) -> Vec<u16> {
@@ -504,22 +465,23 @@ mod tests {
     }
 
     #[test]
-    fn the_direction_actor_is_recognised_by_its_class() {
+    fn the_rotatable_fog_is_recognised_by_its_class() {
         assert!(is_direction_class(
-            "Rx_FogLightDirection Field.TheWorld:PersistentLevel.Rx_FogLightDirection_0"
+            "Rx_ExponentialHeightFog_Rotatable \
+             Field.TheWorld:PersistentLevel.Rx_ExponentialHeightFog_Rotatable_0"
         ));
     }
 
     #[test]
-    fn other_fog_actors_are_passed_over() {
-        // The whole point of the class check: a level's own HeightFog, and the
-        // ExponentialHeightFog this module steers, must never be mistaken for
-        // the marker.
-        assert!(!is_direction_class(
-            "HeightFog Field.TheWorld:PersistentLevel.HeightFog_0"
-        ));
+    fn the_stock_fog_actors_are_passed_over() {
+        // The whole point of the class check: a stock ExponentialHeightFog's
+        // rotation has never meant anything, and must not start meaning
+        // something in levels that already exist.
         assert!(!is_direction_class(
             "ExponentialHeightFog Field.TheWorld:PersistentLevel.ExponentialHeightFog_0"
+        ));
+        assert!(!is_direction_class(
+            "HeightFog Field.TheWorld:PersistentLevel.HeightFog_0"
         ));
     }
 
@@ -527,18 +489,16 @@ mod tests {
     fn a_class_that_merely_starts_the_same_is_not_a_match() {
         // The space terminator is what makes this a class comparison rather
         // than a prefix test.
-        assert!(!is_direction_class("Rx_FogLightDirectionMarker Field.A.B"));
+        assert!(!is_direction_class("Rx_ExponentialHeightFog_Rotatable2 Field.A.B"));
         // ... and a name with no path at all cannot be an actor's full name.
-        assert!(!is_direction_class("Rx_FogLightDirection"));
+        assert!(!is_direction_class(DIRECTION_ACTOR_CLASS));
         assert!(!is_direction_class(""));
     }
 
     #[test]
-    fn the_two_fog_arrays_are_one_tarray_apart() {
-        // FScene declares ExponentialFogs immediately after Fogs, and a TArray
-        // is 16 bytes. If a future build moves one, this pins the other.
-        const TARRAY_SIZE: usize = 0x10;
-        assert_eq!(SCENE_FOGS_DATA + 8, SCENE_FOGS_NUM);
-        assert_eq!(SCENE_FOGS_NUM + TARRAY_SIZE, SCENE_EXPONENTIAL_FOGS_NUM);
+    fn the_fog_array_offsets_form_one_tarray() {
+        // A TArray is {void* Data; INT ArrayNum; INT ArrayMax}, so Num sits one
+        // pointer past Data. If a future build moves one, this pins the other.
+        assert_eq!(SCENE_EXPONENTIAL_FOGS_DATA + 8, SCENE_EXPONENTIAL_FOGS_NUM);
     }
 }

@@ -102,12 +102,13 @@ mod udk_xaudio;
 ///   by the `-D3D9EX`/`-D3D9FLIPEX` command line switches; installs no hooks
 ///   otherwise.
 /// - `udk_fog_light_direction`: makes exponential height fog's two-tone
-///   inscattering follow the rotation of an `Rx_FogLightDirection` actor placed
-///   in the level, instead of the world-up direction `InitFogConstants` falls
-///   back to when it finds no dominant directional light. That actor is a
-///   marker that renders nothing, and the `ExponentialHeightFog` supplying the
-///   fog itself is untouched. No marker in the level, no change - see the module
-///   docs and `RenX_Extra/Classes/Rx_FogLightDirection.uc`.
+///   inscattering follow the fog actor's own rotation, instead of the world-up
+///   direction `InitFogConstants` falls back to when it finds no dominant
+///   directional light. Applies only when the level's rendering fog is an
+///   `Rx_ExponentialHeightFog_Rotatable`, a copy of `ExponentialHeightFog` whose
+///   rotation is given that meaning; a stock fog actor is left alone - see the
+///   module docs and
+///   `RenX_Extra/Classes/Rx_ExponentialHeightFog_Rotatable.uc`.
 pub fn post_udk_init() -> anyhow::Result<()> {
     udk_xaudio::init()?;
     udk_cook::init()?;
