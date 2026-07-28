@@ -7,44 +7,73 @@ mod xaudio27;
 
 mod dll;
 mod patch_utils;
-#[cfg(target_arch = "x86_64")]
-mod udk_audio_channels;
-mod udk_borderless_fullscreen;
+mod udk_log;
+
+// Cooking - any -platform.
 mod udk_bulk_data_count;
-#[cfg(target_arch = "x86_64")]
-mod udk_client_vehicle_physics;
 mod udk_compress_from_memory;
 mod udk_cook;
-#[cfg(target_arch = "x86_64")]
-mod udk_d3d9_flipex;
 mod udk_filename_length;
-#[cfg(target_arch = "x86_64")]
-mod udk_fog_light_direction;
-mod udk_log;
-#[cfg(target_arch = "x86_64")]
-mod udk_mcp;
 mod udk_mt_shader_sandbox;
 mod udk_package_size_limit;
+mod udk_substance;
+
+// Cooking - one -platform each.
 mod udk_pc_map_cook;
 #[cfg(target_arch = "x86_64")]
 mod udk_pcserver_script_cook;
-mod udk_substance;
+
+// Engine-wide: editor, game and cooker alike.
+#[cfg(target_arch = "x86_64")]
+mod udk_audio_channels;
 mod udk_xaudio;
 
+// Game client only.
+mod udk_borderless_fullscreen;
+#[cfg(target_arch = "x86_64")]
+mod udk_client_vehicle_physics;
+#[cfg(target_arch = "x86_64")]
+mod udk_d3d9_flipex;
+#[cfg(target_arch = "x86_64")]
+mod udk_fog_light_direction;
+
+// Development tooling.
+#[cfg(target_arch = "x86_64")]
+mod udk_mcp;
+
 /// Installs all in-process hooks/patches once `udk.exe` has finished its own
-/// init and [`crate::dll::UDK_RANGE`] is available. Each call below targets
-/// an independent crash/limitation found via reverse engineering:
+/// init and [`crate::dll::UDK_RANGE`] is available. Each one targets an
+/// independent crash or limitation found via reverse engineering.
 ///
-/// - `udk_xaudio`: XAudio2 device setup fixes.
+/// The calls are split by what they are for, so a whole category can be
+/// commented out at once and an individual patch can be commented out inside
+/// it. Every `init` detours a distinct function and none depend on each other,
+/// so the order they run in does not matter.
+///
+/// # Not built
+///
+/// `src/udk_flip_model.rs` and `src/udk_emitter_pool.rs` are present in the
+/// tree but deliberately not declared above, so nothing in them compiles. Add a
+/// `mod` line and a call to the right group below to bring one back.
+pub fn post_udk_init() -> anyhow::Result<()> {
+    init_cook_patches()?;
+    init_platform_cook_patches()?;
+    init_engine_patches()?;
+    init_client_patches()?;
+    init_tooling_patches()?;
+    Ok(())
+}
+
+/// Crashes and hard limits hit while cooking, whatever the target platform.
+/// Disabling any of these only matters to a cook; a game client never reaches
+/// them.
+///
 /// - `udk_cook`: patches a NULL-`this` crash in a lookup accessor
 ///   (`FUN_140a1f740`), observed to be reachable during package cooking.
 /// - `udk_substance`: patches a crash in a generic bit-array iterator
 ///   constructor (`FUN_1401491b0`) caused by a bad/dangling array
 ///   reference, observed while cooking a SubstanceAir texture with no
 ///   `ParentInstance`.
-/// - `udk_audio_channels`: raises the compiled-in `MAX_AUDIOCHANNELS` clamp
-///   (64) inside `UXAudio2Device::Init` so the ini `MaxChannels` setting can
-///   actually take effect above 64.
 /// - `udk_filename_length`: disables the "filename is too long for cooking"
 ///   check (30-character limit) in `UObject::SavePackage`.
 /// - `udk_compress_from_memory`: forces `UObject::SavePackage` to stage cooked
@@ -70,10 +99,26 @@ mod udk_xaudio;
 ///   `RealD/CommonDepth.usf` dies with `Couldn't load shader file` - which then
 ///   takes down every sibling child, and with them the whole `-Processes=N`
 ///   cook, behind the parent's uninformative `Child process crashed:`.
-/// - `udk_pc_map_cook`: preserves separately cooked content-package imports
-///   for explicit `-platform=PC` map cooks instead of force-exporting every
-///   dependency into one map, while retaining the caller's seek-free handling.
-/// - `udk_pcserver_script_cook`: makes a `-platform=PCServer` cook produce
+fn init_cook_patches() -> anyhow::Result<()> {
+    udk_cook::init()?;
+    udk_substance::init()?;
+    udk_filename_length::init()?;
+    udk_compress_from_memory::init()?;
+    udk_bulk_data_count::init()?;
+    udk_package_size_limit::init()?;
+    udk_mt_shader_sandbox::init()?;
+    Ok(())
+}
+
+/// Cook patches that each apply to exactly one `-platform=` target, and are
+/// inert for every other cook. Disable one only if you are not shipping that
+/// platform.
+///
+/// - `udk_pc_map_cook` (`-platform=PC`): preserves separately cooked
+///   content-package imports for explicit `-platform=PC` map cooks instead of
+///   force-exporting every dependency into one map, while retaining the
+///   caller's seek-free handling.
+/// - `udk_pcserver_script_cook` (`-platform=PCServer`): makes the cook produce
 ///   script a `-seekfreeloadingserver` dedicated server can load, by removing
 ///   four places where `PLATFORM_WindowsServer` is treated as console-like even
 ///   though the cook is written and read back by this same non-console binary:
@@ -86,18 +131,32 @@ mod udk_xaudio;
 ///   still has, so class defaults deserialise onto native fields), and the two
 ///   gates that discard non-native (mod) script. Needs
 ///   `UDKGame\Config\PCServer\PCServerEngine.ini` - see the module docs.
-/// - `udk_array_append`: backstop for the crash the above overflow produced
-///   (`FMemoryWriter::Serialize` with a negative byte count). With
-///   `udk_compress_from_memory` in place this should never fire; if it does,
-///   the package being written is genuinely too large and the log tells you so.
+fn init_platform_cook_patches() -> anyhow::Result<()> {
+    udk_pc_map_cook::init()?;
+    #[cfg(target_arch = "x86_64")]
+    udk_pcserver_script_cook::init()?;
+    Ok(())
+}
+
+/// Engine-wide fixes that apply the same way to the editor, the game and the
+/// cooker, because they patch subsystem setup rather than any one workflow.
+///
+/// - `udk_xaudio`: XAudio2 device setup fixes.
+/// - `udk_audio_channels`: raises the compiled-in `MAX_AUDIOCHANNELS` clamp
+///   (64) inside `UXAudio2Device::Init` so the ini `MaxChannels` setting can
+///   actually take effect above 64.
+fn init_engine_patches() -> anyhow::Result<()> {
+    udk_xaudio::init()?;
+    #[cfg(target_arch = "x86_64")]
+    udk_audio_channels::init()?;
+    Ok(())
+}
+
+/// Presentation and gameplay changes that only reach a running game client.
+/// These are the ones to reach for when something looks or plays wrong, and the
+/// safe ones to disable when isolating a rendering or physics regression.
+///
 /// - `udk_borderless_fullscreen`: borderless fullscreen window support.
-/// - `udk_client_vehicle_physics`: lets the driving client own its vehicle's
-///   rigid body instead of being corrected to a round-trip-stale server pose,
-///   by presenting `Role` as `ROLE_Authority` to `ASVehicle::physRigidBody` for
-///   the one vehicle a client owns. Inert until `Rx_Vehicle` arms it, which it
-///   only does when the server replicates `bClientPhysicsAuthority`, so a
-///   dedicated server and any client on a server without the matching script
-///   keep stock behaviour - see the module docs.
 /// - `udk_d3d9_flipex`: opt-in D3D9Ex/FlipEx presentation path, enabled only
 ///   by the `-D3D9EX`/`-D3D9FLIPEX` command line switches; installs no hooks
 ///   otherwise.
@@ -109,26 +168,29 @@ mod udk_xaudio;
 ///   rotation is given that meaning; a stock fog actor is left alone - see the
 ///   module docs and
 ///   `RenX_Extra/Classes/Rx_ExponentialHeightFog_Rotatable.uc`.
-pub fn post_udk_init() -> anyhow::Result<()> {
-    udk_xaudio::init()?;
-    udk_cook::init()?;
-    udk_substance::init()?;
-    udk_audio_channels::init()?;
-    udk_filename_length::init()?;
-    udk_compress_from_memory::init()?;
-    udk_bulk_data_count::init()?;
-    udk_package_size_limit::init()?;
-    udk_mt_shader_sandbox::init()?;
-    udk_pc_map_cook::init()?;
-    #[cfg(target_arch = "x86_64")]
-    udk_pcserver_script_cook::init()?;
+/// - `udk_client_vehicle_physics`: lets the driving client own its vehicle's
+///   rigid body instead of being corrected to a round-trip-stale server pose,
+///   by presenting `Role` as `ROLE_Authority` to `ASVehicle::physRigidBody` for
+///   the one vehicle a client owns. Inert until `Rx_Vehicle` arms it, which it
+///   only does when the server replicates `bClientPhysicsAuthority`, so a
+///   dedicated server and any client on a server without the matching script
+///   keep stock behaviour - see the module docs.
+fn init_client_patches() -> anyhow::Result<()> {
     udk_borderless_fullscreen::init()?;
-    #[cfg(target_arch = "x86_64")]
-    udk_client_vehicle_physics::init()?;
     //#[cfg(target_arch = "x86_64")]
     //udk_d3d9_flipex::init()?;
     #[cfg(target_arch = "x86_64")]
     udk_fog_light_direction::init()?;
+    #[cfg(target_arch = "x86_64")]
+    udk_client_vehicle_physics::init()?;
+    Ok(())
+}
+
+/// Development tooling: not part of shipping behaviour, and off by default.
+///
+/// - `udk_mcp`: loopback MCP bridge for the Win64 editor, draining its Unreal
+///   calls from `UUnrealEdEngine::Tick` so they run on the editor thread.
+fn init_tooling_patches() -> anyhow::Result<()> {
     //#[cfg(target_arch = "x86_64")]
     //udk_mcp::init()?;
     Ok(())
