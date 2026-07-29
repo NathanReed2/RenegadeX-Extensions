@@ -26,6 +26,8 @@ mod udk_pcserver_script_cook;
 // Engine-wide: editor, game and cooker alike.
 #[cfg(target_arch = "x86_64")]
 mod udk_audio_channels;
+#[cfg(target_arch = "x86_64")]
+mod udk_script_func_cache;
 mod udk_xaudio;
 
 // Game client only.
@@ -42,6 +44,8 @@ mod udk_fog_light_direction;
 // Development tooling.
 #[cfg(target_arch = "x86_64")]
 mod udk_mcp;
+#[cfg(target_arch = "x86_64")]
+mod udk_script_profiler;
 
 /// Installs all in-process hooks/patches once `udk.exe` has finished its own
 /// init and [`crate::dll::UDK_RANGE`] is available. Each one targets an
@@ -58,10 +62,10 @@ mod udk_mcp;
 /// tree but deliberately not declared above, so nothing in them compiles. Add a
 /// `mod` line and a call to the right group below to bring one back.
 pub fn post_udk_init() -> anyhow::Result<()> {
-    init_cook_patches()?;
-    init_platform_cook_patches()?;
-    init_engine_patches()?;
-    init_client_patches()?;
+    //init_cook_patches()?;
+    //init_platform_cook_patches()?;
+    //init_engine_patches()?;
+    //init_client_patches()?;
     init_tooling_patches()?;
     Ok(())
 }
@@ -147,10 +151,21 @@ fn init_platform_cook_patches() -> anyhow::Result<()> {
 /// - `udk_audio_channels`: raises the compiled-in `MAX_AUDIOCHANNELS` clamp
 ///   (64) inside `UXAudio2Device::Init` so the ini `MaxChannels` setting can
 ///   actually take effect above 64.
+/// - `udk_script_func_cache`: memoises `UObject::FindFunction`, which every
+///   script entry path funnels through and which otherwise re-walks the
+///   object's state chain and then its whole class chain - three dependent,
+///   mostly cache-missing loads per level - on every single lookup. Nothing
+///   caches the answer, and `AActor::Tick` calls `eventTick` unconditionally,
+///   so each ticking actor repeats the walk every frame just to rediscover that
+///   its class does not override `Tick`. Behaviour-preserving; keyed on state
+///   node, class and name, invalidated either side of `UObject::CollectGarbage`.
+///   `-NOSCRIPTFUNCCACHE` stands it down.
 fn init_engine_patches() -> anyhow::Result<()> {
     udk_xaudio::init()?;
     #[cfg(target_arch = "x86_64")]
     udk_audio_channels::init()?;
+    #[cfg(target_arch = "x86_64")]
+    udk_script_func_cache::init()?;
     Ok(())
 }
 
@@ -206,8 +221,14 @@ fn init_client_patches() -> anyhow::Result<()> {
 ///
 /// - `udk_mcp`: loopback MCP bridge for the Win64 editor, draining its Unreal
 ///   calls from `UUnrealEdEngine::Tick` so they run on the editor thread.
+/// - `udk_script_profiler`: per-`UFunction` inclusive/exclusive timings taken
+///   from a detour on `UObject::ProcessInternal`, written to `scriptprof.csv`
+///   next to `UDK.exe` every 30 seconds. Installs nothing at all without
+///   `-SCRIPTPROF`, so it is left in the list rather than commented out.
 fn init_tooling_patches() -> anyhow::Result<()> {
     //#[cfg(target_arch = "x86_64")]
     //udk_mcp::init()?;
+    #[cfg(target_arch = "x86_64")]
+    udk_script_profiler::init()?;
     Ok(())
 }
