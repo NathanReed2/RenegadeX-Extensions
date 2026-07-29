@@ -147,6 +147,29 @@ const DUMP_INTERVAL: Duration = Duration::from_secs(30);
 /// real call depth.
 const MAX_TRACKED_DEPTH: usize = 512;
 
+/// A single call at or above this wall time is recorded individually, not just
+/// folded into an average. Averages cannot show a hitch; one 68ms call buried
+/// under thousands of cheap ones vanishes into a small mean.
+const SPIKE_THRESHOLD_NS: u64 = 1_000_000;
+
+/// How many of the worst spikes to keep. Small enough that re-sorting on insert
+/// is free, large enough to show a whole bad call chain rather than just its
+/// root.
+const MAX_SPIKES: usize = 64;
+
+/// One unusually slow call, kept whole rather than averaged away.
+struct Spike {
+    function: usize,
+    kind: Kind,
+    /// What the frame actually stalled for.
+    inclusive_ns: u64,
+    /// How much of that was this function's own doing - the gap between the two
+    /// is what separates "this is slow" from "this called something slow".
+    exclusive_ns: u64,
+    depth: usize,
+    since_start: Duration,
+}
+
 /// A function whose prologue is verified before it is detoured or called.
 struct HookTarget {
     name: &'static str,
@@ -159,6 +182,15 @@ const PROCESS_INTERNAL: HookTarget = HookTarget {
     rva: 0x0020_C120,
     prologue: &[
         0x40, 0x53, 0x55, 0x56, 0x57, 0x41, 0x54, 0x48, 0x81, 0xEC, 0x90, 0x00, 0x00, 0x00,
+    ],
+};
+
+const PROCESS_EVENT: HookTarget = HookTarget {
+    name: "UObject::ProcessEvent",
+    rva: 0x0021_6EC0,
+    prologue: &[
+        0x40, 0x55, 0x41, 0x55, 0x41, 0x56, 0x48, 0x81, 0xEC, 0xC0, 0x00, 0x00, 0x00, 0x48, 0x8D,
+        0x6C, 0x24, 0x20,
     ],
 };
 
@@ -199,6 +231,8 @@ struct FString {
 type ProcessInternal = extern "C" fn(*mut c_void, *mut c_void, *mut c_void);
 /// `void UObject::CallFunction( FFrame& Stack, RESULT_DECL, UFunction* Function )`.
 type CallFunction = extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void);
+/// `void UObject::ProcessEvent( UFunction* Function, void* Parms, void* Result )`.
+type ProcessEvent = extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void);
 /// `FString UObject::GetPathName( UObject* StopOuter ) const`.
 ///
 /// This returns a struct by value from a member function, so MSVC keeps `this`
@@ -217,6 +251,10 @@ static_detour! {
 
 static_detour! {
     static CallFunctionHook: extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void);
+}
+
+static_detour! {
+    static ProcessEventHook: extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void);
 }
 
 static ENGINE_GET_PATH_NAME: OnceLock<GetPathName> = OnceLock::new();
@@ -263,7 +301,27 @@ struct Profiler {
     stack: Vec<Frame>,
     stats: HashMap<usize, Stat>,
     last_dump: Instant,
+    started: Instant,
     total_ns: u64,
+    /// Worst calls by inclusive time, descending. Bounded at [`MAX_SPIKES`].
+    spikes: Vec<Spike>,
+}
+
+impl Profiler {
+    /// Keeps `candidate` only if it beats the weakest spike held, so the list
+    /// stays the worst N seen rather than the most recent N.
+    fn record_spike(&mut self, candidate: Spike) {
+        if self.spikes.len() < MAX_SPIKES {
+            self.spikes.push(candidate);
+        } else if let Some(weakest) = self.spikes.last_mut() {
+            if candidate.inclusive_ns <= weakest.inclusive_ns {
+                return;
+            }
+            *weakest = candidate;
+        }
+        self.spikes
+            .sort_by_key(|spike| std::cmp::Reverse(spike.inclusive_ns));
+    }
 }
 
 thread_local! {
@@ -339,7 +397,9 @@ fn with_profiler<T>(body: impl FnOnce(&mut Profiler) -> T) -> T {
             stack: Vec::with_capacity(64),
             stats: HashMap::new(),
             last_dump: Instant::now(),
+            started: Instant::now(),
             total_ns: 0,
+            spikes: Vec::with_capacity(MAX_SPIKES),
         });
         body(profiler)
     })
@@ -396,10 +456,23 @@ fn profile_call(function: usize, kind: Kind, body: impl FnOnce()) {
             0
         };
 
+        let exclusive_ns = elapsed_ns.saturating_sub(child_ns);
         if let Some(stat) = profiler.stats.get_mut(&function) {
             stat.calls += 1;
             stat.inclusive_ns += elapsed_ns;
-            stat.exclusive_ns += elapsed_ns.saturating_sub(child_ns);
+            stat.exclusive_ns += exclusive_ns;
+        }
+
+        if elapsed_ns >= SPIKE_THRESHOLD_NS {
+            let since_start = profiler.started.elapsed();
+            profiler.record_spike(Spike {
+                function,
+                kind,
+                inclusive_ns: elapsed_ns,
+                exclusive_ns,
+                depth: profiler.stack.len(),
+                since_start,
+            });
         }
 
         match profiler.stack.last_mut() {
@@ -413,6 +486,9 @@ fn profile_call(function: usize, kind: Kind, body: impl FnOnce()) {
                     profiler.last_dump = Instant::now();
                     if let Err(error) = write_report(profiler) {
                         debug_log!("script profiler dump failed: {error}");
+                    }
+                    if let Err(error) = write_spikes(profiler) {
+                        debug_log!("script profiler spike dump failed: {error}");
                     }
                 }
             }
@@ -469,14 +545,72 @@ extern "C" fn call_function_hook(
     });
 }
 
-fn report_path() -> Option<std::path::PathBuf> {
+extern "C" fn process_event_hook(
+    object: *mut c_void,
+    function: *mut c_void,
+    parms: *mut c_void,
+    result: *mut c_void,
+) {
+    // ProcessEvent dispatches through UFunction::Func, which is ProcessInternal
+    // for a script body - already counted there. Only a dynamically bound
+    // native reaches its own code from here, and that is the one path neither
+    // of the other two hooks can see.
+    let Some(kind) = (unsafe { function.as_ref().and_then(|_| native_kind(function)) }) else {
+        ProcessEventHook.call(object, function, parms, result);
+        return;
+    };
+
+    profile_call(function as usize, kind, || {
+        ProcessEventHook.call(object, function, parms, result)
+    });
+}
+
+fn report_path(file: &str) -> Option<std::path::PathBuf> {
     std::env::current_exe()
         .ok()
-        .and_then(|path| path.parent().map(|dir| dir.join("scriptprof.csv")))
+        .and_then(|path| path.parent().map(|dir| dir.join(file)))
+}
+
+/// Writes the individually-captured slow calls. Kept in its own file rather
+/// than appended to the main table so both stay loadable as plain CSV.
+fn write_spikes(profiler: &Profiler) -> anyhow::Result<()> {
+    let path = report_path("scriptprof-spikes.csv").context("could not locate UDK.exe")?;
+
+    let mut out = String::with_capacity(profiler.spikes.len() * 96 + 256);
+    out.push_str(&format!(
+        "# individual calls over {:.1} ms, worst {} kept, newest run wins\n\
+         # a large inclusive with a small exclusive means this function is not the culprit - read down the depth\n\
+         function,kind,depth,inclusive_ms,exclusive_ms,at_seconds\n",
+        SPIKE_THRESHOLD_NS as f64 / 1.0e6,
+        MAX_SPIKES,
+    ));
+
+    for spike in &profiler.spikes {
+        let name = profiler
+            .stats
+            .get(&spike.function)
+            .map(|stat| stat.name.as_str())
+            .unwrap_or("<unknown>");
+        out.push_str(&format!(
+            "\"{}\",{},{},{:.3},{:.3},{:.1}\n",
+            name.replace('"', "\"\""),
+            spike.kind.label(),
+            spike.depth,
+            spike.inclusive_ns as f64 / 1.0e6,
+            spike.exclusive_ns as f64 / 1.0e6,
+            spike.since_start.as_secs_f64(),
+        ));
+    }
+
+    let mut file = std::fs::File::create(&path)
+        .with_context(|| format!("could not create {}", path.display()))?;
+    file.write_all(out.as_bytes())
+        .with_context(|| format!("could not write {}", path.display()))?;
+    Ok(())
 }
 
 fn write_report(profiler: &Profiler) -> anyhow::Result<()> {
-    let path = report_path().context("could not locate UDK.exe's directory")?;
+    let path = report_path("scriptprof.csv").context("could not locate UDK.exe's directory")?;
 
     let mut rows: Vec<&Stat> = profiler.stats.values().collect();
     rows.sort_by_key(|stat| std::cmp::Reverse(stat.exclusive_ns));
@@ -557,6 +691,7 @@ pub fn init() -> anyhow::Result<()> {
 
     let process_internal_address = PROCESS_INTERNAL.resolve()?;
     let call_function_address = CALL_FUNCTION.resolve()?;
+    let process_event_address = PROCESS_EVENT.resolve()?;
     let get_path_name_address = GET_PATH_NAME.resolve()?;
     let app_free_address = APP_FREE.resolve()?;
 
@@ -580,12 +715,22 @@ pub fn init() -> anyhow::Result<()> {
             })
             .context("failed to set up UObject::CallFunction hook")?;
 
+        let process_event: ProcessEvent = std::mem::transmute(process_event_address);
+        ProcessEventHook
+            .initialize(process_event, |object, function, parms, result| {
+                process_event_hook(object, function, parms, result)
+            })
+            .context("failed to set up UObject::ProcessEvent hook")?;
+
         ProcessInternalHook
             .enable()
             .context("failed to enable UObject::ProcessInternal hook")?;
         CallFunctionHook
             .enable()
             .context("failed to enable UObject::CallFunction hook")?;
+        ProcessEventHook
+            .enable()
+            .context("failed to enable UObject::ProcessEvent hook")?;
     }
 
     debug_log!(
