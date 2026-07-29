@@ -1,35 +1,68 @@
-//! Per-function UnrealScript profiler, written as a detour on the bytecode
-//! interpreter entry point.
+//! Per-function UnrealScript profiler, written as detours on the two script
+//! dispatch points.
 //!
 //! # Why this rather than `PROFILEGAME`
 //!
 //! The shipping `UDK.exe` does carry Epic's gameplay profiler -
 //! `USE_GAMEPLAY_PROFILER` is compiled in, `"GameplayProfiler STARTING
-//! capture."` is in `.rdata`, and `PROFILEGAME START` works. But it emits a
-//! token stream that only the standalone `GameplayProfiler` tool from the UDK
-//! `Tools` folder can read, which is a poor fit for answering one question
-//! quickly: which script functions actually cost anything.
+//! capture."` is in `.rdata`, `GGameplayProfiler` is the global at
+//! `0x143562588` that `CallFunction` tests on every call, and
+//! `Binaries/GameplayProfiler.exe` ships alongside the game to read its output.
+//! On a client it is the better tool and this module is not a replacement for
+//! it.
 //!
-//! This writes a CSV instead, and costs nothing when it is switched off,
+//! It cannot profile a **dedicated server**, which is the case that matters
+//! here. `FGameplayProfiler::Exec` has exactly one caller - the console exec
+//! chain in `UnObj.cpp` - and there is no `ParseParam` autostart anywhere in
+//! the tree, so a capture can only begin by someone typing `PROFILEGAME START`
+//! at a console a headless server does not have.
+//!
+//! This is driven by a command line switch and writes a CSV on a timer, so it
+//! needs no console and no interaction. It costs nothing when switched off,
 //! because without the switch no detour is installed at all.
 //!
 //! # What it measures
 //!
-//! `UObject::ProcessInternal` is the interpreter: every script function body in
-//! the game runs inside one call to it, reached either from
-//! `UObject::CallFunction` (script calling script) or through
-//! `UFunction::Func` from `UObject::ProcessEvent` (C++ calling script). So one
-//! detour sees every script invocation exactly once.
+//! Script reaches native code through two disjoint entry points, and this hooks
+//! both - the same two Epic instruments:
 //!
-//! Each call is timed and attributed to `Stack.Node`, the `UFunction` being
-//! interpreted. A shadow stack subtracts the time spent inside nested calls, so
-//! the report carries both figures:
+//! - `UObject::ProcessInternal` is the interpreter. Every script function
+//!   *body* runs inside one call to it, whether reached from `CallFunction`
+//!   (script calling script) or through `UFunction::Func` from `ProcessEvent`
+//!   (C++ calling script). Attributed to `Stack.Node`.
+//! - `UObject::CallFunction` additionally dispatches **natives and DLLBind
+//!   imports**, which never reach the interpreter at all. Those are attributed
+//!   to the `UFunction` it was handed.
+//!
+//! `CallFunction` deliberately skips script bodies, since `ProcessInternal`
+//! already counts those - hooking both without that filter would double count
+//! every script call. The classification mirrors `CallFunction`'s own branch
+//! order: `iNative != 0`, else `FUNC_DLLImport`, else `FUNC_Native`, else a
+//! script body.
+//!
+//! Measuring natives matters more than it sounds. `Rx_TCPLink:TickListening`
+//! measured 118us per server tick with its whole body being one
+//! `dllimport c_accept` - a `FUNC_DLLImport` call that goes through libffi and
+//! never touches the interpreter. Without the `CallFunction` hook that cost can
+//! only appear as unexplained exclusive time in its caller.
+//!
+//! A shared shadow stack subtracts time spent in nested calls, so the report
+//! carries both figures:
 //!
 //! - **inclusive** - wall time in this function and everything it called.
-//! - **exclusive** - wall time in this function's own bytecode.
+//! - **exclusive** - wall time in this function's own body.
 //!
 //! Sort by exclusive to find what to optimise; read inclusive to find what to
-//! stop calling.
+//! stop calling. The `kind` column separates interpreted script from native and
+//! dllimport work.
+//!
+//! # What it still cannot see
+//!
+//! Operator and math natives dispatched straight from bytecode through
+//! `GNatives` (`VSize`, `+`, `==`) bypass `CallFunction` entirely, and a native
+//! reached through `ProcessEvent` rather than `CallFunction` is missed as well.
+//! Both blind spots apply equally to Epic's profiler, which instruments the
+//! same two functions.
 //!
 //! # Names
 //!
@@ -63,7 +96,11 @@
 //! `ProcessInternal` was located through the sole xref to its "Infinite script
 //! recursion" literal; `GetPathName` and `appFree` matched by unique prologue
 //! searches, and `appFree` diffs 13 of 13 instructions equal against its
-//! symbol-bearing twin.
+//! symbol-bearing twin. `CallFunction` was identified by its 1024-byte
+//! `Buffer` local and its four-way dispatch, and the `UFunction` offsets below
+//! were read straight out of that decompilation. Every prologue here was then
+//! checked byte for byte against the shipping `Firestorm/Binaries/Win64/UDK.exe`
+//! by parsing its PE section table, not just against Ghidra's copy.
 
 #![cfg(target_arch = "x86_64")]
 
@@ -84,6 +121,18 @@ use crate::patch_utils::debug_log;
 /// frame `ProcessInternal` runs. UE3 packs its structs to 4 bytes, which is why
 /// this is not 8-aligned.
 const FFRAME_NODE: usize = 0x14;
+
+/// `UFunction::FunctionFlags`, read by `CallFunction` at `+0xD0` to pick its
+/// dispatch branch.
+const UFUNCTION_FUNCTION_FLAGS: usize = 0x00D0;
+/// `UFunction::iNative` - a WORD at `+0xD4`, tested first by `CallFunction`.
+/// Non-zero means a hardcoded native invoked straight through `Func`.
+const UFUNCTION_INATIVE: usize = 0x00D4;
+
+/// `FUNC_Native`, bit 10 of `FunctionFlags`.
+const FUNC_NATIVE: u32 = 0x0000_0400;
+/// `FUNC_DLLImport`, bit 25 - a DLLBind import routed through libffi.
+const FUNC_DLL_IMPORT: u32 = 0x0200_0000;
 
 /// Command line switch that installs this module.
 const ENABLE_SWITCH: &str = "SCRIPTPROF";
@@ -113,6 +162,15 @@ const PROCESS_INTERNAL: HookTarget = HookTarget {
     ],
 };
 
+const CALL_FUNCTION: HookTarget = HookTarget {
+    name: "UObject::CallFunction",
+    rva: 0x0020_ED00,
+    prologue: &[
+        0x40, 0x55, 0x53, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x81,
+        0xEC, 0xC8, 0x04, 0x00, 0x00,
+    ],
+};
+
 const GET_PATH_NAME: HookTarget = HookTarget {
     name: "UObject::GetPathName",
     rva: 0x0026_AD90,
@@ -139,6 +197,8 @@ struct FString {
 
 /// `void UObject::ProcessInternal( FFrame& Stack, RESULT_DECL )`.
 type ProcessInternal = extern "C" fn(*mut c_void, *mut c_void, *mut c_void);
+/// `void UObject::CallFunction( FFrame& Stack, RESULT_DECL, UFunction* Function )`.
+type CallFunction = extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void);
 /// `FString UObject::GetPathName( UObject* StopOuter ) const`.
 ///
 /// This returns a struct by value from a member function, so MSVC keeps `this`
@@ -155,12 +215,36 @@ static_detour! {
     static ProcessInternalHook: extern "C" fn(*mut c_void, *mut c_void, *mut c_void);
 }
 
+static_detour! {
+    static CallFunctionHook: extern "C" fn(*mut c_void, *mut c_void, *mut c_void, *mut c_void);
+}
+
 static ENGINE_GET_PATH_NAME: OnceLock<GetPathName> = OnceLock::new();
 static ENGINE_APP_FREE: OnceLock<AppFree> = OnceLock::new();
 
-/// One entry per `UFunction` ever interpreted.
+/// How a `UFunction`'s time was reached, so the report can separate interpreted
+/// bytecode from work that only crosses the VM boundary.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Script,
+    Native,
+    DllImport,
+}
+
+impl Kind {
+    fn label(self) -> &'static str {
+        match self {
+            Kind::Script => "script",
+            Kind::Native => "native",
+            Kind::DllImport => "dllimport",
+        }
+    }
+}
+
+/// One entry per `UFunction` ever called.
 struct Stat {
     name: String,
+    kind: Kind,
     calls: u64,
     inclusive_ns: u64,
     exclusive_ns: u64,
@@ -261,14 +345,10 @@ fn with_profiler<T>(body: impl FnOnce(&mut Profiler) -> T) -> T {
     })
 }
 
-extern "C" fn process_internal_hook(object: *mut c_void, stack: *mut c_void, result: *mut c_void) {
-    if stack.is_null() {
-        ProcessInternalHook.call(object, stack, result);
-        return;
-    }
-
-    let function = unsafe { (stack as *const u8).add(FFRAME_NODE).cast::<usize>().read() };
-
+/// Times `body`, attributing it to `function`, and keeps the shadow stack that
+/// turns nested calls into exclusive time. Shared by both hooks so a native
+/// dispatched out of a script body correctly discounts its caller.
+fn profile_call(function: usize, kind: Kind, body: impl FnOnce()) {
     let started = Instant::now();
     let unnamed = with_profiler(|profiler| {
         if profiler.stack.len() >= MAX_TRACKED_DEPTH {
@@ -293,6 +373,7 @@ extern "C" fn process_internal_hook(object: *mut c_void, stack: *mut c_void, res
         with_profiler(|profiler| {
             profiler.stats.entry(function).or_insert(Stat {
                 name,
+                kind,
                 calls: 0,
                 inclusive_ns: 0,
                 exclusive_ns: 0,
@@ -300,7 +381,7 @@ extern "C" fn process_internal_hook(object: *mut c_void, stack: *mut c_void, res
         });
     }
 
-    ProcessInternalHook.call(object, stack, result);
+    body();
 
     let elapsed_ns = started.elapsed().as_nanos() as u64;
     with_profiler(|profiler| {
@@ -339,6 +420,55 @@ extern "C" fn process_internal_hook(object: *mut c_void, stack: *mut c_void, res
     });
 }
 
+/// Mirrors `CallFunction`'s own branch order to decide who owns this call's
+/// time. `None` means an interpreted body, which `ProcessInternal` already
+/// counts and this hook must therefore leave alone.
+unsafe fn native_kind(function: *mut c_void) -> Option<Kind> {
+    let base = function as *const u8;
+    // Tested first by CallFunction: a hardcoded native reached through Func.
+    if base.add(UFUNCTION_INATIVE).cast::<u16>().read() != 0 {
+        return Some(Kind::Native);
+    }
+    let flags = base.add(UFUNCTION_FUNCTION_FLAGS).cast::<u32>().read();
+    if flags & FUNC_DLL_IMPORT != 0 {
+        Some(Kind::DllImport)
+    } else if flags & FUNC_NATIVE != 0 {
+        Some(Kind::Native)
+    } else {
+        None
+    }
+}
+
+extern "C" fn process_internal_hook(object: *mut c_void, stack: *mut c_void, result: *mut c_void) {
+    if stack.is_null() {
+        ProcessInternalHook.call(object, stack, result);
+        return;
+    }
+
+    let function = unsafe { (stack as *const u8).add(FFRAME_NODE).cast::<usize>().read() };
+    profile_call(function, Kind::Script, || {
+        ProcessInternalHook.call(object, stack, result)
+    });
+}
+
+extern "C" fn call_function_hook(
+    object: *mut c_void,
+    stack: *mut c_void,
+    result: *mut c_void,
+    function: *mut c_void,
+) {
+    // Script bodies are counted by the ProcessInternal hook; timing them here
+    // as well would double count every script call in the game.
+    let Some(kind) = (unsafe { function.as_ref().and_then(|_| native_kind(function)) }) else {
+        CallFunctionHook.call(object, stack, result, function);
+        return;
+    };
+
+    profile_call(function as usize, kind, || {
+        CallFunctionHook.call(object, stack, result, function)
+    });
+}
+
 fn report_path() -> Option<std::path::PathBuf> {
     std::env::current_exe()
         .ok()
@@ -359,13 +489,29 @@ fn write_report(profiler: &Profiler) -> anyhow::Result<()> {
         100.0 * hits as f64 / lookups as f64
     };
 
-    let mut out = String::with_capacity(rows.len() * 96 + 256);
+    // Split the headline figure, because "how much of this is even bytecode"
+    // is the first question a report like this has to answer.
+    let native_ns: u64 = profiler
+        .stats
+        .values()
+        .filter(|stat| stat.kind != Kind::Script)
+        .map(|stat| stat.exclusive_ns)
+        .sum();
+
+    let mut out = String::with_capacity(rows.len() * 112 + 320);
     out.push_str(&format!(
         "# measured script time {:.3} ms over {} distinct functions\n\
+         # of which {:.3} ms ({:.1}%) is native/dllimport, not interpreted bytecode\n\
          # FindFunction cache: {hits} hits, {misses} misses, {hit_rate:.1}% hit rate\n\
-         function,calls,exclusive_ms,inclusive_ms,exclusive_us_per_call\n",
+         function,kind,calls,exclusive_ms,inclusive_ms,exclusive_us_per_call\n",
         profiler.total_ns as f64 / 1.0e6,
         rows.len(),
+        native_ns as f64 / 1.0e6,
+        if profiler.total_ns == 0 {
+            0.0
+        } else {
+            100.0 * native_ns as f64 / profiler.total_ns as f64
+        },
     ));
 
     for stat in rows {
@@ -377,8 +523,9 @@ fn write_report(profiler: &Profiler) -> anyhow::Result<()> {
         // Paths carry no commas or quotes, but a corrupt read might, so the
         // field is quoted and any quote doubled.
         out.push_str(&format!(
-            "\"{}\",{},{:.3},{:.3},{:.3}\n",
+            "\"{}\",{},{},{:.3},{:.3},{:.3}\n",
             stat.name.replace('"', "\"\""),
+            stat.kind.label(),
             stat.calls,
             stat.exclusive_ns as f64 / 1.0e6,
             stat.inclusive_ns as f64 / 1.0e6,
@@ -409,6 +556,7 @@ pub fn init() -> anyhow::Result<()> {
     }
 
     let process_internal_address = PROCESS_INTERNAL.resolve()?;
+    let call_function_address = CALL_FUNCTION.resolve()?;
     let get_path_name_address = GET_PATH_NAME.resolve()?;
     let app_free_address = APP_FREE.resolve()?;
 
@@ -424,9 +572,20 @@ pub fn init() -> anyhow::Result<()> {
                 process_internal_hook(object, stack, result)
             })
             .context("failed to set up UObject::ProcessInternal hook")?;
+
+        let call_function: CallFunction = std::mem::transmute(call_function_address);
+        CallFunctionHook
+            .initialize(call_function, |object, stack, result, function| {
+                call_function_hook(object, stack, result, function)
+            })
+            .context("failed to set up UObject::CallFunction hook")?;
+
         ProcessInternalHook
             .enable()
             .context("failed to enable UObject::ProcessInternal hook")?;
+        CallFunctionHook
+            .enable()
+            .context("failed to enable UObject::CallFunction hook")?;
     }
 
     debug_log!(
