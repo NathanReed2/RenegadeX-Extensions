@@ -35,6 +35,8 @@ mod udk_client_vehicle_physics;
 #[cfg(target_arch = "x86_64")]
 mod udk_d3d9_flipex;
 #[cfg(target_arch = "x86_64")]
+mod udk_d3d9_present_params;
+#[cfg(target_arch = "x86_64")]
 mod udk_fog_light_direction;
 
 // Development tooling.
@@ -160,6 +162,18 @@ fn init_engine_patches() -> anyhow::Result<()> {
 /// - `udk_d3d9_flipex`: opt-in D3D9Ex/FlipEx presentation path, enabled only
 ///   by the `-D3D9EX`/`-D3D9FLIPEX` command line switches; installs no hooks
 ///   otherwise.
+/// - `udk_d3d9_present_params`: rewrites two `D3DPRESENT_PARAMETERS` fields
+///   that `FD3D9DynamicRHI::UpdateD3DDeviceFromViewports` hard-codes, by
+///   detouring `IDirect3D9::CreateDevice` and `IDirect3DDevice9::Reset`. It
+///   drops `D3DPRESENTFLAG_LOCKABLE_BACKBUFFER`, which forces a linear
+///   uncompressed back buffer that nothing in the D3D9 RHI ever locks
+///   (`ReadSurfaceData` goes through `GetRenderTargetData` into a SYSTEMMEM
+///   texture), and raises `BackBufferCount` from 1 to 2 so exclusive fullscreen
+///   is triple buffered instead of dropping to half refresh on one missed vsync.
+///   The extra buffer is added only to a `D3DSWAPEFFECT_DISCARD` chain, because
+///   the `D3DSWAPEFFECT_COPY` that every windowed and borderless viewport uses
+///   is defined for a single back buffer only. Stands down under
+///   `-D3D9EX`/`-D3D9FLIPEX`, which hand the same export to `udk_d3d9_flipex`.
 /// - `udk_fog_light_direction`: makes exponential height fog's two-tone
 ///   inscattering follow the fog actor's own rotation, instead of the world-up
 ///   direction `InitFogConstants` falls back to when it finds no dominant
@@ -177,12 +191,14 @@ fn init_engine_patches() -> anyhow::Result<()> {
 ///   keep stock behaviour - see the module docs.
 fn init_client_patches() -> anyhow::Result<()> {
     udk_borderless_fullscreen::init()?;
-    //#[cfg(target_arch = "x86_64")]
-    //udk_d3d9_flipex::init()?;
+    #[cfg(target_arch = "x86_64")]
+    udk_d3d9_flipex::init()?;
+    #[cfg(target_arch = "x86_64")]
+    udk_d3d9_present_params::init()?;
     #[cfg(target_arch = "x86_64")]
     udk_fog_light_direction::init()?;
-    #[cfg(target_arch = "x86_64")]
-    udk_client_vehicle_physics::init()?;
+    //#[cfg(target_arch = "x86_64")]
+    //udk_client_vehicle_physics::init()?;
     Ok(())
 }
 

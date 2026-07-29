@@ -107,6 +107,10 @@ static_detour! {
  static CreateCubeHook:unsafe extern "system" fn(Ptr,u32,u32,u32,u32,u32,*mut Ptr,*mut Ptr)->Hr;
  static CreateVBHook:unsafe extern "system" fn(Ptr,u32,u32,u32,u32,*mut Ptr,*mut Ptr)->Hr;
  static CreateIBHook:unsafe extern "system" fn(Ptr,u32,u32,u32,u32,*mut Ptr,*mut Ptr)->Hr;
+ static DrawHook:unsafe extern "system" fn(Ptr,u32,u32,u32)->Hr;
+ static DrawIndexedHook:unsafe extern "system" fn(Ptr,u32,i32,u32,u32,u32,u32)->Hr;
+ static DrawUPHook:unsafe extern "system" fn(Ptr,u32,u32,Ptr,u32)->Hr;
+ static DrawIndexedUPHook:unsafe extern "system" fn(Ptr,u32,u32,u32,u32,Ptr,u32,Ptr,u32)->Hr;
  static Lock2DHook:unsafe extern "system" fn(Ptr,u32,*mut LockedRect,*const Rect,u32)->Hr;
  static Unlock2DHook:unsafe extern "system" fn(Ptr,u32)->Hr;
  static Release2DHook:unsafe extern "system" fn(Ptr)->u32;
@@ -120,6 +124,9 @@ struct Config {
     ex: bool,
     flip: bool,
     editor: bool,
+    /// Defer each managed texture's upload until it is bound, instead of
+    /// uploading on every mip unlock. `-NoD3D9TextureBatch` turns this off.
+    batch: bool,
 }
 #[derive(Clone, Copy)]
 struct Pending {
@@ -133,6 +140,9 @@ struct Managed {
     staging: usize,
     device: usize,
     pending: Option<Pending>,
+    /// A write has been accumulated into `staging` but not yet pushed to the
+    /// GPU copy. Cleared by [`flush`], which runs before the texture is bound.
+    dirty: bool,
 }
 static CONFIG: OnceLock<Config> = OnceLock::new();
 static CREATE9EX: OnceLock<Create9Ex> = OnceLock::new();
@@ -145,11 +155,18 @@ static CUBE_HOOKED: AtomicBool = AtomicBool::new(false);
 static RELEASE_TARGET: AtomicUsize = AtomicUsize::new(0);
 static FIRST_MANAGED_TEXTURE_LOGGED: AtomicBool = AtomicBool::new(false);
 static FIRST_MANAGED_TEXTURE_STAGED_LOGGED: AtomicBool = AtomicBool::new(false);
+/// Number of entries in `TEX`/`CUBES` with `dirty` set. Kept exact so the
+/// `SetTexture` hook can skip the map lookup entirely - which is the common
+/// case, since nothing is outstanding outside a streaming burst.
+static DIRTY: AtomicUsize = AtomicUsize::new(0);
 thread_local! { static LEGACY_CREATE: Cell<bool> = const { Cell::new(false) }; }
 lazy_static! {
     static ref INSTALL: Mutex<()> = Mutex::new(());
     static ref TEX: Mutex<HashMap<usize, Managed>> = Mutex::new(HashMap::new());
     static ref CUBES: Mutex<HashMap<usize, Managed>> = Mutex::new(HashMap::new());
+    /// GPU texture pointers with a deferred upload outstanding, so [`sweep`]
+    /// costs O(pending) rather than a scan of every managed texture.
+    static ref DIRTY_LIST: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 }
 
 fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -180,7 +197,11 @@ fn args() -> Config {
         ex: has("D3D9EX") || flip,
         flip,
         editor: has("EDITOR") || has("MAKE"),
+        batch: !has("NOD3D9TEXTUREBATCH"),
     }
+}
+fn batching() -> bool {
+    CONFIG.get().is_some_and(|c| c.batch)
 }
 fn configure(p: &mut PresentParams, focus: Ptr) -> bool {
     let c = *CONFIG.get().unwrap();
@@ -253,6 +274,28 @@ unsafe fn hook_device(p: Ptr) -> anyhow::Result<()> {
         |a, b, c, d, e, f, g| unsafe { create_ib(a, b, c, d, e, f, g) },
     )?;
     CreateIBHook.enable()?;
+    // Draw entry points, so `sweep` can run before anything samples a texture.
+    // Indices cross-checked against the engine's own calls: SetTexture is 65
+    // (0x208) and SetSamplerState 69 (0x228) in FD3D9DynamicRHI, SetVertexShader
+    // 92 (0x2E0), SetStreamSource 100 (0x320), SetIndices 104 (0x340).
+    DrawHook.initialize(std::mem::transmute(vt(p, 81)), |a, b, c, d| unsafe {
+        draw(a, b, c, d)
+    })?;
+    DrawIndexedHook.initialize(
+        std::mem::transmute(vt(p, 82)),
+        |a, b, c, d, e, f, g| unsafe { draw_indexed(a, b, c, d, e, f, g) },
+    )?;
+    DrawUPHook.initialize(std::mem::transmute(vt(p, 83)), |a, b, c, d, e| unsafe {
+        draw_up(a, b, c, d, e)
+    })?;
+    DrawIndexedUPHook.initialize(
+        std::mem::transmute(vt(p, 84)),
+        |a, b, c, d, e, f, g, h, i| unsafe { draw_indexed_up(a, b, c, d, e, f, g, h, i) },
+    )?;
+    DrawHook.enable()?;
+    DrawIndexedHook.enable()?;
+    DrawUPHook.enable()?;
+    DrawIndexedUPHook.enable()?;
     DEVICE_HOOKED.store(true, Ordering::Release);
     Ok(())
 }
@@ -527,6 +570,7 @@ unsafe fn create_texture(
             staging: staging as usize,
             device: dev as usize,
             pending: None,
+            dirty: false,
         },
     );
     *out = gpu;
@@ -592,6 +636,7 @@ unsafe fn create_cube(
             staging: staging as usize,
             device: dev as usize,
             pending: None,
+            dirty: false,
         },
     );
     *out = gpu;
@@ -646,35 +691,159 @@ unsafe fn lock_2d(tex: Ptr, level: u32, out: *mut LockedRect, rect: *const Rect,
     }
     hr
 }
-unsafe fn copy_2d(tex: Ptr, m: Managed, p: Pending) -> Hr {
-    if p.read_only {
-        return OK;
-    }
-    // D3D9 only accumulates UpdateTexture dirty regions at level zero. UE3
-    // writes individual mip levels, so explicitly dirty the full texture after
-    // every written mip to ensure the updated sublevel is uploaded as well.
-    let dirty: AddDirtyRect2D = std::mem::transmute(vt(m.staging as Ptr, 21));
-    let hr = dirty(m.staging as Ptr, std::ptr::null());
-    if !good(hr) {
-        log(
-            LogType::Warning,
-            &format!("D3D9Ex AddDirtyRect failed ({hr:#010x}), mip={}", p.level),
-        );
-        return hr;
-    }
+/// Pushes the staging copy to the GPU copy. This is deliberately the whole-mip-
+/// chain `UpdateTexture` and nothing narrower: an earlier attempt to replace it
+/// with a per-level `UpdateSurface` rendered the world with black lightmaps, so
+/// the full-chain copy is load-bearing in some way that is not yet understood.
+/// Batching changes only how *often* this runs, never what it copies.
+unsafe fn upload(tex: Ptr, m: Managed) -> Hr {
     let update: UpdateTexture = std::mem::transmute(vt(m.device as Ptr, 31));
     let hr = update(m.device as Ptr, m.staging as Ptr, tex);
     if !good(hr) {
         log(
             LogType::Warning,
+            &format!("D3D9Ex UpdateTexture failed ({hr:#010x})"),
+        );
+    }
+    hr
+}
+
+/// Records that `tex` has an outstanding write. The dirty rectangles are
+/// already accumulated on the staging texture by the caller, so the deferred
+/// `UpdateTexture` copies exactly what an immediate one would have.
+fn mark_dirty(map: &Mutex<HashMap<usize, Managed>>, tex: Ptr) {
+    let newly_dirty = {
+        let mut guard = lock(map);
+        match guard.get_mut(&(tex as usize)) {
+            Some(entry) if !entry.dirty => {
+                entry.dirty = true;
+                true
+            }
+            _ => false,
+        }
+    };
+    if newly_dirty {
+        lock(&DIRTY_LIST).push(tex as usize);
+        DIRTY.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+/// Uploads `tex` if a write is outstanding. Returns whether this map owns
+/// `tex`, so the caller can skip searching the other one.
+///
+/// A pointer whose entry has since been removed is simply not found, so a
+/// texture destroyed while dirty can never be dereferenced from the pending
+/// list.
+unsafe fn take_dirty(map: &Mutex<HashMap<usize, Managed>>, tex: usize) -> bool {
+    // Drop the guard before calling into D3D9: the streaming thread unlocks
+    // against these same maps.
+    let managed = {
+        let mut guard = lock(map);
+        let Some(entry) = guard.get_mut(&tex) else {
+            return false;
+        };
+        if !entry.dirty {
+            return true;
+        }
+        entry.dirty = false;
+        DIRTY.fetch_sub(1, Ordering::AcqRel);
+        *entry
+    };
+    upload(tex as Ptr, managed);
+    true
+}
+
+/// Uploads everything written since the last draw.
+///
+/// Running this before every draw rather than at bind time is what makes the
+/// deferral airtight: it needs no reasoning about which textures are bound, so
+/// a texture written while already bound is still current by the time a shader
+/// can sample it. When nothing is outstanding - which is every draw outside a
+/// streaming burst - the whole thing is one relaxed atomic load.
+unsafe fn sweep() {
+    if DIRTY.load(Ordering::Acquire) == 0 {
+        return;
+    }
+    let pending = std::mem::take(&mut *lock(&DIRTY_LIST));
+    for tex in pending {
+        if !take_dirty(&TEX, tex) {
+            take_dirty(&CUBES, tex);
+        }
+    }
+}
+
+unsafe fn draw(dev: Ptr, kind: u32, start: u32, count: u32) -> Hr {
+    sweep();
+    DrawHook.call(dev, kind, start, count)
+}
+unsafe fn draw_indexed(
+    dev: Ptr,
+    kind: u32,
+    base: i32,
+    min_index: u32,
+    vertices: u32,
+    start: u32,
+    count: u32,
+) -> Hr {
+    sweep();
+    DrawIndexedHook.call(dev, kind, base, min_index, vertices, start, count)
+}
+unsafe fn draw_up(dev: Ptr, kind: u32, count: u32, data: Ptr, stride: u32) -> Hr {
+    sweep();
+    DrawUPHook.call(dev, kind, count, data, stride)
+}
+#[allow(clippy::too_many_arguments)]
+unsafe fn draw_indexed_up(
+    dev: Ptr,
+    kind: u32,
+    min_index: u32,
+    vertices: u32,
+    count: u32,
+    indices: Ptr,
+    index_format: u32,
+    data: Ptr,
+    stride: u32,
+) -> Hr {
+    sweep();
+    DrawIndexedUPHook.call(
+        dev,
+        kind,
+        min_index,
+        vertices,
+        count,
+        indices,
+        index_format,
+        data,
+        stride,
+    )
+}
+
+unsafe fn copy_2d(tex: Ptr, m: Managed, p: Pending) -> Hr {
+    if p.read_only {
+        return OK;
+    }
+    // D3D9 only accumulates UpdateTexture dirty regions at level zero, and UE3
+    // locks with D3DLOCK_NO_DIRTY_UPDATE so nothing marks them for us. Dirty
+    // the full texture now; unioning N of these is what makes deferring the
+    // upload equivalent to doing it on every unlock.
+    let dirty: AddDirtyRect2D = std::mem::transmute(vt(m.staging as Ptr, 21));
+    let hr = dirty(m.staging as Ptr, std::ptr::null());
+    if !good(hr) {
+        log(
+            LogType::Warning,
             &format!(
-                "D3D9Ex UpdateTexture failed ({hr:#010x}), mip={}, rect={}",
+                "D3D9Ex AddDirtyRect failed ({hr:#010x}), mip={}, rect={}",
                 p.level,
                 if p.rect.is_some() { "partial" } else { "full" }
             ),
         );
+        return hr;
     }
-    hr
+    if batching() {
+        mark_dirty(&TEX, tex);
+        return OK;
+    }
+    upload(tex, m)
 }
 unsafe fn unlock_2d(tex: Ptr, level: u32) -> Hr {
     let Some(m) = lock(&TEX).get(&(tex as usize)).copied() else {
@@ -737,26 +906,19 @@ unsafe fn copy_cube(tex: Ptr, m: Managed, p: Pending) -> Hr {
         log(
             LogType::Warning,
             &format!(
-                "D3D9Ex cube AddDirtyRect failed ({hr:#010x}), face={}, mip={}",
-                p.face, p.level
-            ),
-        );
-        return hr;
-    }
-    let update: UpdateTexture = std::mem::transmute(vt(m.device as Ptr, 31));
-    let hr = update(m.device as Ptr, m.staging as Ptr, tex);
-    if !good(hr) {
-        log(
-            LogType::Warning,
-            &format!(
-                "D3D9Ex cube UpdateTexture failed ({hr:#010x}), face={}, mip={}, rect={}",
+                "D3D9Ex cube AddDirtyRect failed ({hr:#010x}), face={}, mip={}, rect={}",
                 p.face,
                 p.level,
                 if p.rect.is_some() { "partial" } else { "full" }
             ),
         );
+        return hr;
     }
-    hr
+    if batching() {
+        mark_dirty(&CUBES, tex);
+        return OK;
+    }
+    upload(tex, m)
 }
 unsafe fn unlock_cube(tex: Ptr, face: u32, level: u32) -> Hr {
     let Some(m) = lock(&CUBES).get(&(tex as usize)).copied() else {
@@ -782,7 +944,15 @@ unsafe fn unlock_cube(tex: Ptr, face: u32, level: u32) -> Hr {
 unsafe fn drop_managed(map: &Mutex<HashMap<usize, Managed>>, tex: Ptr) {
     // Drop the map guard before Release. Texture Release is detoured and can
     // re-enter this function for the staging texture.
-    let staging = { lock(map).remove(&(tex as usize)).map(|m| m.staging) };
+    let staging = {
+        let removed = lock(map).remove(&(tex as usize));
+        // Keep DIRTY exact: a texture destroyed while dirty is never flushed,
+        // and a raw pointer that outlived its entry must never be uploaded.
+        if removed.is_some_and(|m| m.dirty) {
+            DIRTY.fetch_sub(1, Ordering::AcqRel);
+        }
+        removed.map(|m| m.staging)
+    };
     if let Some(staging) = staging {
         release(staging as Ptr)
     }
