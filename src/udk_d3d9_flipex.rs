@@ -3,6 +3,12 @@
 //! `-D3D9FLIPEX` enables Ex plus FlipEx when the initial presentation setup is
 //! eligible. `-D3D9EX` enables only the Ex/resource-emulation path. Without
 //! either switch this module installs no hooks and stock D3D9 is unchanged.
+//!
+//! Emulating the MANAGED pool means every mip write costs an explicit upload,
+//! which is what ate the presentation win: UE3 streams a texture in mip by mip,
+//! so an N-mip texture paid N whole-chain uploads. Writes are instead
+//! accumulated on the staging copy and flushed once by [`sweep`] before the next
+//! draw. `-NoD3D9TextureBatch` restores the upload-per-unlock behaviour.
 
 #![cfg(target_arch = "x86_64")]
 
@@ -32,6 +38,8 @@ const FLIPEX: u32 = 5;
 const LOCKABLE: u32 = 1;
 const LOCK_READONLY: u32 = 0x10;
 const LOCK_DISCARD: u32 = 0x2000;
+const INTERVAL_IMMEDIATE: u32 = 0x8000_0000;
+const PRESENT_FORCEIMMEDIATE: u32 = 0x100;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -141,7 +149,7 @@ struct Managed {
     device: usize,
     pending: Option<Pending>,
     /// A write has been accumulated into `staging` but not yet pushed to the
-    /// GPU copy. Cleared by [`flush`], which runs before the texture is bound.
+    /// GPU copy. Cleared by [`take_dirty`], which runs before the next draw.
     dirty: bool,
 }
 static CONFIG: OnceLock<Config> = OnceLock::new();
@@ -155,10 +163,12 @@ static CUBE_HOOKED: AtomicBool = AtomicBool::new(false);
 static RELEASE_TARGET: AtomicUsize = AtomicUsize::new(0);
 static FIRST_MANAGED_TEXTURE_LOGGED: AtomicBool = AtomicBool::new(false);
 static FIRST_MANAGED_TEXTURE_STAGED_LOGGED: AtomicBool = AtomicBool::new(false);
-/// Number of entries in `TEX`/`CUBES` with `dirty` set. Kept exact so the
-/// `SetTexture` hook can skip the map lookup entirely - which is the common
-/// case, since nothing is outstanding outside a streaming burst.
+/// Length of `DIRTY_LIST`, so [`sweep`] can rule out pending work with a single
+/// atomic load instead of a mutex acquisition - which is every draw outside a
+/// streaming burst. Only ever written while `DIRTY_LIST` is held.
 static DIRTY: AtomicUsize = AtomicUsize::new(0);
+/// Set when the swap chain was created at `INTERVAL_IMMEDIATE`, i.e. vsync off.
+static IMMEDIATE: AtomicBool = AtomicBool::new(false);
 thread_local! { static LEGACY_CREATE: Cell<bool> = const { Cell::new(false) }; }
 lazy_static! {
     static ref INSTALL: Mutex<()> = Mutex::new(());
@@ -211,8 +221,15 @@ fn configure(p: &mut PresentParams, focus: Ptr) -> bool {
         && p.ms_type == 0
         && !p.window.is_null()
         && p.window == focus;
+    // FlipEx presents go through a queue. With vsync on, two buffers leave the
+    // GPU idle while the front buffer is scanned out - that flip-queue stall is
+    // what the third buffer removes, and it is where the frame-pacing win comes
+    // from. With vsync off the queue is bypassed outright (see
+    // `PRESENT_FORCEIMMEDIATE`), so a third buffer would only add latency.
+    let immediate = p.interval == INTERVAL_IMMEDIATE;
+    IMMEDIATE.store(flip && immediate, Ordering::Release);
     if flip {
-        p.count = 2;
+        p.count = if immediate { 2 } else { 3 };
         p.effect = FLIPEX;
         p.flags &= !LOCKABLE;
     } else if p.effect == FLIPEX {
@@ -387,7 +404,7 @@ unsafe fn create_device(
         DEVICE.store(*out as usize, Ordering::Release);
         FLIP.store(flip, Ordering::Release);
         log(LogType::Init,&format!("D3D9Ex active: FlipEx requested={}, active={}, {}x{}, buffers={}, interval={}, HWND={:#x}",CONFIG.get().unwrap().flip,flip,(*pp).width,(*pp).height,(*pp).count,(*pp).interval,(*pp).window as usize));
-        log(LogType::Init,"D3D9Ex resources: DEFAULT GPU textures with SYSTEMMEM staging; static vertex/index buffers use DEFAULT");
+        log(LogType::Init,&format!("D3D9Ex resources: DEFAULT GPU textures with SYSTEMMEM staging; static vertex/index buffers use DEFAULT; texture upload batching={}, forced-immediate presents={}",batching(),IMMEDIATE.load(Ordering::Acquire)));
         return hr;
     }
     log(
@@ -429,19 +446,38 @@ unsafe fn present(dev: Ptr, s: *const Rect, d: *const Rect, w: Ptr, r: Ptr) -> H
         return PresentHook.call(dev, s, d, w, r);
     }
     let f: PresentEx = std::mem::transmute(vt(dev, 121));
-    let flip = FLIP.load(Ordering::Acquire);
-    let hr = if flip {
+    if !FLIP.load(Ordering::Acquire) {
+        let hr = f(dev, s, d, w, r, 0);
+        if hr < 0 {
+            log(LogType::Warning, &format!("PresentEx failed ({hr:#010x})"));
+        }
+        return hr;
+    }
+    // A FlipEx swap chain still queues presents at INTERVAL_IMMEDIATE, which
+    // caps throughput at the flip rate; FORCEIMMEDIATE is what actually bypasses
+    // the queue. It is only legal on FlipEx, so if the runtime rejects it, drop
+    // it for good and re-present rather than failing - and logging - every frame.
+    let immediate = IMMEDIATE.load(Ordering::Acquire);
+    let flags = if immediate { PRESENT_FORCEIMMEDIATE } else { 0 };
+    let present_flip = |flags| {
         f(
             dev,
             std::ptr::null(),
             std::ptr::null(),
             std::ptr::null_mut(),
             std::ptr::null_mut(),
-            0,
+            flags,
         )
-    } else {
-        f(dev, s, d, w, r, 0)
     };
+    let mut hr = present_flip(flags);
+    if hr < 0 && immediate {
+        IMMEDIATE.store(false, Ordering::Release);
+        log(
+            LogType::Warning,
+            &format!("PresentEx rejected FORCEIMMEDIATE ({hr:#010x}); using queued presents"),
+        );
+        hr = present_flip(0);
+    }
     if hr < 0 {
         log(LogType::Warning, &format!("PresentEx failed ({hr:#010x})"));
     }
@@ -723,8 +759,15 @@ fn mark_dirty(map: &Mutex<HashMap<usize, Managed>>, tex: Ptr) {
         }
     };
     if newly_dirty {
-        lock(&DIRTY_LIST).push(tex as usize);
-        DIRTY.fetch_add(1, Ordering::AcqRel);
+        // Publish the pointer and the fast-path count under one guard. As two
+        // separate atomics, a sweep on the render thread can drain the list
+        // between the push and the count update - UE3 streams mips from its own
+        // thread, so that interleaving is reachable. The count then never
+        // returns to zero, and every later draw pays a mutex it should have
+        // skipped.
+        let mut list = lock(&DIRTY_LIST);
+        list.push(tex as usize);
+        DIRTY.store(list.len(), Ordering::Release);
     }
 }
 
@@ -746,7 +789,6 @@ unsafe fn take_dirty(map: &Mutex<HashMap<usize, Managed>>, tex: usize) -> bool {
             return true;
         }
         entry.dirty = false;
-        DIRTY.fetch_sub(1, Ordering::AcqRel);
         *entry
     };
     upload(tex as Ptr, managed);
@@ -764,7 +806,11 @@ unsafe fn sweep() {
     if DIRTY.load(Ordering::Acquire) == 0 {
         return;
     }
-    let pending = std::mem::take(&mut *lock(&DIRTY_LIST));
+    let pending = {
+        let mut list = lock(&DIRTY_LIST);
+        DIRTY.store(0, Ordering::Release);
+        std::mem::take(&mut *list)
+    };
     for tex in pending {
         if !take_dirty(&TEX, tex) {
             take_dirty(&CUBES, tex);
@@ -944,15 +990,10 @@ unsafe fn unlock_cube(tex: Ptr, face: u32, level: u32) -> Hr {
 unsafe fn drop_managed(map: &Mutex<HashMap<usize, Managed>>, tex: Ptr) {
     // Drop the map guard before Release. Texture Release is detoured and can
     // re-enter this function for the staging texture.
-    let staging = {
-        let removed = lock(map).remove(&(tex as usize));
-        // Keep DIRTY exact: a texture destroyed while dirty is never flushed,
-        // and a raw pointer that outlived its entry must never be uploaded.
-        if removed.is_some_and(|m| m.dirty) {
-            DIRTY.fetch_sub(1, Ordering::AcqRel);
-        }
-        removed.map(|m| m.staging)
-    };
+    // A texture destroyed while dirty leaves its pointer in DIRTY_LIST. That is
+    // safe by construction: the next sweep looks the pointer up, misses, and
+    // drops it, so a pointer that outlived its entry is never dereferenced.
+    let staging = { lock(map).remove(&(tex as usize)).map(|m| m.staging) };
     if let Some(staging) = staging {
         release(staging as Ptr)
     }

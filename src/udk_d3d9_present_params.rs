@@ -312,6 +312,11 @@ unsafe fn create_device(
             if let Err(error) = hook_device(*out) {
                 debug_log!("D3D9 Reset hook failed: {error:#}; resolution changes stay stock");
             }
+            // Hand the live device to any other module that needs one. This is
+            // the only place in the process where a freshly created
+            // IDirect3DDevice9 is observable, and re-deriving it elsewhere would
+            // mean a second hook on the same contended CreateDevice.
+            crate::udk_gpu_light_env::note_device(*out);
         }
         return hr;
     }
@@ -326,6 +331,10 @@ unsafe fn create_device(
 }
 
 unsafe fn reset(device: Ptr, params: *mut PresentParams) -> Hr {
+    // A reset destroys every D3DPOOL_DEFAULT resource. Anything this process
+    // holds in that pool has to be released before the call, not after.
+    crate::udk_gpu_light_env::invalidate_atlas();
+
     if params.is_null() || disabled() {
         return ResetHook.call(device, params);
     }
