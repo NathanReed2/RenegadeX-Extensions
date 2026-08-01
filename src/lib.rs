@@ -161,15 +161,18 @@ patch_group!(fn init_engine_patches {
     udk_xaudio,
     #[cfg(target_arch = "x86_64")]
     udk_audio_channels,
-    #[cfg(target_arch = "x86_64")]
-    udk_script_func_cache,
+    //#[cfg(target_arch = "x86_64")]
+    //udk_script_func_cache,
 });
 
 // Presentation and gameplay changes that only reach a running game client.
 // These are the ones to reach for when something looks or plays wrong, and the
 // safe ones to disable when isolating a rendering or physics regression.
 //
-// - `udk_borderless_fullscreen`: borderless fullscreen window support.
+// - `udk_borderless_fullscreen`: borderless fullscreen window support. Adds
+//   the `SETRES <w>x<h>b` suffix and a `GETRESMODE` query for menus, and
+//   remembers the chosen mode in `[SystemSettings]` next to `ResX`/`Fullscreen`
+//   so it comes back on the next launch - see the module docs.
 // - `udk_d3d9_flipex`: opt-in D3D9Ex/FlipEx presentation path, enabled only
 //   by the `-D3D9EX`/`-D3D9FLIPEX` command line switches; installs no hooks
 //   otherwise.
@@ -202,16 +205,16 @@ patch_group!(fn init_engine_patches {
 //   keep stock behaviour - see the module docs.
 patch_group!(fn init_client_patches {
     udk_borderless_fullscreen,
-    #[cfg(target_arch = "x86_64")]
-    udk_d3d9_flipex,
-    #[cfg(target_arch = "x86_64")]
-    udk_d3d9_present_params,
+    //#[cfg(target_arch = "x86_64")]
+    //udk_d3d9_flipex,
+    //#[cfg(target_arch = "x86_64")]
+    //udk_d3d9_present_params,
     #[cfg(target_arch = "x86_64")]
     udk_fog_light_direction,
-    #[cfg(target_arch = "x86_64")]
-    udk_gpu_light_env,
-    #[cfg(target_arch = "x86_64")]
-    udk_dle_shadow_cost,
+    //#[cfg(target_arch = "x86_64")]
+    //udk_gpu_light_env,
+    //#[cfg(target_arch = "x86_64")]
+    //udk_dle_shadow_cost,
     // #[cfg(target_arch = "x86_64")]
     // udk_client_vehicle_physics,
 });
@@ -226,8 +229,8 @@ patch_group!(fn init_client_patches {
 //   even when not actively being used - only uncomment it if you also want it
 //   excluded from the build.
 patch_group!(fn init_tooling_patches {
-    #[cfg(target_arch = "x86_64")]
-    udk_mcp,
-    #[cfg(target_arch = "x86_64")]
-    udk_script_profiler,
+    //#[cfg(target_arch = "x86_64")]
+    //udk_mcp,
+    //#[cfg(target_arch = "x86_64")]
+    //udk_script_profiler,
 });

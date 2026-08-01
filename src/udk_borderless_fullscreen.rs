@@ -4,6 +4,50 @@
 //! use `ConsoleCommand("SETRES <width>x<height>b")`; the existing `f` and `w`
 //! suffixes switch back to exclusive fullscreen and windowed mode.
 //!
+//! # Asking which mode is active
+//!
+//! `ConsoleCommand("GETRESMODE")` answers `borderless`, `fullscreen` or
+//! `windowed`, so a settings menu can show the mode the player is actually in.
+//! Nothing stock can do that: UE3 performs all of its ordinary fullscreen work
+//! in borderless mode, so `FViewport::bIsFullscreen` - and therefore
+//! `GameViewportClient.IsFullScreenViewport()` - is TRUE for both `f` and `b`.
+//! That flag staying set is load-bearing rather than incidental; see
+//! [`stretch_window`].
+//!
+//! The reply goes through the command's `FOutputDevice`, which is what
+//! `ConsoleCommand` hands back to script. `FConsoleOutputDevice` appends a
+//! newline and echoes to the log, so match with `InStr` rather than `==`, and
+//! query when a menu opens rather than every tick.
+//!
+//! # Remembering the mode
+//!
+//! Exclusive fullscreen and windowed already survive a restart on their own,
+//! because `FWindowsViewport::UpdateRenderDevice` ends in
+//! `GSystemSettings.SetResolution`, which persists `[SystemSettings] Fullscreen`.
+//! That flag cannot distinguish borderless, though, so borderless would decay
+//! into exclusive fullscreen on the next launch. [`update_render_device_hook`]
+//! therefore records the effective mode next to the engine's own write, under
+//! the same conditions, and [`init`] restores it.
+//!
+//! The preference sits in `[SystemSettings]` of [`SYSTEM_SETTINGS_FILE_NAME`],
+//! beside the `ResX`/`ResY`/`Fullscreen` it belongs with, so there is one place
+//! to look and it is regenerated, backed up and reset along with them.
+//!
+//! Getting it there means writing through `GConfig`, not through the file.
+//! `GConfig` parses a whole ini into memory at startup and rewrites it wholesale
+//! once something dirties it, which a resolution change always does - so a key
+//! poked into the file behind its back would be dropped by the very change that
+//! set it. [`config_set_bool`] calls `FConfigCacheIni::SetBool` exactly as
+//! `FSystemSettings::SaveToIni` does, one call after the engine has written its
+//! own resolution keys, so both reach the disk on the same flush.
+//!
+//! Reading happens the other way round, straight off the file: [`init`] runs at
+//! `DLL_PROCESS_ATTACH`, long before `GConfig` exists, and the mode has to be
+//! decided before `UGameEngine::Init` tests for `-FULLSCREEN`. The path is
+//! derived from the executable's location; [`config_set_bool`] cross-checks it
+//! against `GSystemSettingsIni` once that global is populated, and logs a
+//! mismatch rather than silently remembering nothing.
+//!
 //! The byte patches keep the D3D device/swap chain windowed while UE3 performs
 //! its ordinary fullscreen work. That alone is not enough once the requested
 //! resolution is smaller than the desktop: `FWindowsViewport::Resize` sizes the
@@ -56,7 +100,7 @@ use std::cell::Cell;
 #[cfg(target_arch = "x86_64")]
 use std::ffi::c_void;
 #[cfg(target_arch = "x86_64")]
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering};
 #[cfg(target_arch = "x86_64")]
 use std::sync::Mutex;
 
@@ -79,6 +123,28 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 const LAUNCH_OPTION: &str = "-BorderlessFullscreen";
+/// Escapes a remembered borderless mode without editing [`CONFIG_FILE_NAME`],
+/// for the case where it leaves the game unusable on the player's setup.
+const DISABLE_LAUNCH_OPTION: &str = "-NoBorderlessFullscreen";
+
+/// What `GSystemSettingsIni` resolves to for this game. The engine's own
+/// `ResX`, `ResY` and `Fullscreen` live in the same section of the same file.
+const SYSTEM_SETTINGS_FILE_NAME: &str = "UDKSystemSettings.ini";
+/// `GetSectionName(bIsEditor=FALSE, NULL)` in `SystemSettings.cpp`. Only a
+/// client is ever written back, so the editor and mobile variants cannot occur.
+const CONFIG_SECTION: &str = "SystemSettings";
+const CONFIG_KEY: &str = "BorderlessFullscreen";
+
+/// Console command that reports the active mode. Parsed case-insensitively.
+#[cfg(target_arch = "x86_64")]
+const QUERY_COMMAND: &[u8] = b"GETRESMODE";
+
+#[cfg(target_arch = "x86_64")]
+const MODE_BORDERLESS: &str = "borderless";
+#[cfg(target_arch = "x86_64")]
+const MODE_FULLSCREEN: &str = "fullscreen";
+#[cfg(target_arch = "x86_64")]
+const MODE_WINDOWED: &str = "windowed";
 
 /// A function whose prologue is verified before a detour is written over it.
 #[cfg(target_arch = "x86_64")]
@@ -340,6 +406,23 @@ static MODE_CHANGE_LOCK: Mutex<()> = Mutex::new(());
 #[cfg(target_arch = "x86_64")]
 static BORDERLESS_ACTIVE: AtomicBool = AtomicBool::new(false);
 
+/// Mirrors `FViewport::bIsFullscreen` for the main game viewport.
+///
+/// Reading the flag back off the engine object would need an offset this module
+/// does not otherwise use; tracking it is exact instead of approximate, because
+/// on Windows every write to it goes through `FViewport::UpdateViewportRHI`, and
+/// the only caller that reaches the game viewport is
+/// `FWindowsViewport::UpdateRenderDevice` - which is hooked here.
+#[cfg(target_arch = "x86_64")]
+static VIEWPORT_FULLSCREEN: AtomicBool = AtomicBool::new(false);
+
+/// Last value written to [`CONFIG_FILE_NAME`], so an unchanged mode does not
+/// rewrite the file. `2` means "not read yet".
+#[cfg(target_arch = "x86_64")]
+static SAVED_BORDERLESS: AtomicU8 = AtomicU8::new(SAVED_UNKNOWN);
+#[cfg(target_arch = "x86_64")]
+const SAVED_UNKNOWN: u8 = 2;
+
 /// The window that is currently stretched over a monitor, or 0. Stored last on
 /// the way in and cleared first on the way out so a reader that sees a window
 /// also sees its matching back-buffer size.
@@ -358,10 +441,201 @@ thread_local! {
     static RESIZE_MONITOR: Cell<Option<RECT>> = const { Cell::new(None) };
 }
 
-fn launch_option_present() -> bool {
+fn launch_option_present(option: &str) -> bool {
     std::env::args_os()
         .skip(1)
-        .any(|arg| arg.to_string_lossy().eq_ignore_ascii_case(LAUNCH_OPTION))
+        .any(|arg| arg.to_string_lossy().eq_ignore_ascii_case(option))
+}
+
+/// TRUE for a run that will create a game window.
+///
+/// UE3 reads the first non-switch token on the command line to pick what to
+/// run: `editor`, `server`, `make` or a commandlet name select something other
+/// than a client, and a client passes a map name or nothing at all. The
+/// remembered mode must not follow the editor into its own viewports, and only
+/// a client should have its preference written back.
+fn is_game_client_process() -> bool {
+    const NON_CLIENT_TOKENS: &[&str] = &["editor", "server", "make", "run", "cookpackages"];
+
+    let Some(token) = std::env::args_os()
+        .skip(1)
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .find(|argument| !argument.starts_with('-'))
+    else {
+        return true;
+    };
+
+    let token = token.to_ascii_lowercase();
+    !NON_CLIENT_TOKENS.contains(&token.as_str()) && !token.ends_with("commandlet")
+}
+
+/// `<install>\UDKGame\Config\UDKSystemSettings.ini`, derived from
+/// `<install>\Binaries\Win64\UDK.exe`.
+///
+/// This duplicates what `GSystemSettingsIni` holds, because that global is still
+/// empty when this module needs the answer. [`config_set_bool`] compares the two
+/// once the engine has filled it in.
+fn config_path() -> Option<std::path::PathBuf> {
+    let executable = std::env::current_exe().ok()?;
+    let config_directory = executable
+        .parent()
+        .and_then(|win64| win64.parent())
+        .and_then(|binaries| binaries.parent())
+        .map(|install| install.join("UDKGame").join("Config"))?;
+
+    Some(config_directory.join(SYSTEM_SETTINGS_FILE_NAME))
+}
+
+/// Splits an ini line into its section name, if it declares one.
+fn section_name(line: &str) -> Option<&str> {
+    let line = line.trim();
+    line.strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+        .map(str::trim)
+}
+
+/// Reads [`CONFIG_KEY`] out of an ini body. UE3 writes `True`/`False`; `1` and
+/// `0` are accepted too because a player editing the file by hand may use them.
+fn parse_borderless_preference(contents: &str) -> Option<bool> {
+    let mut in_section = false;
+    for line in contents.lines() {
+        if let Some(section) = section_name(line) {
+            in_section = section.eq_ignore_ascii_case(CONFIG_SECTION);
+            continue;
+        }
+        if !in_section {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        if !key.trim().eq_ignore_ascii_case(CONFIG_KEY) {
+            continue;
+        }
+        let value = value.trim();
+        return Some(value.eq_ignore_ascii_case("true") || value == "1");
+    }
+    None
+}
+
+/// The remembered mode, or `None` when nothing has been saved yet.
+fn read_borderless_preference() -> Option<bool> {
+    let path = config_path()?;
+    let contents = std::fs::read_to_string(&path).ok()?;
+    parse_borderless_preference(&contents)
+}
+
+/// `FConfigCacheIni::SetBool(Section, Key, Value, Filename)`. Non-virtual, and
+/// every argument is a plain pointer or integer, so there is no `FString` to
+/// marshal - it forwards to `SetString` with `TEXT("True")`/`TEXT("False")`.
+#[cfg(target_arch = "x86_64")]
+type ConfigSetBool = extern "C" fn(*mut c_void, *const u16, *const u16, u32, *const u16);
+
+/// Located by decompiling `FSystemSettings::SaveToIni`, whose three arms call
+/// `SetInt`/`SetFloat`/`SetBool` with `(GConfig, Section, Key, Value,
+/// &GSystemSettingsIni)` - the same shape as the symbol-bearing 2013 build.
+#[cfg(target_arch = "x86_64")]
+const CONFIG_SET_BOOL: HookTarget = HookTarget {
+    name: "FConfigCacheIni::SetBool",
+    rva: 0x001C_89B0,
+    prologue: &[
+        0x48, 0x83, 0xEC, 0x38, 0x41, 0x8B, 0xC1, 0x4C, 0x8D, 0x15, 0x0A, 0x12, 0x3F, 0x02, 0x4C,
+        0x8D, 0x0D, 0x13, 0x12, 0x3F, 0x02,
+    ],
+};
+
+/// `GConfig`, the global `FConfigCacheIni*`.
+#[cfg(target_arch = "x86_64")]
+const GCONFIG_RVA: usize = 0x0354_0930;
+/// `GSystemSettingsIni`. An inline `TCHAR` buffer rather than a pointer, so its
+/// *address* is the string - which is how `SaveToIni` passes it.
+#[cfg(target_arch = "x86_64")]
+const GSYSTEM_SETTINGS_INI_RVA: usize = 0x0354_AA60;
+
+#[cfg(target_arch = "x86_64")]
+fn wide(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// Reads a null-terminated wide string out of the image, for comparing
+/// `GSystemSettingsIni` against the path [`config_path`] guessed. Only the dev
+/// profile makes that comparison, because only it can report the answer.
+#[cfg(all(target_arch = "x86_64", debug_assertions))]
+unsafe fn read_wide_string(address: *const u16, limit: usize) -> String {
+    let mut units = Vec::new();
+    for index in 0..limit {
+        let unit = address.add(index).read();
+        if unit == 0 {
+            break;
+        }
+        units.push(unit);
+    }
+    String::from_utf16_lossy(&units)
+}
+
+/// Sets a key in the engine's own system-settings ini, through `GConfig` so the
+/// engine's next flush carries it to disk instead of overwriting it.
+///
+/// Returns FALSE when the engine is not in a state to accept the write, which
+/// is not an error worth failing a resolution change over: the mode the player
+/// asked for has already been applied, and only the memory of it is lost.
+#[cfg(target_arch = "x86_64")]
+fn config_set_bool(key: &str, value: bool) -> bool {
+    let Ok(gconfig_address) = image_address(GCONFIG_RVA, std::mem::size_of::<usize>(), "GConfig")
+    else {
+        return false;
+    };
+    let Ok(ini_address) = image_address(GSYSTEM_SETTINGS_INI_RVA, 2, "GSystemSettingsIni") else {
+        return false;
+    };
+    let Ok(set_bool_address) = CONFIG_SET_BOOL.resolve() else {
+        debug_log!("{} moved; cannot remember the mode", CONFIG_SET_BOOL.name);
+        return false;
+    };
+
+    // Both globals are still empty this early in a run; the caller only reaches
+    // here once a viewport exists, so this is a sanity check, not a race.
+    let gconfig = unsafe { *(gconfig_address as *const *mut c_void) };
+    let ini = ini_address as *const u16;
+    if gconfig.is_null() || unsafe { ini.read() } == 0 {
+        debug_log!("GConfig not ready; the mode will not be remembered");
+        return false;
+    }
+
+    // A home-directory redirect would put the engine's ini somewhere other than
+    // where init() read from. The save stays correct either way - it goes to
+    // whatever GSystemSettingsIni names - but the restore would then read a file
+    // nothing writes, so the failure is worth naming. Only the dev profile keeps
+    // debug_log!, so the lookup itself is not worth doing in release.
+    #[cfg(debug_assertions)]
+    if let Some(expected) = config_path() {
+        let actual = unsafe { read_wide_string(ini, 1024) };
+        if !actual.eq_ignore_ascii_case(&expected.to_string_lossy()) {
+            debug_log!(
+                "GSystemSettingsIni is {actual}, but init() read {}",
+                expected.display()
+            );
+        }
+    }
+
+    let (section, key, filename) = (wide(CONFIG_SECTION), wide(key), ini);
+    unsafe {
+        let set_bool: ConfigSetBool = std::mem::transmute(set_bool_address);
+        set_bool(gconfig, section.as_ptr(), key.as_ptr(), u32::from(value), filename);
+    }
+    true
+}
+
+/// Persists the effective mode, skipping the write when it has not changed.
+#[cfg(target_arch = "x86_64")]
+fn save_borderless_preference(borderless: bool) {
+    if SAVED_BORDERLESS.load(Ordering::Relaxed) == u8::from(borderless) {
+        return;
+    }
+    if config_set_bool(CONFIG_KEY, borderless) {
+        SAVED_BORDERLESS.store(u8::from(borderless), Ordering::Relaxed);
+        debug_log!("remembered [{CONFIG_SECTION}] {CONFIG_KEY}={borderless}");
+    }
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -722,6 +996,68 @@ fn is_ascii_digit(unit: u16) -> bool {
     (b'0' as u16..=b'9' as u16).contains(&unit)
 }
 
+/// `FOutputDevice::Serialize(const TCHAR*, EName)`.
+#[cfg(target_arch = "x86_64")]
+type OutputDeviceSerialize = extern "C" fn(*mut c_void, *const u16, u32);
+
+/// `Serialize` sits directly after MSVC's deleting destructor in the
+/// `FOutputDevice` vtable. Confirmed against `FOutputDevice::Log` in the
+/// symbol-bearing 2013 build, whose whole body ends in
+/// `MOV RAX,[RBX]; MOV R8D,EDI; MOV RDX,RSI; MOV RCX,RBX; CALL qword ptr [RAX + 0x8]`.
+#[cfg(target_arch = "x86_64")]
+const OUTPUT_DEVICE_SERIALIZE_SLOT: usize = 1;
+/// `NAME_None`, the event category an unadorned `Logf` uses.
+#[cfg(target_arch = "x86_64")]
+const NAME_NONE: u32 = 0;
+
+/// Answers an exec command through the device `Exec` was handed, which is the
+/// string `ConsoleCommand` returns to script.
+#[cfg(target_arch = "x86_64")]
+fn write_output(output_device: *mut c_void, text: &str) {
+    if output_device.is_null() {
+        return;
+    }
+
+    let mut units: Vec<u16> = text.encode_utf16().collect();
+    units.push(0);
+
+    unsafe {
+        let vtable = *(output_device as *const *const *const ());
+        let serialize: OutputDeviceSerialize =
+            std::mem::transmute(*vtable.add(OUTPUT_DEVICE_SERIALIZE_SLOT));
+        serialize(output_device, units.as_ptr(), NAME_NONE);
+    }
+}
+
+/// TRUE for a bare [`QUERY_COMMAND`], ignoring case and surrounding whitespace.
+#[cfg(target_arch = "x86_64")]
+fn is_query_command(command: &[u16]) -> bool {
+    let Some(mut index) = command.iter().position(|unit| !is_ascii_whitespace(*unit)) else {
+        return false;
+    };
+
+    for expected in QUERY_COMMAND {
+        match command.get(index) {
+            Some(unit) if ascii_eq_ignore_case(*unit, *expected) => index += 1,
+            _ => return false,
+        }
+    }
+
+    command[index..].iter().all(|unit| is_ascii_whitespace(*unit))
+}
+
+/// The mode a settings menu should show as selected.
+#[cfg(target_arch = "x86_64")]
+fn current_mode() -> &'static str {
+    if !VIEWPORT_FULLSCREEN.load(Ordering::Relaxed) {
+        MODE_WINDOWED
+    } else if BORDERLESS_ACTIVE.load(Ordering::Relaxed) {
+        MODE_BORDERLESS
+    } else {
+        MODE_FULLSCREEN
+    }
+}
+
 /// Returns the UTF-16 index and lower-case mode suffix for a SETRES command.
 #[cfg(target_arch = "x86_64")]
 fn setres_mode(command: &[u16]) -> Option<(usize, u8)> {
@@ -796,6 +1132,12 @@ extern "C" fn game_viewport_exec_hook(
     let Some(mut command_units) = (unsafe { read_wide_command(command) }) else {
         return GameViewportExecHook.call(viewport_client, command, output_device);
     };
+    if is_query_command(&command_units) {
+        let mode = current_mode();
+        debug_log!("GETRESMODE -> {mode}");
+        write_output(output_device, mode);
+        return 1;
+    }
     let Some((mode_index, mode)) = setres_mode(&command_units) else {
         return GameViewportExecHook.call(viewport_client, command, output_device);
     };
@@ -960,7 +1302,42 @@ extern "C" fn update_render_device_hook(
         new_fullscreen,
         save_resolution_settings,
     );
+    record_mode(frame, new_size_x, new_size_y, new_fullscreen, save_resolution_settings);
     trace_geometry("UpdateRenderDevice exit", frame);
+}
+
+/// Tracks the mode alongside the engine's own bookkeeping.
+///
+/// `FWindowsViewport::UpdateRenderDevice` sets `FViewport::bIsFullscreen` and
+/// calls `GSystemSettings.SetResolution` under `if( NewSizeX && NewSizeY )`,
+/// with `bSaveResolutionSettings` already cleared when `Resize` clamped the size
+/// to the display aspect ratio. Matching both conditions keeps the remembered
+/// mode in lockstep with the `Fullscreen` flag the engine writes next to it, so
+/// the two can never disagree about a restart.
+///
+/// The mode is recorded as the *effective* one rather than as whichever suffix
+/// SETRES carried, because Alt-Enter leaves borderless without going through
+/// SETRES at all: the patches stay applied, but the viewport is windowed, and
+/// what should come back on the next launch is a window.
+#[cfg(target_arch = "x86_64")]
+fn record_mode(
+    frame: *mut c_void,
+    new_size_x: u32,
+    new_size_y: u32,
+    new_fullscreen: u32,
+    save_resolution_settings: u32,
+) {
+    let is_main_viewport = unsafe { read_window(frame, VIEWPORT_PARENT_WINDOW_OFFSET) }.0 == 0;
+    if !is_main_viewport || new_size_x == 0 || new_size_y == 0 {
+        return;
+    }
+
+    let fullscreen = new_fullscreen != 0;
+    VIEWPORT_FULLSCREEN.store(fullscreen, Ordering::Relaxed);
+
+    if save_resolution_settings != 0 && is_game_client_process() {
+        save_borderless_preference(fullscreen && BORDERLESS_ACTIVE.load(Ordering::Relaxed));
+    }
 }
 
 /// `this` for the `FViewport` virtuals; the window lives before the vtable-owner
@@ -1074,7 +1451,18 @@ pub fn init() -> anyhow::Result<()> {
             validate_patch(patch)?;
         }
 
-        let launch_borderless = launch_option_present();
+        // Seed the cache even when a launch option decides the mode, so the
+        // first resolution change compares against what is really on disk.
+        let saved = read_borderless_preference();
+        if let Some(saved) = saved {
+            SAVED_BORDERLESS.store(u8::from(saved), Ordering::Relaxed);
+        }
+
+        // A launch option overrides the remembered mode without replacing it;
+        // only an in-game mode change rewrites the file.
+        let launch_borderless = is_game_client_process()
+            && !launch_option_present(DISABLE_LAUNCH_OPTION)
+            && (launch_option_present(LAUNCH_OPTION) || saved.unwrap_or(false));
 
         unsafe {
             let exec: GameViewportExec = std::mem::transmute(exec_address);
@@ -1180,9 +1568,18 @@ pub fn init() -> anyhow::Result<()> {
         if launch_borderless {
             write_patch(&STARTUP_FULLSCREEN_PATCH, true)?;
             set_borderless_patches(true)?;
-            debug_log!("borderless fullscreen selected at launch by {LAUNCH_OPTION}");
+            debug_log!(
+                "borderless fullscreen selected at launch by {}",
+                if launch_option_present(LAUNCH_OPTION) {
+                    LAUNCH_OPTION
+                } else {
+                    SYSTEM_SETTINGS_FILE_NAME
+                }
+            );
         } else {
-            debug_log!("normal launch mode (use {LAUNCH_OPTION} or SETRES <width>x<height>b)");
+            debug_log!(
+                "normal launch mode (saved={saved:?}, use {LAUNCH_OPTION} or SETRES <width>x<height>b)"
+            );
         }
     }
 
@@ -1192,10 +1589,63 @@ pub fn init() -> anyhow::Result<()> {
 
 #[cfg(all(test, target_arch = "x86_64"))]
 mod tests {
-    use super::{scale_coordinate, setres_mode};
+    use super::{is_query_command, parse_borderless_preference, scale_coordinate, setres_mode};
 
     fn wide(value: &str) -> Vec<u16> {
         value.encode_utf16().collect()
+    }
+
+    #[test]
+    fn recognises_the_mode_query() {
+        assert!(is_query_command(&wide("GETRESMODE")));
+        assert!(is_query_command(&wide("  getresmode\t")));
+        assert!(!is_query_command(&wide("GETRESMODES")));
+        assert!(!is_query_command(&wide("GETRESMODE 1920x1080")));
+        assert!(!is_query_command(&wide("GETRES")));
+        assert!(!is_query_command(&wide("   ")));
+    }
+
+    #[test]
+    fn reads_the_saved_mode() {
+        // The shape GConfig writes: True/False, in [SystemSettings].
+        assert_eq!(
+            parse_borderless_preference("[SystemSettings]\r\nBorderlessFullscreen=True\r\n"),
+            Some(true)
+        );
+        assert_eq!(
+            parse_borderless_preference("[systemsettings]\nborderlessfullscreen = false\n"),
+            Some(false)
+        );
+        // Hand-edited by a player.
+        assert_eq!(
+            parse_borderless_preference("[SystemSettings]\nBorderlessFullscreen=1\n"),
+            Some(true)
+        );
+        assert_eq!(parse_borderless_preference(""), None);
+    }
+
+    #[test]
+    fn ignores_the_key_outside_its_own_section() {
+        // UDKSystemSettings.ini holds SystemSettingsEditor and
+        // SystemSettingsMobile too, and only a client is ever written back.
+        assert_eq!(
+            parse_borderless_preference(
+                "[SystemSettingsEditor]\nBorderlessFullscreen=True\n\
+                 [SystemSettings]\nBorderlessFullscreen=False\n"
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            parse_borderless_preference("[SystemSettingsMobile]\nBorderlessFullscreen=True\n"),
+            None
+        );
+    }
+
+    #[test]
+    fn finds_the_key_among_the_settings_it_sits_with() {
+        let ini = "[SystemSettings]\r\nStaticDecals=True\r\nResX=1920\r\n\
+                   ResY=1080\r\nFullscreen=True\r\nBorderlessFullscreen=True\r\n";
+        assert_eq!(parse_borderless_preference(ini), Some(true));
     }
 
     #[test]
