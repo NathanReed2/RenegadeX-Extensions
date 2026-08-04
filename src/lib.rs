@@ -102,6 +102,15 @@ pub fn post_udk_init() -> anyhow::Result<()> {
 //   that looks like the ceiling never binds. Drops the RAM-budget clamp,
 //   widens the thread clamp to `GNumHardwareThreads`, and lowers the
 //   unattended default from 5 to 4. Only patches a `cookpackages` process.
+// - `udk_cook_pcd_checkpoint`: makes a `-Processes=N` cook resumable. The MT
+//   master is excluded from the per-package `PersistentCookerData->SaveToDisk()`
+//   that a single-process cook does, and writes its authoritative PCD only in
+//   `StartChildren` (before any work) and at the end of a *successful* run - so
+//   a crash, a full disk or a Ctrl-C rolls the incremental record back to the
+//   start and the next cook redoes every package that had already succeeded.
+//   Captures the `BulletProofPCDSave` call `StartChildren` already makes and
+//   replays it at job boundaries, every 120s by default
+//   (`-PCDCheckpointSeconds=N`). Only installs in an MT master.
 patch_group!(fn init_cook_patches {
     udk_cook,
     udk_substance,
@@ -112,6 +121,8 @@ patch_group!(fn init_cook_patches {
     udk_mt_shader_sandbox,
     #[cfg(target_arch = "x86_64")]
     udk_mt_cook_processes,
+    #[cfg(target_arch = "x86_64")]
+    udk_cook_pcd_checkpoint,
 });
 
 // Cook patches that each apply to exactly one `-platform=` target, and are
@@ -157,10 +168,18 @@ patch_group!(fn init_platform_cook_patches {
 //   its class does not override `Tick`. Behaviour-preserving; keyed on state
 //   node, class and name, invalidated either side of `UObject::CollectGarbage`.
 //   `-NOSCRIPTFUNCCACHE` stands it down.
+// - `udk_server_cloth`: restores the `#if DEDICATED_SERVER` early return Epic
+//   wrote in `USkeletalMeshComponent::InitClothSim` but UDK compiles out, so a
+//   dedicated server no longer cooks cloth from vertex buffers that
+//   `-seekfreeloadingserver` content has stripped. Without it, any map that
+//   spawns a cloth-enabled skeletal mesh kills the server during
+//   `RouteBeginPlay`. No effect on clients or listen servers.
 patch_group!(fn init_engine_patches {
     udk_xaudio,
     #[cfg(target_arch = "x86_64")]
     udk_audio_channels,
+    #[cfg(target_arch = "x86_64")]
+    udk_server_cloth,
     //#[cfg(target_arch = "x86_64")]
     //udk_script_func_cache,
 });
@@ -219,7 +238,13 @@ patch_group!(fn init_client_patches {
     // udk_client_vehicle_physics,
 });
 
-// Development tooling: not part of shipping behaviour, and off by default.
+// Development tooling, plus the one shipping item that must run last.
+//
+// - `udk_hook_guard`: watches `.text` for foreign inline hooks. It has to be
+//   the final entry of the final group, because it baselines against live
+//   memory and every hook installed before it becomes part of that baseline -
+//   which is exactly how our own detours avoid needing a whitelist. Anything
+//   added after this line would be misreported as a foreign hook.
 //
 // - `udk_mcp`: loopback MCP bridge for the Win64 editor, draining its Unreal
 //   calls from `UUnrealEdEngine::Tick` so they run on the editor thread.
@@ -233,4 +258,6 @@ patch_group!(fn init_tooling_patches {
     //udk_mcp,
     //#[cfg(target_arch = "x86_64")]
     //udk_script_profiler,
+    #[cfg(target_arch = "x86_64")]
+    udk_hook_guard,
 });
