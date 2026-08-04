@@ -181,7 +181,12 @@ const CHILD_IS_IDLE_SIG: [u8; 28] = [
 const MASTER_PCD_FILENAME: &str = "globalpersistentcookerdata.upk";
 
 /// How long to leave between checkpoints when `-PCDCheckpointSeconds=` is absent.
-const DEFAULT_CHECKPOINT_SECONDS: u64 = 120;
+///
+/// A complete 50-map PCServer cook measured 190s end to end, of which only 117s
+/// was multithreaded - so a 120s interval never fired once across an entire cook.
+/// The interval has to be well inside the shortest run worth protecting, not
+/// merely inside the longest.
+const DEFAULT_CHECKPOINT_SECONDS: u64 = 45;
 
 /// Never checkpoint more often than this, whatever was asked for; the write is a
 /// full serialise of every bulk data record.
@@ -269,30 +274,30 @@ fn bullet_proof_pcd_save_hook(
     cooker_data: *mut core::ffi::c_void,
     path: *const u16,
 ) {
-    if TARGET.get().is_none() && !commandlet.is_null() && !cooker_data.is_null() {
-        if let Some(owned) = unsafe { read_wide(path, 1024) } {
-            if is_master_pcd(&owned) {
-                let display = String::from_utf16_lossy(&owned[..owned.len() - 1]);
-                if TARGET
-                    .set(CheckpointTarget {
-                        commandlet: commandlet as usize,
-                        cooker_data: cooker_data as usize,
-                        path: owned,
-                    })
-                    .is_ok()
-                {
-                    debug_log!("udk_cook_pcd_checkpoint: master PCD is {display}");
-                }
+    let is_master = unsafe { read_wide(path, 1024) }
+        .map(|owned| {
+            let master = is_master_pcd(&owned);
+            if master && TARGET.get().is_none() && !commandlet.is_null() && !cooker_data.is_null() {
+                let _ = TARGET.set(CheckpointTarget {
+                    commandlet: commandlet as usize,
+                    cooker_data: cooker_data as usize,
+                    path: owned,
+                });
             }
-        }
-    }
+            master
+        })
+        .unwrap_or(false);
 
     BulletProofPcdSaveHook.call(commandlet, cooker_data, path);
 
-    // Any master save - ours or the engine's own - resets the throttle, so the
-    // end-of-run save and the TFC syncs are not immediately followed by one of
-    // ours.
-    LAST_CHECKPOINT_SECONDS.store(elapsed_seconds(), Ordering::Relaxed);
+    // Only a *master* save resets the throttle. The per-child saves that
+    // SavePersistentCookerDataForChild makes go to P_GlobalPersistentCookerData.upk
+    // inside the child's own directory and do nothing for the master's file, and
+    // they fire on every TFC sync - counting those would starve the checkpoint
+    // indefinitely on a texture-heavy cook, which is exactly when it matters most.
+    if is_master {
+        LAST_CHECKPOINT_SECONDS.store(elapsed_seconds(), Ordering::Relaxed);
+    }
 }
 
 /// Writes the checkpoint by replaying the engine's captured call.

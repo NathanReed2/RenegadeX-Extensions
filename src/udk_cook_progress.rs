@@ -85,7 +85,6 @@
 
 #![cfg(target_arch = "x86_64")]
 
-use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::Instant;
@@ -204,6 +203,50 @@ unsafe fn completed_jobs(commandlet: *mut core::ffi::c_void) -> Option<i32> {
     Some(total)
 }
 
+/// Writes a line to the console as UTF-16.
+///
+/// UDK writes its log wide, which leaves the console stream in UTF-16 mode, so
+/// narrow bytes written through `std::io::stdout` are re-read as UTF-16: the
+/// text comes out as CJK filler and - worse - the `\r` is swallowed into a wide
+/// character instead of returning the carriage, so every repaint appends rather
+/// than overwriting. `WriteConsoleW` on the console handle sidesteps the CRT
+/// stream mode entirely.
+///
+/// Returns `false` when stdout is not a console (redirected to a file or a
+/// pipe), where a repainting bar would only pile up carriage returns.
+fn write_console(text: &str) -> bool {
+    use windows::Win32::System::Console::{
+        GetConsoleMode, GetStdHandle, WriteConsoleW, CONSOLE_MODE, STD_OUTPUT_HANDLE,
+    };
+
+    unsafe {
+        let Ok(handle) = GetStdHandle(STD_OUTPUT_HANDLE) else {
+            return false;
+        };
+        if handle.is_invalid() {
+            return false;
+        }
+        // Only a real console screen buffer accepts WriteConsoleW.
+        let mut mode = CONSOLE_MODE::default();
+        if GetConsoleMode(handle, &mut mode).is_err() {
+            return false;
+        }
+
+        let wide: Vec<u16> = text.encode_utf16().collect();
+
+        // windows-0.52 types WriteConsoleW's buffer as `&[u8]` but forwards
+        // `len()` as nNumberOfCharsToWrite, which the API counts in *characters*.
+        // Handing it the UTF-16 bytes directly would therefore ask for twice as
+        // many characters as exist and read off the end of the buffer. Build a
+        // byte slice that keeps the wide pointer but carries the character count:
+        // it spans half the allocation, so it stays in bounds.
+        let buffer = std::slice::from_raw_parts(wide.as_ptr().cast::<u8>(), wide.len());
+
+        let mut written = 0u32;
+        WriteConsoleW(handle, buffer, Some(&mut written), None).is_ok()
+    }
+}
+
 fn paint(completed: i32, total: i32) {
     let fraction = if total > 0 {
         (completed as f64 / total as f64).clamp(0.0, 1.0)
@@ -233,9 +276,7 @@ fn paint(completed: i32, total: i32) {
         format_duration(elapsed),
     );
 
-    let mut stdout = std::io::stdout();
-    let _ = stdout.write_all(line.as_bytes());
-    let _ = stdout.flush();
+    write_console(&line);
 }
 
 /// Called from the `ChildIsIdle` detour once per poll. Cheap and throttled: it
@@ -276,9 +317,7 @@ pub fn tick(commandlet: *mut core::ffi::c_void) {
         // end-of-cook hook: the counter reaching the total is the signal.
         if completed >= total {
             ACTIVE.store(false, Ordering::SeqCst);
-            let mut stdout = std::io::stdout();
-            let _ = stdout.write_all(b"\n");
-            let _ = stdout.flush();
+            write_console("\r\n");
         }
     }
 
