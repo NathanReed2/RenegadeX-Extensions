@@ -111,6 +111,15 @@ pub fn post_udk_init() -> anyhow::Result<()> {
 //   Captures the `BulletProofPCDSave` call `StartChildren` already makes and
 //   replays it at job boundaries, every 120s by default
 //   (`-PCDCheckpointSeconds=N`). Only installs in an MT master.
+// - `udk_cook_mt_transition` (`-MTTRANSITION`, opt-in): lets a cook that was
+//   refused `-Processes=N` at `Init` - which is every full recook, because the
+//   material shaders are out of date - go multithreaded when it reaches the
+//   maps. Maps are 9% of a cook's packages and 95% of its work, and by then the
+//   shader cache the refusal was protecting is warm. Calls `StartChildren` by
+//   hand at the first `.udk` load, removes the `bWasMTMaster` restore that would
+//   otherwise revert the flip before `StopChildren` is decided, and sets
+//   `bIsMTMaster`. Reads its arming signal, map count and `StartChildren`
+//   address from `udk_cook_progress`, so it needs that module installed.
 patch_group!(fn init_cook_patches {
     udk_cook,
     udk_substance,
@@ -125,6 +134,8 @@ patch_group!(fn init_cook_patches {
     udk_cook_pcd_checkpoint,
     #[cfg(target_arch = "x86_64")]
     udk_cook_progress,
+    #[cfg(target_arch = "x86_64")]
+    udk_cook_mt_transition,
 });
 
 // Cook patches that each apply to exactly one `-platform=` target, and are
