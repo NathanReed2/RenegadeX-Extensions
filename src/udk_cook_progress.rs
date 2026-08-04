@@ -444,9 +444,21 @@ fn format_duration(seconds: u64) -> String {
 }
 
 /// `JobsCompleted` for every child, and their sum.
+///
+/// A fixed array rather than a `Vec` because this is now read on *every*
+/// `ChildIsIdle` call - thousands a second - rather than only when the repaint
+/// throttle allows. Sixteen unaligned loads are nothing; an allocation per call
+/// would not be.
 struct Census {
     completed: i32,
-    per_child: Vec<i32>,
+    per_child: [i32; MAX_PLAUSIBLE_CHILDREN as usize],
+    children: usize,
+}
+
+impl Census {
+    fn counts(&self) -> &[i32] {
+        &self.per_child[..self.children]
+    }
 }
 
 /// Sums `JobsCompleted` across the master's child array.
@@ -469,7 +481,7 @@ unsafe fn completed_jobs(commandlet: *mut core::ffi::c_void) -> Option<Census> {
     }
 
     let mut total = 0i32;
-    let mut per_child = Vec::with_capacity(count as usize);
+    let mut per_child = [0i32; MAX_PLAUSIBLE_CHILDREN as usize];
     for index in 0..count as usize {
         let element = data + index * CHILD_PROCESS_STRIDE;
         let jobs = ((element + CHILD_PROCESS_JOBS_COMPLETED) as *const i32).read_unaligned();
@@ -477,11 +489,12 @@ unsafe fn completed_jobs(commandlet: *mut core::ffi::c_void) -> Option<Census> {
             return None;
         }
         total = total.saturating_add(jobs);
-        per_child.push(jobs);
+        per_child[index] = jobs;
     }
     Some(Census {
         completed: total,
         per_child,
+        children: count as usize,
     })
 }
 
@@ -761,8 +774,16 @@ fn paint(completed: i32, total: i32, model: &Model) {
     write_console(&line);
 }
 
-/// Called from the `ChildIsIdle` detour once per poll. Cheap and throttled: it
-/// only walks the child array when the repaint interval has elapsed.
+/// Called from the `ChildIsIdle` detour once per poll.
+///
+/// The child array is read on **every** call, and only the painting is throttled.
+/// Throttling the read instead loses the last job: `ChildIsIdle` is what
+/// increments `JobsCompleted`, and the master stops polling the moment the queue
+/// drains, so the call that carries the final increment is also the last one there
+/// will ever be. If the 250ms throttle happens to swallow it, nothing else comes
+/// along to correct the count - which is why a finished cook sat at "99% 154/155"
+/// under the "Cook finished OK" prompt, with the reserved row never handed back,
+/// and why the persisted stats recorded 49 of 50 maps.
 pub fn tick(commandlet: *mut core::ffi::c_void) {
     if !ACTIVE.load(Ordering::Relaxed) {
         return;
@@ -773,12 +794,6 @@ pub fn tick(commandlet: *mut core::ffi::c_void) {
         return;
     }
 
-    let now = elapsed_millis();
-    let last = LAST_PAINT_MILLIS.load(Ordering::Relaxed) as u128;
-    if now.saturating_sub(last) < REPAINT_INTERVAL_MILLIS {
-        return;
-    }
-
     if PAINTING
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
         .is_err()
@@ -786,6 +801,7 @@ pub fn tick(commandlet: *mut core::ffi::c_void) {
         return;
     }
 
+    let now = elapsed_millis();
     let read = unsafe { completed_jobs(commandlet) };
 
     // One-shot diagnosis of the two things that can silently kill the bar: an
@@ -819,16 +835,25 @@ pub fn tick(commandlet: *mut core::ffi::c_void) {
     if let Some(census) = read {
         let completed = census.completed;
 
+        let moved = LAST_COMPLETED.swap(completed, Ordering::Relaxed) != completed;
+        let finished = completed >= total;
         // Repaint on a timer even when the count has not moved, so the elapsed
         // clock keeps running and the bar survives being scrolled off by log
         // output.
-        let moved = LAST_COMPLETED.swap(completed, Ordering::Relaxed) != completed;
+        let due = now.saturating_sub(LAST_PAINT_MILLIS.load(Ordering::Relaxed) as u128)
+            >= REPAINT_INTERVAL_MILLIS;
+
+        // Nothing to do on the overwhelming majority of calls, which is what keeps
+        // reading every time affordable.
+        if !(moved || due || finished) {
+            PAINTING.store(false, Ordering::SeqCst);
+            return;
+        }
         LAST_PAINT_MILLIS.store(now as u64, Ordering::Relaxed);
 
-        let finished = completed >= total;
         let fast_jobs = total - MAP_JOBS.load(Ordering::Relaxed).clamp(0, total);
         if let Ok(mut model) = MODEL.lock() {
-            model.observe(now as u64, &census.per_child, fast_jobs);
+            model.observe(now as u64, census.counts(), fast_jobs);
 
             // A pinned bar can repaint in place, so it may tick on the timer to
             // keep the clock live. The inline fallback cannot - `\r` returns the
@@ -838,7 +863,7 @@ pub fn tick(commandlet: *mut core::ffi::c_void) {
             // produced ~1600 fossil lines per cook. Drawing only when the count
             // moves yields one line per completed job, which is the same cadence
             // as the engine's own "done in" lines.
-            if moved || console().is_some() {
+            if moved || finished || console().is_some() {
                 paint(completed, total, &model);
             }
 
@@ -874,7 +899,8 @@ pub fn tick(commandlet: *mut core::ffi::c_void) {
 
         // Every job is back, so close the bar off on its own line rather than
         // leaving the cook's remaining output to overwrite it. Needs no
-        // end-of-cook hook: the counter reaching the total is the signal.
+        // end-of-cook hook: the counter reaching the total is the signal, which
+        // only holds because the count above is read unthrottled.
         if finished {
             ACTIVE.store(false, Ordering::SeqCst);
             // Hand the reserved row back before the cook's closing output arrives,
