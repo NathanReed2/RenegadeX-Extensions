@@ -257,6 +257,14 @@ const BAR_WIDTH: usize = 32;
 /// thousands of times a second cannot flood the console.
 const REPAINT_INTERVAL_MILLIS: u128 = 250;
 
+/// How often the background ticker repaints so the elapsed clock keeps moving.
+///
+/// `tick` only runs when the engine calls `ChildIsIdle`, and the master stops
+/// doing that for long stretches - an 18s `BulletProofPCDSave` is the worst case,
+/// during which log lines keep scrolling past a bar whose clock has frozen. This
+/// repaints on its own so the seconds always advance while output is moving.
+const CLOCK_INTERVAL_MILLIS: u64 = 250;
+
 /// How often the same figures also go to the log.
 ///
 /// The bar itself is drawn to the console and leaves no trace, so without this
@@ -774,6 +782,57 @@ fn paint(completed: i32, total: i32, model: &Model) {
     write_console(&line);
 }
 
+/// Redraws the bar from the last counts read, advancing only the clock.
+///
+/// Deliberately does not touch the commandlet: this runs on its own thread, and
+/// walking engine structures from off the game thread to move a clock forward
+/// would be trading a real risk for a cosmetic gain. The job counts it shows are
+/// whatever [`tick`] last observed.
+fn repaint_clock() {
+    let total = TOTAL_JOBS.load(Ordering::Relaxed);
+    let completed = LAST_COMPLETED.load(Ordering::Relaxed);
+    if total <= 0 || completed < 0 {
+        return;
+    }
+
+    if PAINTING
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return;
+    }
+    if let Ok(model) = MODEL.lock() {
+        LAST_PAINT_MILLIS.store(elapsed_millis() as u64, Ordering::Relaxed);
+        paint(completed, total, &model);
+    }
+    PAINTING.store(false, Ordering::SeqCst);
+}
+
+/// Starts the clock ticker, once, when the bar arms.
+///
+/// Only for the pinned route. The inline fallback cannot repaint in place - `\r`
+/// returns the cursor but the next log line appends and scrolls it away - so
+/// ticking it on a timer would produce a fossil every 250ms instead of one line
+/// per completed job. There the clock advancing is not worth ~1600 junk lines.
+///
+/// Started here rather than from `init`, which runs under the Windows loader lock
+/// where spawning a thread is not safe.
+fn start_clock() {
+    if console().is_none() {
+        return;
+    }
+    let _ = std::thread::Builder::new()
+        .name("cook-progress-clock".to_string())
+        .spawn(|| {
+            while ACTIVE.load(Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_millis(CLOCK_INTERVAL_MILLIS));
+                if ACTIVE.load(Ordering::Relaxed) {
+                    repaint_clock();
+                }
+            }
+        });
+}
+
 /// Called from the `ChildIsIdle` detour once per poll.
 ///
 /// The child array is read on **every** call, and only the painting is throttled.
@@ -1072,6 +1131,7 @@ fn start_children_hook(commandlet: *mut core::ffi::c_void, num_files: i32) -> i3
     if started != 0 && num_files > 0 {
         TOTAL_JOBS.store(num_files, Ordering::Relaxed);
         ACTIVE.store(true, Ordering::SeqCst);
+        start_clock();
     }
 
     // Install confirmation is deferred to here rather than done in init(), which
