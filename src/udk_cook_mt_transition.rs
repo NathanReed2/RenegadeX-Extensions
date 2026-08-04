@@ -201,12 +201,16 @@
 //! child would otherwise inherit the flag too). Without the switch this module
 //! installs nothing at all.
 //!
-//! Pair it with `-SINGLETHREAD` to get the behaviour deliberately rather than by
-//! luck. On its own, `-MTTRANSITION` only ever fires on a cook the engine had
-//! already refused to parallelise - on an incremental cook with current shaders
-//! `Init` goes multithreaded from the start, the master never cooks a map
-//! itself, and this module correctly does nothing. `Init` tests `-SINGLETHREAD`
-//! *before* `bMaterialShadersOutdated`:
+//! Nothing else is needed. This only ever fires on a cook that is already running
+//! serially, which is the case it exists for: a full recook, where
+//! `bMaterialShadersOutdated` makes `Init` refuse `-Processes=N` outright. On an
+//! incremental cook with current shaders `Init` goes multithreaded from the
+//! start, the master never cooks a map itself, and this module correctly does
+//! nothing.
+//!
+//! # `-SINGLETHREAD` is a test lever, not a recommendation
+//!
+//! `Init` tests it *before* `bMaterialShadersOutdated`:
 //!
 //! ```c
 //! if (Switches.FindItemIndex(TEXT("SINGLETHREAD")) == INDEX_NONE )
@@ -217,11 +221,19 @@
 //! }
 //! ```
 //!
-//! so `-SINGLETHREAD -MTTRANSITION -Processes=N` says exactly what is wanted on
-//! any cook: content serially, so the shader cache is warmed once, then maps in
-//! parallel. The two switches read as contradictory and are not - `-SINGLETHREAD`
-//! is what makes the serial half deterministic instead of dependent on whether
-//! the shaders happened to be stale.
+//! so it forces the serial half on *any* cook, which is the only way to exercise
+//! this module on a cheap incremental run instead of a two-hour `-FULL` one. That
+//! is what it is for here.
+//!
+//! Using it on a real cook is a **separate, unmeasured bet**: that cooking the
+//! content serially and only the maps in parallel beats a from-the-start
+//! multithreaded cook, because N children otherwise each compile overlapping
+//! shaders independently - the redundancy Epic's gate exists to prevent - whereas
+//! a serial content phase compiles them once and the children inherit a fully
+//! warm cache. Plausible on a shader-heavy `-platform=PC` cook, near-certainly a
+//! loss on `PCServer` where there are no shaders to warm and the serial phase is
+//! pure cost. Nobody has A/B'd it. Do not pair the switches on the strength of
+//! this paragraph.
 
 #![cfg(target_arch = "x86_64")]
 
