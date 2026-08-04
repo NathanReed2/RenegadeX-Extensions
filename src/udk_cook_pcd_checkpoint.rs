@@ -331,9 +331,9 @@ fn checkpoint(target: &CheckpointTarget) {
     udk_log::log(
         udk_log::LogType::Init,
         &format!(
-            "PCD checkpoint {count} written in {:.1}s. A multithreaded cook otherwise only \
-             records what it has cooked at the very end, so anything that stops this run early \
-             would have made the next one recook every package that already succeeded.",
+            "PCD checkpoint {count} written in {:.1}s (INCOMPLETE - does not yet contain the \
+             children's cooked-version records, so it will not make a resumed cook skip their \
+             work; see udk_cook_pcd_checkpoint docs).",
             started.elapsed().as_secs_f32()
         ),
     );
