@@ -247,20 +247,40 @@ fn console() -> Option<windows::Win32::Foundation::HANDLE> {
         CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
     };
     use windows::Win32::System::Console::{
-        GetConsoleMode, SetConsoleMode, CONSOLE_MODE, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
+        AttachConsole, GetConsoleMode, SetConsoleMode, ATTACH_PARENT_PROCESS, CONSOLE_MODE,
+        ENABLE_VIRTUAL_TERMINAL_PROCESSING,
     };
 
     let raw = *CONSOLE.get_or_init(|| unsafe {
         let name: Vec<u16> = "CONOUT$\0".encode_utf16().collect();
-        let handle = CreateFileW(
-            PCWSTR(name.as_ptr()),
-            0x8000_0000 | 0x4000_0000, // GENERIC_READ | GENERIC_WRITE
-            FILE_SHARE_READ | FILE_SHARE_WRITE,
-            None,
-            OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL,
-            HANDLE::default(),
-        );
+        let open = || {
+            CreateFileW(
+                PCWSTR(name.as_ptr()),
+                0x8000_0000 | 0x4000_0000, // GENERIC_READ | GENERIC_WRITE
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                None,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                HANDLE::default(),
+            )
+        };
+
+        // UDK.exe is a GUI-subsystem binary, so it starts with no console of its
+        // own and CONOUT$ cannot be opened - measured, which is what forced the
+        // inline fallback. Its parent UDK.com does own the console that launched
+        // it, and ATTACH_PARENT_PROCESS adopts that one. After this CONOUT$
+        // resolves to the real screen buffer and scroll margins become usable.
+        //
+        // Harmless if it fails (already attached, or launched without a console):
+        // the open below is retried either way and the inline path still covers us.
+        let handle = match open() {
+            Ok(handle) if !handle.is_invalid() => Ok(handle),
+            _ => {
+                let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+                open()
+            }
+        };
+
         match handle {
             Ok(handle) if !handle.is_invalid() => {
                 // Scroll margins are a VT feature, so the terminal has to be in VT
