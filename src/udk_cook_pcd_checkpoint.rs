@@ -324,6 +324,11 @@ fn checkpoint(target: &CheckpointTarget) {
 fn child_is_idle_hook(commandlet: *mut core::ffi::c_void, process_index: i32) -> i32 {
     let idle = ChildIsIdleHook.call(commandlet, process_index);
 
+    // Two detours cannot share one address, so the progress bar is driven from
+    // here rather than hooking ChildIsIdle a second time. It is throttled
+    // internally and never touches the cook's control flow.
+    crate::udk_cook_progress::tick(commandlet);
+
     if idle == 0 {
         return idle;
     }

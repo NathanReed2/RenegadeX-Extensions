@@ -123,6 +123,8 @@ patch_group!(fn init_cook_patches {
     udk_mt_cook_processes,
     #[cfg(target_arch = "x86_64")]
     udk_cook_pcd_checkpoint,
+    #[cfg(target_arch = "x86_64")]
+    udk_cook_progress,
 });
 
 // Cook patches that each apply to exactly one `-platform=` target, and are
