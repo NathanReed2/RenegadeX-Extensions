@@ -67,6 +67,61 @@
 //! pointer, and any failure just skips that repaint - the bar is cosmetic and
 //! must never be able to take a cook down.
 //!
+//! # Why the bar is weighted rather than counting packages
+//!
+//! Cook jobs are violently bimodal, so a count-based bar and the ETA derived from
+//! it are not merely imprecise - they are wrong by orders of magnitude. Measured
+//! over a complete 741-job PCServer cook:
+//!
+//! ```text
+//! 676 non-map packages   mean  0.44s   max   9.1s    5% of the work
+//!  65 map packages       mean 85.60s   max 577.9s   95% of the work
+//! ```
+//!
+//! Maps are 9% of the count and 95% of the cost, a 195x per-job ratio, and the
+//! engine dispatches them **last** (`GeneratePackageList` appends `MapFilenamePairs`
+//! after everything else). So a counting bar reached 90% at t=91s and then took a
+//! further 715s to finish, and its ETA at that moment predicted 11s against 715s
+//! actual. Weighting by cost instead put the same moment at 21% against 23% of the
+//! wall clock actually elapsed.
+//!
+//! The split is not guessed. `UCookPackagesCommandlet::GeneratePackageList` hands
+//! back the assembled list and reports where the maps begin:
+//!
+//! ```c
+//! TArray<FPackageCookerInfo> UCookPackagesCommandlet::GeneratePackageList(
+//!     INT& FirstStartupIndex, INT& FirstScriptIndex,
+//!     INT& FirstGameScriptIndex, INT& FirstMapIndex )
+//! ...
+//!     if( MapFilenamePairs.Num() )
+//!     {
+//!         FirstMapIndex = SortedFilenamePairs.Num();   // maps are the tail
+//!         SortedFilenamePairs += MapFilenamePairs;
+//!     }
+//! ```
+//!
+//! so `Num() - FirstMapIndex` is the map count, known before the first job is
+//! dispatched - which is what makes the bar right from t=0 on a first run rather
+//! than only after the phase change becomes observable.
+//!
+//! Per-job costs are then measured live (a child's `JobsCompleted` stepping tells
+//! us how long its last job took) and persisted to `CookProgress.stats` beside the
+//! cooked data, so a repeat cook starts with the previous run's costs instead of
+//! the built-in priors.
+//!
+//! # There is deliberately no ETA
+//!
+//! One was built, measured, and removed. The tail of a cook is not a throughput
+//! problem: a job cannot be split across children, so the finish time is set by
+//! the single longest map rather than by how much work is left. On a measured
+//! 875s cook the last job ran alone for its final nine minutes, and the bar sat at
+//! 98% throughout - an ETA over that stretch has nothing to estimate *from*. The
+//! version that floored the estimate by the longest running job simply drifted
+//! upward as that job continued (1:23 -> 2:23 while stuck at 98%), which is worse
+//! than no number at all: it looked authoritative and was steadily wrong.
+//!
+//! Elapsed time is shown instead. It is always true.
+//!
 //! # Scope
 //!
 //! Only the multithreaded **master** draws. A child would fight the master for
@@ -139,6 +194,58 @@ const CHILD_PROCESSES_NUM: usize = 0x2ADC;
 const CHILD_PROCESS_STRIDE: usize = 0x68;
 const CHILD_PROCESS_JOBS_COMPLETED: usize = 0x48;
 
+/// `UCookPackagesCommandlet::GeneratePackageList` in the 12791 (UDK-2015-01) x64
+/// build.
+///
+/// Identified by diffing against the symbol-bearing 2013 build (which is compiled
+/// from `D:\Firestorm SDK\UE3 2013 Base`, so its names are the source's): 2268
+/// instructions on both sides, 1999 equal and exactly one changed - a `LEA
+/// RDI,[RCX+0x7d8]` that became `[RCX+0x1258]` as the commandlet grew. It also
+/// sits immediately before `CookPackages`, its only caller, in both images.
+const GENERATE_PACKAGE_LIST_OFFSET: usize = 0x0011_F4710;
+
+/// Prologue of `GeneratePackageList`, through the EH state store:
+///
+/// ```asm
+/// MOV  RAX, RSP
+/// MOV  qword [RAX+0x20], R9      ; home FirstScriptIndex
+/// MOV  qword [RAX+0x18], R8      ; home FirstStartupIndex
+/// MOV  qword [RAX+0x10], RDX     ; home this
+/// MOV  qword [RAX+0x08], RCX     ; home the hidden return pointer
+/// PUSH RBP ; RBX ; RSI ; RDI ; R12 ; R13 ; R14 ; R15
+/// LEA  RBP, [RAX-0x358]
+/// SUB  RSP, 0x418
+/// MOV  qword [RBP+0x2D0], -2
+/// ```
+///
+/// The four homing stores are what confirm the argument mapping used by
+/// [`generate_package_list_hook`]: MSVC passes the hidden struct-return pointer
+/// ahead of `this`, so the four `INT&` out-parameters land in R8, R9 and the two
+/// stack slots. No rip-relative displacement, so this is a plain byte match.
+const GENERATE_PACKAGE_LIST_SIG: [u8; 56] = [
+    0x48, 0x8B, 0xC4, // MOV RAX,RSP
+    0x4C, 0x89, 0x48, 0x20, // MOV [RAX+0x20],R9
+    0x4C, 0x89, 0x40, 0x18, // MOV [RAX+0x18],R8
+    0x48, 0x89, 0x50, 0x10, // MOV [RAX+0x10],RDX
+    0x48, 0x89, 0x48, 0x08, // MOV [RAX+0x08],RCX
+    0x55, 0x53, 0x56, 0x57, // PUSH RBP ; RBX ; RSI ; RDI
+    0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, // PUSH R12 ; R13 ; R14 ; R15
+    0x48, 0x8D, 0xA8, 0xA8, 0xFC, 0xFF, 0xFF, // LEA RBP,[RAX-0x358]
+    0x48, 0x81, 0xEC, 0x18, 0x04, 0x00, 0x00, // SUB RSP,0x418
+    0x48, 0xC7, 0x85, 0xD0, 0x02, 0x00, 0x00, 0xFE, 0xFF, 0xFF, 0xFF, // MOV [RBP+0x2D0],-2
+];
+
+/// `TArray::ArrayNum`, which is all this module reads out of the returned list.
+const TARRAY_NUM: usize = 0x8;
+
+/// Costs assumed before anything has been measured and with no stats file to
+/// load. Only used for the first minutes of a first-ever cook.
+const DEFAULT_FAST_MILLIS: u64 = 500;
+const DEFAULT_MAP_MILLIS: u64 = 60_000;
+
+/// Samples needed before a measured mean displaces the prior.
+const MIN_SAMPLES: u32 = 3;
+
 /// `StartChildren` itself clamps to 48 children; anything beyond this means the
 /// pointer being read is not really the array.
 const MAX_PLAUSIBLE_CHILDREN: i32 = 64;
@@ -150,8 +257,36 @@ const BAR_WIDTH: usize = 32;
 /// thousands of times a second cannot flood the console.
 const REPAINT_INTERVAL_MILLIS: u128 = 250;
 
+/// How often the same figures also go to the log.
+///
+/// The bar itself is drawn to the console and leaves no trace, so without this
+/// there is no record of what it predicted - which makes an ETA impossible to
+/// hold to account after the fact, and leaves an unattended cook with no progress
+/// history at all.
+const PROGRESS_LOG_INTERVAL_MILLIS: u64 = 60_000;
+
 static_detour! {
     static StartChildrenHook: extern "C" fn(*mut core::ffi::c_void, i32) -> i32;
+}
+
+// Its own block, and with no trailing comma after the last argument: both of
+// those send `static_detour!` into unbounded recursion rather than a parse error,
+// so the compiler reports "recursion limit reached" and suggests a bigger limit
+// that never helps - it just asks for double again on the next build.
+//
+// `MOV [RAX+0x08],RCX` in the prologue homes the hidden struct-return pointer,
+// so it arrives *before* `this` - hence six slots for a function the source
+// declares with four arguments. On Windows x64 `extern "C"` is the Microsoft
+// ABI, which places them in RCX, RDX, R8, R9 and then `[RSP+0x20]`, `[RSP+0x28]`.
+static_detour! {
+    static GeneratePackageListHook: extern "C" fn(
+        *mut core::ffi::c_void,
+        *mut core::ffi::c_void,
+        *mut i32,
+        *mut i32,
+        *mut i32,
+        *mut i32
+    ) -> *mut core::ffi::c_void;
 }
 
 static TOTAL_JOBS: AtomicI32 = AtomicI32::new(0);
@@ -161,7 +296,140 @@ static PAINTING: AtomicBool = AtomicBool::new(false);
 /// Set once the first tick has reported what it could and could not do.
 static DIAGNOSED: AtomicBool = AtomicBool::new(false);
 static LAST_PAINT_MILLIS: AtomicU64 = AtomicU64::new(0);
+static LAST_LOG_MILLIS: AtomicU64 = AtomicU64::new(0);
 static EPOCH: OnceLock<Instant> = OnceLock::new();
+
+/// How many of the trailing jobs are maps, or -1 while unknown. Unknown means
+/// the bar falls back to weighting every package the same, which is what it did
+/// before this was available.
+static MAP_JOBS: AtomicI32 = AtomicI32::new(-1);
+
+/// Running cost model, rebuilt each cook and seeded from the previous one.
+///
+/// Guarded by a mutex rather than split into atomics because the samples have to
+/// move together to stay consistent, and `tick` is throttled to 4 Hz so the lock
+/// is never contended.
+static MODEL: std::sync::Mutex<Model> = std::sync::Mutex::new(Model::new());
+
+#[derive(Default)]
+struct Model {
+    /// Last `JobsCompleted` seen per child, or -1 for a child not yet observed.
+    child_last_count: Vec<i32>,
+    /// When each child most recently started a job, as `elapsed_millis`.
+    child_job_start: Vec<u64>,
+
+    /// Completions folded into the model so far, which is what decides whether
+    /// the next one belongs to the fast span or the map tail.
+    jobs_seen: u32,
+
+    fast_samples: u32,
+    fast_total_millis: u64,
+    map_samples: u32,
+    map_total_millis: u64,
+    map_max_millis: u64,
+
+    /// Costs carried over from the last completed cook, if there was one.
+    prior_fast_millis: Option<u64>,
+    prior_map_millis: Option<u64>,
+}
+
+impl Model {
+    const fn new() -> Self {
+        Self {
+            child_last_count: Vec::new(),
+            child_job_start: Vec::new(),
+            jobs_seen: 0,
+            fast_samples: 0,
+            fast_total_millis: 0,
+            map_samples: 0,
+            map_total_millis: 0,
+            map_max_millis: 0,
+            prior_fast_millis: None,
+            prior_map_millis: None,
+        }
+    }
+
+    /// Mean cost of a non-map package: measured if there is enough evidence,
+    /// otherwise the previous cook's figure, otherwise the built-in prior.
+    fn fast_millis(&self) -> u64 {
+        if self.fast_samples >= MIN_SAMPLES {
+            return (self.fast_total_millis / self.fast_samples as u64).max(1);
+        }
+        self.prior_fast_millis.unwrap_or(DEFAULT_FAST_MILLIS).max(1)
+    }
+
+    fn map_millis(&self) -> u64 {
+        if self.map_samples >= MIN_SAMPLES {
+            return (self.map_total_millis / self.map_samples as u64).max(1);
+        }
+        self.prior_map_millis.unwrap_or(DEFAULT_MAP_MILLIS).max(1)
+    }
+
+    /// Folds one finished job into the bucket its **position** puts it in.
+    ///
+    /// Position, not duration, because these two means are multiplied back by the
+    /// positional job counts to get the total work - so they have to measure the
+    /// same populations those counts describe. Classifying by duration instead
+    /// sounds more precise and is actually wrong: this content has ~15 expensive
+    /// non-map packages (`RX_BU_Prefabs`, `EngineMeshes`, ~143s each) sitting
+    /// inside the 691-package "fast" span, and filing them under maps leaves their
+    /// 2145s of work counted in neither bucket - a 22% underestimate of the cook.
+    ///
+    /// Jobs finish out of order, but never more than one child's worth out of
+    /// dispatch order, so the nth completion is the nth dispatch to within the
+    /// number of children.
+    fn record(&mut self, millis: u64, fast_jobs: i32) {
+        self.jobs_seen += 1;
+        if self.jobs_seen as i64 > fast_jobs as i64 {
+            self.map_samples += 1;
+            self.map_total_millis += millis;
+        } else {
+            self.fast_samples += 1;
+            self.fast_total_millis += millis;
+        }
+        // Tracked across both buckets purely to size the tail estimate.
+        self.map_max_millis = self.map_max_millis.max(millis);
+    }
+
+    /// Takes a fresh reading of every child's finished-job count and turns the
+    /// increments into job durations.
+    ///
+    /// A child's job started when its previous one finished - measured across a
+    /// full cook, the gap between the two is at most 0.07s, so the difference is
+    /// the job's duration to well within what the bar needs.
+    fn observe(&mut self, now: u64, per_child: &[i32], fast_jobs: i32) {
+        if self.child_last_count.len() != per_child.len() {
+            self.child_last_count = vec![-1; per_child.len()];
+            self.child_job_start = vec![0; per_child.len()];
+        }
+
+        for (index, &count) in per_child.iter().enumerate() {
+            let previous = self.child_last_count[index];
+            if count <= previous {
+                continue;
+            }
+
+            // The first sighting of a child only establishes a start time; there
+            // is no earlier completion to measure from, and timing its first job
+            // from the arming instant would charge child startup to that job and
+            // misfile a 0.4s package as a map.
+            let start = self.child_job_start[index];
+            if previous >= 0 && start > 0 {
+                // A single tick can span more than one completion, so split the
+                // window evenly rather than crediting it all to one job.
+                let jobs = (count - previous) as u64;
+                let each = now.saturating_sub(start) / jobs.max(1);
+                for _ in 0..jobs {
+                    self.record(each, fast_jobs);
+                }
+            }
+
+            self.child_job_start[index] = now;
+            self.child_last_count[index] = count;
+        }
+    }
+
+}
 
 fn elapsed_millis() -> u128 {
     EPOCH
@@ -175,11 +443,17 @@ fn format_duration(seconds: u64) -> String {
     format!("{hours:02}:{minutes:02}:{secs:02}")
 }
 
+/// `JobsCompleted` for every child, and their sum.
+struct Census {
+    completed: i32,
+    per_child: Vec<i32>,
+}
+
 /// Sums `JobsCompleted` across the master's child array.
 ///
 /// Returns `None` rather than a partial count if anything about the array looks
 /// wrong, so a bad read can only cost a repaint.
-unsafe fn completed_jobs(commandlet: *mut core::ffi::c_void) -> Option<i32> {
+unsafe fn completed_jobs(commandlet: *mut core::ffi::c_void) -> Option<Census> {
     if commandlet.is_null() {
         return None;
     }
@@ -195,6 +469,7 @@ unsafe fn completed_jobs(commandlet: *mut core::ffi::c_void) -> Option<i32> {
     }
 
     let mut total = 0i32;
+    let mut per_child = Vec::with_capacity(count as usize);
     for index in 0..count as usize {
         let element = data + index * CHILD_PROCESS_STRIDE;
         let jobs = ((element + CHILD_PROCESS_JOBS_COMPLETED) as *const i32).read_unaligned();
@@ -202,8 +477,12 @@ unsafe fn completed_jobs(commandlet: *mut core::ffi::c_void) -> Option<i32> {
             return None;
         }
         total = total.saturating_add(jobs);
+        per_child.push(jobs);
     }
-    Some(total)
+    Some(Census {
+        completed: total,
+        per_child,
+    })
 }
 
 /// Writes a line to the console as UTF-16.
@@ -230,8 +509,10 @@ unsafe fn completed_jobs(commandlet: *mut core::ffi::c_void) -> Option<i32> {
 /// console, and `WriteConsoleW` is correct there regardless of stream mode.
 /// Direct handle to the console screen buffer, or 0 if there is no console.
 static CONSOLE: OnceLock<isize> = OnceLock::new();
-/// Set once the scroll region has been reserved.
-static PINNED: AtomicBool = AtomicBool::new(false);
+/// Window height the scroll region is currently reserved for, or 0 when no
+/// region is reserved. Kept as the height rather than a flag so a resize is
+/// detectable - see [`pin`].
+static PINNED_ROWS: AtomicI32 = AtomicI32::new(0);
 
 /// Opens the console screen buffer directly and turns on VT sequence handling.
 ///
@@ -333,27 +614,43 @@ fn console_rows() -> Option<i16> {
 
 /// Reserves the last row by confining the scrolling region to everything above
 /// it, so UDK's log output can no longer scroll over the bar.
-fn pin() {
-    if PINNED.load(Ordering::Relaxed) {
+///
+/// Re-run whenever the window height changes. A scroll region reserved once and
+/// left alone breaks the moment the user resizes: shrinking the window leaves the
+/// old region extending past the new bottom row, so the bar is then drawn *inside*
+/// the scrolling area and every subsequent log line shunts a copy of it upward -
+/// one fossil per repaint, interleaved with the cook's output.
+fn pin(rows: i16) {
+    let wanted = if rows >= 3 { rows as i32 } else { 0 };
+    let previous = PINNED_ROWS.swap(wanted, Ordering::Relaxed);
+    if previous == wanted {
         return;
     }
-    let Some(rows) = console_rows() else {
-        return;
-    };
-    if rows < 3 {
-        return;
+
+    if previous != 0 {
+        // Hand the old region back before reserving a different one, and wipe the
+        // row the bar used to occupy so the resize does not strand a copy of it.
+        // Only when that row still exists - after a shrink the terminal clamps the
+        // address, and clearing it would eat a line of the cook's own output.
+        emit("\x1b[r");
+        if previous <= rows as i32 {
+            emit(&format!("\x1b[{previous};1H\x1b[2K"));
+        }
     }
-    // DECSTBM: margins are 1-based and inclusive.
-    emit(&format!("\x1b[1;{}r", rows - 1));
-    PINNED.store(true, Ordering::Relaxed);
+
+    if wanted != 0 {
+        // DECSTBM: margins are 1-based and inclusive.
+        emit(&format!("\x1b[1;{}r", rows - 1));
+    }
 }
 
 /// Releases the reserved row and leaves the cursor below the bar.
 fn unpin() {
-    if !PINNED.swap(false, Ordering::SeqCst) {
+    let rows = PINNED_ROWS.swap(0, Ordering::SeqCst);
+    if rows == 0 {
         return;
     }
-    let rows = console_rows().unwrap_or(25);
+    let rows = console_rows().map_or(rows, |current| current as i32);
     emit("\x1b[r"); // reset margins to the full window
     emit(&format!("\x1b[{rows};1H\r\n"));
 }
@@ -362,8 +659,10 @@ fn unpin() {
 /// engine's own logging is writing at.
 fn write_console(text: &str) -> bool {
     if console().is_some() {
-        pin();
         if let Some(rows) = console_rows() {
+            // Measured fresh every paint rather than cached, because this is the
+            // only thing that notices a resize.
+            pin(rows);
             // DECSC/DECRC (save/restore cursor) rather than CSI s/u, which
             // conflicts with the horizontal-margin sequence on some terminals.
             return emit(&format!("\x1b7\x1b[{rows};1H\x1b[2K{text}\x1b8"));
@@ -394,33 +693,69 @@ fn write_pipe(text: &str) -> bool {
     stdout.write_all(&bytes).is_ok() && stdout.flush().is_ok()
 }
 
-fn paint(completed: i32, total: i32) {
-    let fraction = if total > 0 {
-        (completed as f64 / total as f64).clamp(0.0, 1.0)
+/// What the bar reports for one reading.
+struct Estimate {
+    fraction: f64,
+    maps_left: i32,
+}
+
+/// Turns a job count into a share of the *work*, which is not the same thing.
+///
+/// See the module header for why counting packages does not work, and why this
+/// deliberately stops at a fraction rather than going on to predict a finish time.
+fn estimate(completed: i32, total: i32, model: &Model) -> Estimate {
+    let completed = completed.clamp(0, total);
+    let map_jobs = MAP_JOBS.load(Ordering::Relaxed).clamp(0, total);
+    let fast_jobs = total - map_jobs;
+
+    let fast_cost = model.fast_millis() as f64;
+    let map_cost = model.map_millis();
+
+    // Maps are the tail of the list and are dispatched last, so the split of what
+    // has finished follows from the count alone - no need to identify individual
+    // jobs. At the boundary this is off by however many are in flight, which is
+    // at most one job per child and self-corrects on the next tick.
+    let completed_fast = completed.min(fast_jobs);
+    let completed_maps = (completed - fast_jobs).max(0);
+
+    let done = completed_fast as f64 * fast_cost + completed_maps as f64 * map_cost as f64;
+    let remaining = (fast_jobs - completed_fast) as f64 * fast_cost
+        + (map_jobs - completed_maps) as f64 * map_cost as f64;
+    let work = done + remaining;
+
+    let fraction = if work > 0.0 {
+        (done / work).clamp(0.0, 1.0)
     } else {
         0.0
     };
-    let filled = (fraction * BAR_WIDTH as f64).round() as usize;
+
+    Estimate {
+        fraction,
+        maps_left: map_jobs - completed_maps,
+    }
+}
+
+fn paint(completed: i32, total: i32, model: &Model) {
+    let now = elapsed_millis() as u64;
+    let estimate = estimate(completed, total, model);
+
+    let filled = (estimate.fraction * BAR_WIDTH as f64).round() as usize;
     let bar: String = (0..BAR_WIDTH)
         .map(|cell| if cell < filled { '#' } else { '.' })
         .collect();
 
-    let elapsed = (elapsed_millis() / 1000) as u64;
-    // Estimate from throughput so far; meaningless until a job has finished.
-    let eta = if completed > 0 && completed < total {
-        let per_job = elapsed as f64 / completed as f64;
-        format!(
-            " ETA {}",
-            format_duration((per_job * (total - completed) as f64) as u64)
-        )
+    // The count still gets shown - it is what the engine's own log lines report,
+    // so the two have to be reconcilable - but the bar and the percentage track
+    // work rather than count.
+    let maps = if estimate.maps_left > 0 {
+        format!(" ({} maps left)", estimate.maps_left)
     } else {
         String::new()
     };
-
     let line = format!(
-        "[cook] [{bar}] {:>3}%  {completed}/{total} pkgs  {}{eta}",
-        (fraction * 100.0) as u32,
-        format_duration(elapsed),
+        "[cook] [{bar}] {:>3}%  {completed}/{total} pkgs{maps}  {}",
+        (estimate.fraction * 100.0) as u32,
+        format_duration(now / 1000),
     );
 
     write_console(&line);
@@ -467,38 +802,80 @@ pub fn tick(commandlet: *mut core::ffi::c_void) {
         crate::udk_log::log(
             crate::udk_log::LogType::Init,
             &format!(
-                "cook progress: first tick - ChildProcesses read {}, output route: {route}, total {}",
-                match read {
-                    Some(n) => format!("OK ({n} jobs done)"),
+                "cook progress: first tick - ChildProcesses read {}, output route: {route}, \
+                 total {total}, maps {}",
+                match &read {
+                    Some(census) => format!("OK ({} jobs done)", census.completed),
                     None => "FAILED (layout mismatch)".to_string(),
                 },
-                total
+                match MAP_JOBS.load(Ordering::Relaxed) {
+                    -1 => "unknown (weighting every package equally)".to_string(),
+                    maps => format!("{maps}"),
+                },
             ),
         );
     }
 
-    if let Some(completed) = read {
+    if let Some(census) = read {
+        let completed = census.completed;
+
         // Repaint on a timer even when the count has not moved, so the elapsed
         // clock keeps running and the bar survives being scrolled off by log
         // output.
         let moved = LAST_COMPLETED.swap(completed, Ordering::Relaxed) != completed;
         LAST_PAINT_MILLIS.store(now as u64, Ordering::Relaxed);
 
-        // A pinned bar can repaint in place, so it may tick on the timer to keep
-        // the clock live. The inline fallback cannot - `\r` returns the cursor but
-        // the next log line appends and scrolls it away, so every repaint leaves a
-        // fossil. Measured: UDK.exe has no console (only a pipe to UDK.com), so
-        // inline is the normal case, and at 4Hz it produced ~1600 fossil lines per
-        // cook. Drawing only when the count moves yields one line per completed
-        // job, which is the same cadence as the engine's own "done in" lines.
-        if moved || console().is_some() {
-            paint(completed, total);
+        let finished = completed >= total;
+        let fast_jobs = total - MAP_JOBS.load(Ordering::Relaxed).clamp(0, total);
+        if let Ok(mut model) = MODEL.lock() {
+            model.observe(now as u64, &census.per_child, fast_jobs);
+
+            // A pinned bar can repaint in place, so it may tick on the timer to
+            // keep the clock live. The inline fallback cannot - `\r` returns the
+            // cursor but the next log line appends and scrolls it away, so every
+            // repaint leaves a fossil. Measured: UDK.exe has no console (only a
+            // pipe to UDK.com), so inline is the normal case, and at 4Hz it
+            // produced ~1600 fossil lines per cook. Drawing only when the count
+            // moves yields one line per completed job, which is the same cadence
+            // as the engine's own "done in" lines.
+            if moved || console().is_some() {
+                paint(completed, total, &model);
+            }
+
+            let due = LAST_LOG_MILLIS.load(Ordering::Relaxed);
+            if now as u64 >= due.saturating_add(PROGRESS_LOG_INTERVAL_MILLIS) || finished {
+                LAST_LOG_MILLIS.store(now as u64, Ordering::Relaxed);
+                let estimate = estimate(completed, total, &model);
+                crate::udk_log::log(
+                    crate::udk_log::LogType::Init,
+                    &format!(
+                        "cook progress: {}% ({completed}/{total} pkgs, {} maps left) elapsed {} \
+                         [costs: fast {}ms x{}, map {}ms x{}]",
+                        (estimate.fraction * 100.0) as u32,
+                        estimate.maps_left,
+                        format_duration(now as u64 / 1000),
+                        model.fast_millis(),
+                        model.fast_samples,
+                        model.map_millis(),
+                        model.map_samples,
+                    ),
+                );
+
+                // Persisted on the same cadence rather than only at the end. The
+                // master stops polling ChildIsIdle once the queue drains, so the
+                // tick that would see completed == total often never happens -
+                // measured: a clean 155-job cook finished without one, and wrote
+                // no stats at all. Saving as we go also means a cook that is
+                // killed still teaches the next one something.
+                save_stats(&model);
+            }
+
         }
 
         // Every job is back, so close the bar off on its own line rather than
         // leaving the cook's remaining output to overwrite it. Needs no
         // end-of-cook hook: the counter reaching the total is the signal.
-        if completed >= total {
+        if finished {
             ACTIVE.store(false, Ordering::SeqCst);
             // Hand the reserved row back before the cook's closing output arrives,
             // otherwise the console keeps scrolling inside the shrunken region for
@@ -508,6 +885,155 @@ pub fn tick(commandlet: *mut core::ffi::c_void) {
     }
 
     PAINTING.store(false, Ordering::SeqCst);
+}
+
+/// Where the cost model is kept between cooks: beside the cooked data, so each
+/// platform keeps its own and wiping a cooked tree wipes its statistics too.
+///
+/// Derived from `-platform=` exactly as `udk_cook_pcd_checkpoint` derives the
+/// PCD path (`<exe>\..\..\UDKGame\Cooked<Platform>\`).
+fn stats_path() -> Option<std::path::PathBuf> {
+    let platform = std::env::args_os().find_map(|argument| {
+        let text = argument.to_string_lossy();
+        let (key, value) = text.trim_start_matches(['-', '/']).split_once('=')?;
+        key.eq_ignore_ascii_case("platform")
+            .then(|| value.trim().to_string())
+    })?;
+
+    let base = std::env::current_exe().ok().and_then(|exe| {
+        exe.parent()
+            .and_then(|dir| dir.parent())
+            .and_then(|dir| dir.parent())
+            .map(|dir| dir.to_path_buf())
+    })?;
+
+    Some(
+        base.join("UDKGame")
+            .join(format!("Cooked{platform}"))
+            .join("CookProgress.stats"),
+    )
+}
+
+/// Seeds the model with the last completed cook's costs.
+///
+/// Anything unparseable is ignored rather than repaired: a corrupt stats file
+/// must never be able to stop a cook, and the built-in priors are a fine
+/// fallback.
+fn load_stats(model: &mut Model) {
+    let Some(text) = stats_path().and_then(|path| std::fs::read_to_string(path).ok()) else {
+        return;
+    };
+
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let Ok(value) = value.trim().parse::<u64>() else {
+            continue;
+        };
+        match key.trim() {
+            "fast_millis" if value > 0 => model.prior_fast_millis = Some(value),
+            "map_millis" if value > 0 => model.prior_map_millis = Some(value),
+            _ => {}
+        }
+    }
+}
+
+/// Writes the costs this cook measured, for the next one to start from.
+///
+/// Only measured values are written; if a cook was too short to observe either
+/// cluster, the previous file is left alone rather than overwritten with priors.
+fn save_stats(model: &Model) {
+    if model.fast_samples < MIN_SAMPLES && model.map_samples < MIN_SAMPLES {
+        return;
+    }
+    let Some(path) = stats_path() else {
+        return;
+    };
+
+    let text = format!(
+        "# Cook job costs measured by TotemArts Extensions; delete to reset.\n\
+         version=1\n\
+         fast_millis={}\n\
+         map_millis={}\n\
+         map_max_millis={}\n\
+         fast_samples={}\n\
+         map_samples={}\n",
+        model.fast_millis(),
+        model.map_millis(),
+        model.map_max_millis,
+        model.fast_samples,
+        model.map_samples,
+    );
+    let _ = std::fs::write(path, text);
+}
+
+/// Hook for `UCookPackagesCommandlet::GeneratePackageList`.
+///
+/// Runs once per cook, before `StartChildren`, and exists only to learn how much
+/// of the job list is maps - see the module header for why that dominates.
+///
+/// Nothing is altered: the original builds the list, and this reads two numbers
+/// out of the result afterwards. A reading that fails validation leaves
+/// `MAP_JOBS` at -1, which degrades the bar to equal weighting rather than
+/// producing a confidently wrong estimate.
+fn generate_package_list_hook(
+    result: *mut core::ffi::c_void,
+    commandlet: *mut core::ffi::c_void,
+    first_startup: *mut i32,
+    first_script: *mut i32,
+    first_game_script: *mut i32,
+    first_map: *mut i32,
+) -> *mut core::ffi::c_void {
+    let returned = GeneratePackageListHook.call(
+        result,
+        commandlet,
+        first_startup,
+        first_script,
+        first_game_script,
+        first_map,
+    );
+
+    let read = |pointer: *mut i32| -> Option<i32> {
+        (!pointer.is_null()).then(|| unsafe { pointer.read_unaligned() })
+    };
+
+    let packages = (!returned.is_null())
+        .then(|| unsafe { ((returned as usize + TARRAY_NUM) as *const i32).read_unaligned() });
+    let map_index = read(first_map);
+
+    // INDEX_NONE means the cook has no maps at all, which is the -nomaps pass the
+    // user runs first; equal weighting is then exactly right.
+    let maps = match (packages, map_index) {
+        (Some(packages), Some(index)) if index > 0 && index < packages => {
+            MAP_JOBS.store(packages - index, Ordering::Relaxed);
+            Some(packages - index)
+        }
+        _ => None,
+    };
+
+    // Logged rather than trusted silently: the four out-parameters are positional
+    // and only their order in the source distinguishes them, so this line is what
+    // confirms the mapping on a real cook. FirstScriptIndex <= FirstStartupIndex
+    // <= FirstMapIndex < Num is the invariant the assembled list guarantees.
+    crate::udk_log::log(
+        crate::udk_log::LogType::Init,
+        &format!(
+            "cook progress: package list has {} entries (startup {}, script {}, game script {}, \
+             first map {}) -> {}",
+            packages.map_or("?".to_string(), |value| value.to_string()),
+            read(first_startup).map_or("?".to_string(), |value| value.to_string()),
+            read(first_script).map_or("?".to_string(), |value| value.to_string()),
+            read(first_game_script).map_or("?".to_string(), |value| value.to_string()),
+            map_index.map_or("?".to_string(), |value| value.to_string()),
+            match maps {
+                Some(maps) => format!("{maps} map jobs, weighting enabled"),
+                None => "no map split, weighting every package equally".to_string(),
+            },
+        ),
+    );
+
+    returned
 }
 
 /// Hook for `UCookPackagesCommandlet::StartChildren`.
@@ -585,12 +1111,45 @@ pub fn init() -> anyhow::Result<()> {
 
     let _ = EPOCH.set(Instant::now());
 
+    // Reading the stats file here is safe - it is plain file IO with no engine
+    // calls - whereas logging from init() would deadlock under the loader lock.
+    if let Ok(mut model) = MODEL.lock() {
+        load_stats(&mut model);
+    }
+
     unsafe {
         let udk = get_udk_ptr();
         StartChildrenHook
             .initialize(std::mem::transmute(udk.add(offset)), start_children_hook)
             .context("Failed to setup StartChildren hook")?;
         StartChildrenHook.enable()?;
+    }
+
+    // The map split is a refinement, not a prerequisite: if this second hook
+    // cannot be placed the bar still draws, just with every package weighted the
+    // same. So a failure here is logged and swallowed rather than propagated.
+    let (offset, matches) = find_signature_offset(
+        &GENERATE_PACKAGE_LIST_SIG,
+        GENERATE_PACKAGE_LIST_OFFSET,
+        0,
+    );
+    debug_log!("udk_cook_progress: GeneratePackageList signature matches: {matches}");
+
+    if let Some(offset) = offset {
+        unsafe {
+            let udk = get_udk_ptr();
+            let installed = GeneratePackageListHook
+                .initialize(
+                    std::mem::transmute(udk.add(offset)),
+                    generate_package_list_hook,
+                )
+                .and_then(|hook| hook.enable());
+            if installed.is_err() {
+                debug_log!("udk_cook_progress: GeneratePackageList hook failed to install");
+            }
+        }
+    } else {
+        debug_log!("udk_cook_progress: GeneratePackageList not found - equal weighting");
     }
 
     debug_log!("udk_cook_progress: installed");
