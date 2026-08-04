@@ -157,6 +157,8 @@ static TOTAL_JOBS: AtomicI32 = AtomicI32::new(0);
 static LAST_COMPLETED: AtomicI32 = AtomicI32::new(-1);
 static ACTIVE: AtomicBool = AtomicBool::new(false);
 static PAINTING: AtomicBool = AtomicBool::new(false);
+/// Set once the first tick has reported what it could and could not do.
+static DIAGNOSED: AtomicBool = AtomicBool::new(false);
 static LAST_PAINT_MILLIS: AtomicU64 = AtomicU64::new(0);
 static EPOCH: OnceLock<Instant> = OnceLock::new();
 
@@ -212,39 +214,144 @@ unsafe fn completed_jobs(commandlet: *mut core::ffi::c_void) -> Option<i32> {
 /// than overwriting. `WriteConsoleW` on the console handle sidesteps the CRT
 /// stream mode entirely.
 ///
-/// Returns `false` when stdout is not a console (redirected to a file or a
-/// pipe), where a repainting bar would only pile up carriage returns.
-fn write_console(text: &str) -> bool {
+/// `UDK.com` is a console stub that launches `UDK.exe` and relays its output, so
+/// inside this process stdout is a **pipe, not a console** - measured, via the
+/// `console writable false` diagnostic on a live cook. There is therefore no
+/// console handle to write to in the normal case, and the bar has to go down the
+/// pipe in the encoding the relay expects.
+///
+/// That encoding is UTF-16: UDK writes its log wide, and the first attempt at
+/// this bar (narrow UTF-8 through `std::io::stdout`) came out the other end as
+/// CJK filler with the `\r` absorbed into a wide character, which is precisely
+/// what UTF-8 bytes look like when re-read as UTF-16.
+///
+/// Both paths are kept, because running `UDK.exe` directly does give a real
+/// console, and `WriteConsoleW` is correct there regardless of stream mode.
+/// Direct handle to the console screen buffer, or 0 if there is no console.
+static CONSOLE: OnceLock<isize> = OnceLock::new();
+/// Set once the scroll region has been reserved.
+static PINNED: AtomicBool = AtomicBool::new(false);
+
+/// Opens the console screen buffer directly and turns on VT sequence handling.
+///
+/// `GetStdHandle(STD_OUTPUT_HANDLE)` is useless here: `UDK.com` launches
+/// `UDK.exe` with stdout redirected into a pipe it relays, so there is no console
+/// handle on stdout (measured - the `console writable false` diagnostic). The
+/// process is still *attached* to that console though, so `CONOUT$` opens the
+/// screen buffer itself and bypasses the pipe entirely.
+fn console() -> Option<windows::Win32::Foundation::HANDLE> {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::HANDLE;
+    use windows::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
     use windows::Win32::System::Console::{
-        GetConsoleMode, GetStdHandle, WriteConsoleW, CONSOLE_MODE, STD_OUTPUT_HANDLE,
+        GetConsoleMode, SetConsoleMode, CONSOLE_MODE, ENABLE_VIRTUAL_TERMINAL_PROCESSING,
     };
 
+    let raw = *CONSOLE.get_or_init(|| unsafe {
+        let name: Vec<u16> = "CONOUT$\0".encode_utf16().collect();
+        let handle = CreateFileW(
+            PCWSTR(name.as_ptr()),
+            0x8000_0000 | 0x4000_0000, // GENERIC_READ | GENERIC_WRITE
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            HANDLE::default(),
+        );
+        match handle {
+            Ok(handle) if !handle.is_invalid() => {
+                // Scroll margins are a VT feature, so the terminal has to be in VT
+                // mode before DECSTBM will do anything.
+                let mut mode = CONSOLE_MODE::default();
+                if GetConsoleMode(handle, &mut mode).is_ok() {
+                    let _ = SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+                }
+                handle.0
+            }
+            _ => 0,
+        }
+    });
+
+    (raw != 0).then_some(HANDLE(raw))
+}
+
+/// Raw write of a UTF-16 string to the console screen buffer.
+fn emit(text: &str) -> bool {
+    use windows::Win32::System::Console::WriteConsoleW;
+
+    let Some(handle) = console() else {
+        return false;
+    };
+    let wide: Vec<u16> = text.encode_utf16().collect();
+
     unsafe {
-        let Ok(handle) = GetStdHandle(STD_OUTPUT_HANDLE) else {
-            return false;
-        };
-        if handle.is_invalid() {
-            return false;
-        }
-        // Only a real console screen buffer accepts WriteConsoleW.
-        let mut mode = CONSOLE_MODE::default();
-        if GetConsoleMode(handle, &mut mode).is_err() {
-            return false;
-        }
-
-        let wide: Vec<u16> = text.encode_utf16().collect();
-
-        // windows-0.52 types WriteConsoleW's buffer as `&[u8]` but forwards
-        // `len()` as nNumberOfCharsToWrite, which the API counts in *characters*.
-        // Handing it the UTF-16 bytes directly would therefore ask for twice as
-        // many characters as exist and read off the end of the buffer. Build a
-        // byte slice that keeps the wide pointer but carries the character count:
-        // it spans half the allocation, so it stays in bounds.
+        // windows-0.52 types WriteConsoleW's buffer as `&[u8]` but forwards `len()`
+        // as nNumberOfCharsToWrite, which the API counts in *characters*. Passing
+        // the UTF-16 bytes directly would ask for twice as many characters as exist
+        // and read off the end. This slice keeps the wide pointer but carries the
+        // character count, so it spans half the allocation and stays in bounds.
         let buffer = std::slice::from_raw_parts(wide.as_ptr().cast::<u8>(), wide.len());
-
         let mut written = 0u32;
         WriteConsoleW(handle, buffer, Some(&mut written), None).is_ok()
     }
+}
+
+/// Number of rows in the console window.
+fn console_rows() -> Option<i16> {
+    use windows::Win32::System::Console::{
+        GetConsoleScreenBufferInfo, CONSOLE_SCREEN_BUFFER_INFO,
+    };
+
+    let handle = console()?;
+    let mut info = CONSOLE_SCREEN_BUFFER_INFO::default();
+    unsafe { GetConsoleScreenBufferInfo(handle, &mut info).ok()? };
+    Some(info.srWindow.Bottom - info.srWindow.Top + 1)
+}
+
+/// Reserves the last row by confining the scrolling region to everything above
+/// it, so UDK's log output can no longer scroll over the bar.
+fn pin() {
+    if PINNED.load(Ordering::Relaxed) {
+        return;
+    }
+    let Some(rows) = console_rows() else {
+        return;
+    };
+    if rows < 3 {
+        return;
+    }
+    // DECSTBM: margins are 1-based and inclusive.
+    emit(&format!("\x1b[1;{}r", rows - 1));
+    PINNED.store(true, Ordering::Relaxed);
+}
+
+/// Releases the reserved row and leaves the cursor below the bar.
+fn unpin() {
+    if !PINNED.swap(false, Ordering::SeqCst) {
+        return;
+    }
+    let rows = console_rows().unwrap_or(25);
+    emit("\x1b[r"); // reset margins to the full window
+    emit(&format!("\x1b[{rows};1H\r\n"));
+}
+
+/// Draws `text` on the reserved bottom row without disturbing the cursor the
+/// engine's own logging is writing at.
+fn write_console(text: &str) -> bool {
+    if console().is_none() {
+        return false;
+    }
+    pin();
+
+    let Some(rows) = console_rows() else {
+        return false;
+    };
+
+    // DECSC/DECRC (save/restore cursor) rather than CSI s/u, which conflicts with
+    // the horizontal-margin sequence on some terminals.
+    emit(&format!("\x1b7\x1b[{rows};1H\x1b[2K{text}\x1b8"))
 }
 
 fn paint(completed: i32, total: i32) {
@@ -271,7 +378,7 @@ fn paint(completed: i32, total: i32) {
     };
 
     let line = format!(
-        "\r[cook] [{bar}] {:>3}%  {completed}/{total} pkgs  {}{eta}   ",
+        "[cook] [{bar}] {:>3}%  {completed}/{total} pkgs  {}{eta}",
         (fraction * 100.0) as u32,
         format_duration(elapsed),
     );
@@ -304,7 +411,27 @@ pub fn tick(commandlet: *mut core::ffi::c_void) {
         return;
     }
 
-    if let Some(completed) = unsafe { completed_jobs(commandlet) } {
+    let read = unsafe { completed_jobs(commandlet) };
+
+    // One-shot diagnosis of the two things that can silently kill the bar: an
+    // unreadable ChildProcesses array, or stdout not being a console.
+    if !DIAGNOSED.swap(true, Ordering::SeqCst) {
+        let console = write_console("");
+        crate::udk_log::log(
+            crate::udk_log::LogType::Init,
+            &format!(
+                "cook progress: first tick - ChildProcesses read {}, console writable {}, total {}",
+                match read {
+                    Some(n) => format!("OK ({n} jobs done)"),
+                    None => "FAILED (layout mismatch)".to_string(),
+                },
+                console,
+                total
+            ),
+        );
+    }
+
+    if let Some(completed) = read {
         // Repaint on a timer even when the count has not moved, so the elapsed
         // clock keeps running and the bar survives being scrolled off by log
         // output.
@@ -317,7 +444,10 @@ pub fn tick(commandlet: *mut core::ffi::c_void) {
         // end-of-cook hook: the counter reaching the total is the signal.
         if completed >= total {
             ACTIVE.store(false, Ordering::SeqCst);
-            write_console("\r\n");
+            // Hand the reserved row back before the cook's closing output arrives,
+            // otherwise the console keeps scrolling inside the shrunken region for
+            // the rest of the session.
+            unpin();
         }
     }
 
@@ -334,13 +464,19 @@ fn start_children_hook(commandlet: *mut core::ffi::c_void, num_files: i32) -> i3
     if started != 0 && num_files > 0 {
         TOTAL_JOBS.store(num_files, Ordering::Relaxed);
         ACTIVE.store(true, Ordering::SeqCst);
-        debug_log!("udk_cook_progress: tracking {num_files} packages");
-    } else {
-        debug_log!(
-            "udk_cook_progress: StartChildren declined ({num_files} jobs); \
-             single-process cooks are not tracked"
-        );
     }
+
+    // Install confirmation is deferred to here rather than done in init(), which
+    // runs from DllMain under the loader lock where udk_log would deadlock. This
+    // is the first point that proves the detour is live.
+    crate::udk_log::log(
+        crate::udk_log::LogType::Init,
+        &format!(
+            "cook progress: StartChildren returned {started} for {num_files} jobs; \
+             bar {}",
+            if started != 0 && num_files > 0 { "ARMED" } else { "inactive" }
+        ),
+    );
 
     started
 }

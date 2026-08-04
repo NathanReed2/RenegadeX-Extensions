@@ -180,6 +180,12 @@ const CHILD_IS_IDLE_SIG: [u8; 28] = [
 /// basename keeps only the master's.
 const MASTER_PCD_FILENAME: &str = "globalpersistentcookerdata.upk";
 
+/// Appended to the live PCD path to form the sidecar the checkpoint writes to.
+const CHECKPOINT_SUFFIX: &str = ".checkpoint";
+
+/// Live PCD path, captured alongside the sidecar so a later run can promote.
+static LIVE_PCD_PATH: OnceLock<String> = OnceLock::new();
+
 /// How long to leave between checkpoints when `-PCDCheckpointSeconds=` is absent.
 ///
 /// A complete 50-map PCServer cook measured 190s end to end, of which only 117s
@@ -201,8 +207,16 @@ static_detour! {
 struct CheckpointTarget {
     commandlet: usize,
     cooker_data: usize,
-    /// NUL-terminated copy of `Where`, owned so it outlives the engine's temporary.
-    path: Vec<u16>,
+    /// NUL-terminated sidecar path the checkpoint is written to.
+    ///
+    /// **Not** the live `GlobalPersistentCookerData.upk`. `BulletProofPCDSave`
+    /// deletes its target before rewriting it, and every child has the live file
+    /// open from boot, so deleting it mid-run can never succeed: the master wedges
+    /// in `WaitToDeleteFile` retrying (measured: 416 retries, no progress) and
+    /// eventually `appErrorf`s the cook. Stock UE3 only ever makes that call
+    /// before children exist or after they are stopped. A sidecar nobody has open
+    /// deletes and rewrites cleanly.
+    checkpoint_path: Vec<u16>,
 }
 
 // The two pointers are engine-owned and only ever handed straight back to the
@@ -278,11 +292,14 @@ fn bullet_proof_pcd_save_hook(
         .map(|owned| {
             let master = is_master_pcd(&owned);
             if master && TARGET.get().is_none() && !commandlet.is_null() && !cooker_data.is_null() {
+                let live = String::from_utf16_lossy(&owned[..owned.len() - 1]);
+                let sidecar = format!("{live}{CHECKPOINT_SUFFIX}\0");
                 let _ = TARGET.set(CheckpointTarget {
                     commandlet: commandlet as usize,
                     cooker_data: cooker_data as usize,
-                    path: owned,
+                    checkpoint_path: sidecar.encode_utf16().collect(),
                 });
+                LIVE_PCD_PATH.get_or_init(|| live);
             }
             master
         })
@@ -307,7 +324,7 @@ fn checkpoint(target: &CheckpointTarget) {
     BulletProofPcdSaveHook.call(
         target.commandlet as *mut core::ffi::c_void,
         target.cooker_data as *mut core::ffi::c_void,
-        target.path.as_ptr(),
+        target.checkpoint_path.as_ptr(),
     );
 
     let count = CHECKPOINTS_WRITTEN.fetch_add(1, Ordering::Relaxed) + 1;
@@ -404,12 +421,72 @@ fn is_mt_cook_master() -> bool {
     is_cook && has_switch("Processes") && !has_switch("MTCHILD")
 }
 
+/// Promotes a checkpoint left by a previous run into place as the live PCD.
+///
+/// Runs from `DllMain`, which is the only moment early enough to matter: the
+/// incremental decisions in `GeneratePackageList` read the PCD, so promoting any
+/// later would not save a single package from being recooked. No engine file
+/// handles exist yet, so replacing the file here is safe.
+///
+/// The cooked directory is derived from `-platform=`, matching the layout the
+/// cooker uses (`<exe>\..\..\UDKGame\Cooked<Platform>\`).
+fn promote_checkpoint() {
+    let Some(platform) = std::env::args_os().find_map(|argument| {
+        let text = argument.to_string_lossy();
+        let (key, value) = text.trim_start_matches(['-', '/']).split_once('=')?;
+        key.eq_ignore_ascii_case("platform")
+            .then(|| value.trim().to_string())
+    }) else {
+        return;
+    };
+
+    let Some(base) = std::env::current_exe().ok().and_then(|exe| {
+        exe.parent()
+            .and_then(|dir| dir.parent())
+            .and_then(|dir| dir.parent())
+            .map(|dir| dir.to_path_buf())
+    }) else {
+        return;
+    };
+
+    let live = base
+        .join("UDKGame")
+        .join(format!("Cooked{platform}"))
+        .join("GlobalPersistentCookerData.upk");
+    let sidecar = live.with_extension(format!("upk{CHECKPOINT_SUFFIX}"));
+
+    let Ok(sidecar_meta) = std::fs::metadata(&sidecar) else {
+        return;
+    };
+    if sidecar_meta.len() == 0 {
+        let _ = std::fs::remove_file(&sidecar);
+        return;
+    }
+
+    // Only promote a checkpoint that is strictly newer than the live file; if the
+    // last run finished cleanly the engine's own end-of-cook save is authoritative.
+    let newer = match (sidecar_meta.modified(), std::fs::metadata(&live).and_then(|m| m.modified())) {
+        (Ok(checkpoint), Ok(current)) => checkpoint > current,
+        (Ok(_), Err(_)) => true, // live PCD missing entirely
+        _ => false,
+    };
+
+    if newer && std::fs::copy(&sidecar, &live).is_ok() {
+        debug_log!("udk_cook_pcd_checkpoint: promoted checkpoint into {}", live.display());
+    }
+    let _ = std::fs::remove_file(&sidecar);
+}
+
 pub fn init() -> anyhow::Result<()> {
     if !is_mt_cook_master() {
         return Ok(());
     }
 
     debug_log!("udk_cook_pcd_checkpoint::init start");
+
+    // Before anything else: a checkpoint from a run that died is only useful if it
+    // is in place before GeneratePackageList reads the PCD.
+    promote_checkpoint();
 
     let interval = switch_value("PCDCheckpointSeconds")
         .unwrap_or(DEFAULT_CHECKPOINT_SECONDS)
