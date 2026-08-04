@@ -1,4 +1,4 @@
-//! Draws a cook progress bar on the console, so a long `-Processes=N` cook says
+﻿//! Draws a cook progress bar on the console, so a long `-Processes=N` cook says
 //! how far through it is instead of only scrolling package names.
 //!
 //! # Where the numbers come from
@@ -85,6 +85,7 @@
 
 #![cfg(target_arch = "x86_64")]
 
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::Instant;
@@ -340,18 +341,37 @@ fn unpin() {
 /// Draws `text` on the reserved bottom row without disturbing the cursor the
 /// engine's own logging is writing at.
 fn write_console(text: &str) -> bool {
-    if console().is_none() {
-        return false;
+    if console().is_some() {
+        pin();
+        if let Some(rows) = console_rows() {
+            // DECSC/DECRC (save/restore cursor) rather than CSI s/u, which
+            // conflicts with the horizontal-margin sequence on some terminals.
+            return emit(&format!("\x1b7\x1b[{rows};1H\x1b[2K{text}\x1b8"));
+        }
     }
-    pin();
 
-    let Some(rows) = console_rows() else {
-        return false;
-    };
+    // No reachable console screen buffer. Fall back to the pipe UDK.com relays -
+    // inline and scrolled away by each log line, but visible, which beats a bar
+    // that silently does not exist. Making CONOUT$ a hard requirement is exactly
+    // how this regressed to nothing being drawn at all.
+    write_pipe(text)
+}
 
-    // DECSC/DECRC (save/restore cursor) rather than CSI s/u, which conflicts with
-    // the horizontal-margin sequence on some terminals.
-    emit(&format!("\x1b7\x1b[{rows};1H\x1b[2K{text}\x1b8"))
+/// Inline fallback: UTF-16LE down stdout, which is the pipe `UDK.com` relays.
+///
+/// The trailing spaces cover the tail of a previous, longer line, since `\r` only
+/// returns the cursor and does not clear.
+fn write_pipe(text: &str) -> bool {
+    let line = format!("\r{text}    ");
+    let wide: Vec<u16> = line.encode_utf16().collect();
+
+    let mut bytes = Vec::with_capacity(wide.len() * 2);
+    for unit in &wide {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+
+    let mut stdout = std::io::stdout();
+    stdout.write_all(&bytes).is_ok() && stdout.flush().is_ok()
 }
 
 fn paint(completed: i32, total: i32) {
@@ -416,16 +436,22 @@ pub fn tick(commandlet: *mut core::ffi::c_void) {
     // One-shot diagnosis of the two things that can silently kill the bar: an
     // unreadable ChildProcesses array, or stdout not being a console.
     if !DIAGNOSED.swap(true, Ordering::SeqCst) {
-        let console = write_console("");
+        // Report which output path is actually in use. The previous version of
+        // this line said "console writable true" on the pipe fallback too, which
+        // was measuring whether a write succeeded rather than where it went.
+        let route = if console().is_some() {
+            "pinned bottom row via CONOUT$"
+        } else {
+            "inline via UDK.com pipe (no console screen buffer reachable)"
+        };
         crate::udk_log::log(
             crate::udk_log::LogType::Init,
             &format!(
-                "cook progress: first tick - ChildProcesses read {}, console writable {}, total {}",
+                "cook progress: first tick - ChildProcesses read {}, output route: {route}, total {}",
                 match read {
                     Some(n) => format!("OK ({n} jobs done)"),
                     None => "FAILED (layout mismatch)".to_string(),
                 },
-                console,
                 total
             ),
         );
