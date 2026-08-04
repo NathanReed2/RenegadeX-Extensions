@@ -461,9 +461,19 @@ pub fn tick(commandlet: *mut core::ffi::c_void) {
         // Repaint on a timer even when the count has not moved, so the elapsed
         // clock keeps running and the bar survives being scrolled off by log
         // output.
-        LAST_COMPLETED.store(completed, Ordering::Relaxed);
+        let moved = LAST_COMPLETED.swap(completed, Ordering::Relaxed) != completed;
         LAST_PAINT_MILLIS.store(now as u64, Ordering::Relaxed);
-        paint(completed, total);
+
+        // A pinned bar can repaint in place, so it may tick on the timer to keep
+        // the clock live. The inline fallback cannot - `\r` returns the cursor but
+        // the next log line appends and scrolls it away, so every repaint leaves a
+        // fossil. Measured: UDK.exe has no console (only a pipe to UDK.com), so
+        // inline is the normal case, and at 4Hz it produced ~1600 fossil lines per
+        // cook. Drawing only when the count moves yields one line per completed
+        // job, which is the same cadence as the engine's own "done in" lines.
+        if moved || console().is_some() {
+            paint(completed, total);
+        }
 
         // Every job is back, so close the bar off on its own line rather than
         // leaving the cook's remaining output to overwrite it. Needs no
