@@ -141,6 +141,14 @@ pub enum Mode {
     Edit = 1,
     Full = 2,
     Custom = 3,
+    /// Everything `Full` grants, and none of the asking.
+    ///
+    /// This is the one mode that cannot be arrived at by accident. It has the
+    /// same capability mask as `Full`, so [`mode_for_mask`] never names it -
+    /// editing bits until they happen to add up to "everything" gives `Full`.
+    /// It is only ever entered by being asked for explicitly, because the thing
+    /// it switches off is the mechanism that would otherwise ask.
+    Dangerous = 4,
 }
 
 impl Mode {
@@ -150,6 +158,7 @@ impl Mode {
             Mode::Edit => "edit",
             Mode::Full => "full",
             Mode::Custom => "custom",
+            Mode::Dangerous => "dangerous",
         }
     }
 
@@ -159,6 +168,9 @@ impl Mode {
             Mode::Edit => "Read, edit properties, and move actors. No deleting, no Exec.",
             Mode::Full => "Everything, including arbitrary editor commands.",
             Mode::Custom => "Per-capability, as set in the advanced menu.",
+            Mode::Dangerous => {
+                "(!) Everything, and no prompts, size limits or rate limits. Nothing will ask."
+            }
         }
     }
 
@@ -168,6 +180,7 @@ impl Mode {
             "edit" => Some(Mode::Edit),
             "full" => Some(Mode::Full),
             "custom" => Some(Mode::Custom),
+            "dangerous" => Some(Mode::Dangerous),
             _ => None,
         }
     }
@@ -177,6 +190,7 @@ impl Mode {
             1 => Mode::Edit,
             2 => Mode::Full,
             3 => Mode::Custom,
+            4 => Mode::Dangerous,
             _ => Mode::Context,
         }
     }
@@ -201,7 +215,7 @@ impl Mode {
                     }
                 }
             }
-            Mode::Full => {
+            Mode::Full | Mode::Dangerous => {
                 for capability in ALL {
                     mask |= capability.bit();
                 }
@@ -211,7 +225,47 @@ impl Mode {
     }
 }
 
-pub const ALL_MODES: [Mode; 4] = [Mode::Context, Mode::Edit, Mode::Full, Mode::Custom];
+/// `Full` is deliberately ahead of `Dangerous`, because [`mode_for_mask`] takes
+/// the first match and the two share a mask. That ordering is what makes
+/// `Dangerous` unreachable except by name.
+pub const ALL_MODES: [Mode; 5] = [
+    Mode::Context,
+    Mode::Edit,
+    Mode::Full,
+    Mode::Dangerous,
+    Mode::Custom,
+];
+
+/// Whether the operator has said, in advance, to stop asking.
+///
+/// Every prompt and every limit the bridge imposes exists because the caller
+/// cannot be the one to decide. This is the operator deciding once, in advance,
+/// that for this session it can be - which is a legitimate thing to want when
+/// you are driving the editor yourself and the prompts are the slow part.
+///
+/// It does **not** switch off the audit log. A session with no prompts is the
+/// one where a written record matters most, and nothing here is load-bearing for
+/// performance.
+pub fn confirmations_suppressed() -> bool {
+    current_mode() == Mode::Dangerous
+}
+
+/// The warning shown before entering the mode - the last prompt there will be.
+pub fn dangerous_warning() -> String {
+    format!(
+        "Turn on DANGEROUS mode?\n\nThis grants every capability and switches off everything that \
+         would otherwise stop and ask you:\n\n    - no approval prompt before an editor command \
+         runs (including MAP SAVE, ACTOR DELETE, BUILDLIGHTING)\n    - no approval prompt before \
+         the connected program changes its own permissions\n    - no {} actor limit on a single \
+         change\n    - no limit on how many changes a minute\n    - deleting no longer needs a \
+         confirm flag\n\nA connected model will be able to modify and delete anything in this \
+         editor, as fast as it can ask, without you seeing a single dialog. Undo is your only \
+         safety net, and it does not cover everything an editor command can do.\n\nThis setting \
+         persists across restarts until you change it back. Every action is still written to the \
+         audit log.\n\nOnly do this if you are watching the editor and know what is connected.",
+        super::guard::BLAST_RADIUS
+    )
+}
 
 /// Read on every tool call, so it is an atomic rather than living behind the
 /// mutex that serialises writes.
@@ -342,9 +396,16 @@ pub fn deny_message(capability: Capability) -> String {
 
 /// Names the presets that would grant `capability`, so the user can be asked for
 /// the smallest change that unblocks the work rather than "give me full access".
+///
+/// `Dangerous` is excluded on purpose. It grants everything, so it would appear
+/// in every one of these sentences, and a refusal that ends "...or ask them for
+/// dangerous mode" teaches a blocked model to request the removal of all the
+/// safeguards as a routine way past an obstacle. That mode is the operator's
+/// choice to volunteer, never something a refusal suggests.
 fn granting_modes_sentence(capability: Capability) -> String {
     let granting: Vec<&str> = ALL_MODES
         .iter()
+        .filter(|mode| **mode != Mode::Dangerous)
         .filter(|mode| matches!(mode.mask(), Some(mask) if mask & capability.bit() != 0))
         .map(|mode| mode.id())
         .collect();
@@ -479,12 +540,30 @@ impl Change {
     /// takes on even one new capability is exactly the thing the policy exists
     /// to stop the caller doing for itself.
     pub fn grants_anything(&self) -> bool {
-        !self.grants.is_empty()
+        !self.grants.is_empty() || self.enables_dangerous()
+    }
+
+    /// Switching the prompts off is itself a widening, even though it moves no
+    /// capability bit. Without this, `full` -> `dangerous` would grant nothing
+    /// by the mask test and so would apply unasked - which is precisely the
+    /// change nobody should be able to make on the operator's behalf.
+    pub fn enables_dangerous(&self) -> bool {
+        self.mode == Mode::Dangerous && current_mode() != Mode::Dangerous
     }
 
     /// The prompt text. Written so someone who did not expect the dialog can
     /// tell what it is asking for and say no.
     pub fn summary(&self) -> String {
+        // Asking for DANGEROUS is not a permission request like the others: it
+        // asks for this dialog never to appear again. Say that first, in place
+        // of the ordinary wording, or the last prompt looks like all the rest.
+        if self.enables_dangerous() {
+            return format!(
+                "A program connected to this editor's MCP bridge is asking to turn on DANGEROUS \
+                 mode.\n\nThis is the last time you will be asked about anything.\n\n{}",
+                dangerous_warning()
+            );
+        }
         let mut text = String::from(
             "A program connected to this editor's MCP bridge is asking to change what it is \
              allowed to do.\n\nOnly allow this if you were expecting it.\n\n",
@@ -549,8 +628,14 @@ fn plan_from(request: &str, current: u32) -> Result<Change, String> {
     // A preset whose bits were then edited is no longer that preset. Naming the
     // mask is the same rule the panel uses, so both surfaces agree on what to
     // call the result.
+    // `Custom` and `Dangerous` are both named rather than derived: the first
+    // because its mask is whatever it is, the second because it shares `Full`'s
+    // mask and must never be inferred from one.
     let mode = match requested_mode {
         Some(Mode::Custom) => Mode::Custom,
+        Some(Mode::Dangerous) if mask == Mode::Dangerous.mask().unwrap_or_default() => {
+            Mode::Dangerous
+        }
         _ => mode_for_mask(mask),
     };
 
@@ -635,6 +720,47 @@ mod tests {
         assert_ne!(mask & Capability::WriteTransform.bit(), 0);
     }
 
+    /// The safety property that makes the mode safe to offer at all: no amount
+    /// of bit-editing can land on it, so it can only be entered deliberately.
+    #[test]
+    fn dangerous_is_never_inferred_from_a_mask() {
+        let everything = Mode::Full.mask().unwrap();
+        assert_eq!(Mode::Dangerous.mask(), Some(everything));
+        assert!(
+            mode_for_mask(everything) == Mode::Full,
+            "the full mask must name itself Full, never Dangerous"
+        );
+        for capability in ALL {
+            let one_off = everything & !capability.bit();
+            assert!(mode_for_mask(one_off) != Mode::Dangerous);
+        }
+    }
+
+    /// Turning the prompts off moves no capability bit, so the plain grant test
+    /// would let it through unasked - the one change that must never apply on
+    /// the operator's behalf.
+    #[test]
+    fn entering_dangerous_counts_as_widening_even_from_full() {
+        let everything = Mode::Full.mask().unwrap();
+        let change = plan_from(r#"{"mode":"dangerous"}"#, everything).unwrap();
+        assert!(change.grants.is_empty(), "no capability bit moves");
+        assert!(change.enables_dangerous());
+        assert!(change.grants_anything(), "and yet it must still ask");
+        assert!(change.summary().contains("DANGEROUS"), "{}", change.summary());
+        assert!(
+            change.summary().contains("last time you will be asked"),
+            "{}",
+            change.summary()
+        );
+    }
+
+    #[test]
+    fn dangerous_grants_every_capability() {
+        let change = plan_from(r#"{"mode":"dangerous"}"#, Mode::Context.mask().unwrap()).unwrap();
+        assert_eq!(change.mode.id(), "dangerous");
+        assert_eq!(change.mask, Mode::Full.mask().unwrap());
+    }
+
     #[test]
     fn full_mode_grants_everything() {
         let mask = Mode::Full.mask().unwrap();
@@ -689,6 +815,14 @@ mod tests {
     #[test]
     fn deny_message_names_the_modes_that_would_grant_it() {
         assert!(deny_message(Capability::Exec).contains("'full' mode"));
+        // Never route a blocked model towards switching the safeguards off.
+        for capability in ALL {
+            assert!(
+                !deny_message(capability).contains("dangerous"),
+                "{} suggests dangerous mode",
+                capability.id()
+            );
+        }
         // Granted by both `edit` and `full`, so the user can be asked for the
         // smaller of the two rather than for everything.
         let transform = deny_message(Capability::WriteTransform);

@@ -602,7 +602,7 @@ fn build_children(hwnd: HWND) {
     y += ROW_HEIGHT;
 
     for (index, mode) in ALL_MODES.iter().enumerate() {
-        // WS_GROUP on the first radio makes the four behave as one exclusive set.
+        // WS_GROUP on the first radio makes them behave as one exclusive set.
         let mut style = WINDOW_STYLE(BS_AUTORADIOBUTTON as u32);
         if index == 0 {
             style |= WS_GROUP;
@@ -759,7 +759,24 @@ unsafe extern "system" fn panel_proc(
                 // what they do or in what they report.
                 run_server_command(hwnd, command);
             } else if (MODE_BASE..MODE_BASE + ALL_MODES.len()).contains(&id) {
-                policy::apply_mode(ALL_MODES[id - MODE_BASE]);
+                let chosen = ALL_MODES[id - MODE_BASE];
+                // The one mode that asks on the way in, because it is the mode
+                // that stops anything asking afterwards. The `refresh` below
+                // puts the radio back where it was if they decline.
+                if chosen == policy::Mode::Dangerous && !policy::confirmations_suppressed() {
+                    let body = wide(&policy::dangerous_warning());
+                    let answer = MessageBoxW(
+                        hwnd,
+                        PCWSTR(body.as_ptr()),
+                        w!("RenX MCP - Turn off every safeguard?"),
+                        MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2,
+                    );
+                    if answer == IDYES {
+                        policy::apply_mode(chosen);
+                    }
+                } else {
+                    policy::apply_mode(chosen);
+                }
                 refresh();
             } else if (CAP_BASE..CAP_BASE + ALL.len()).contains(&id) {
                 let capability = ALL[id - CAP_BASE];

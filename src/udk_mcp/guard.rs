@@ -286,8 +286,16 @@ mod tests {
         assert!(message.contains("not a policy refusal"), "{message}");
     }
 
+    /// The selection generation is process-wide, so these two tests would
+    /// otherwise interleave and invalidate each other's tokens. Cargo runs tests
+    /// in parallel by default, which made that a flake rather than a failure.
+    static SELECTION_TESTS: Mutex<()> = Mutex::new(());
+
     #[test]
     fn a_selection_token_changes_when_the_selection_size_does() {
+        let _serialised = SELECTION_TESTS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         invalidate_selection();
         let first = selection_token(3);
         assert_eq!(first, selection_token(3), "a stable selection keeps a token");
@@ -297,6 +305,9 @@ mod tests {
 
     #[test]
     fn a_stale_selection_token_is_refused_but_an_absent_one_is_not() {
+        let _serialised = SELECTION_TESTS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         invalidate_selection();
         let token = selection_token(2);
         assert!(check_selection_token(Some(&token), 2).is_ok());

@@ -575,7 +575,7 @@ fn guard_and_execute(
             guard::check_blast_radius(
                 count as i32,
                 operation_description(&operation).as_str(),
-                guards.confirm_large_change,
+                guards.confirm_large_change || policy::confirmations_suppressed(),
             )?;
         }
     } else if guards.dry_run && !capability.is_read_only() {
@@ -1007,7 +1007,9 @@ fn submit_guarded(operation: EditorOperation, guards: Guards) -> Result<EditorVa
     // A dry run changes nothing, so it is not spent against the mutation budget
     // and does not need a command approved - otherwise "show me what this would
     // do" would cost the same as doing it.
-    if is_mutation(&operation) && !guards.dry_run {
+    let unguarded = policy::confirmations_suppressed();
+
+    if is_mutation(&operation) && !guards.dry_run && !unguarded {
         guard::check_rate()?;
     }
 
@@ -1017,7 +1019,15 @@ fn submit_guarded(operation: EditorOperation, guards: Guards) -> Result<EditorVa
     // is confirmed individually, which turns a single broad grant into a series
     // of specific ones.
     if let EditorOperation::Exec(command) = &operation {
-        if !guards.dry_run && !guard::exec_is_read_only(command) {
+        if unguarded && !guard::exec_is_read_only(command) {
+            // Recorded even though nothing asked, because this is exactly the
+            // command that would have been shown to a human in any other mode.
+            audit::record(
+                audit::Entry::new("exec", "renx_exec", audit::Outcome::Ok)
+                    .detail(command)
+                    .note("ran unprompted: dangerous mode"),
+            );
+        } else if !guards.dry_run && !guard::exec_is_read_only(command) {
             let approved = request_confirmation(
                 "RenX MCP - Allow this editor command?",
                 guard::exec_confirmation(command),
@@ -1236,6 +1246,12 @@ pub(crate) fn status_report() -> String {
     let error = last_server_error();
 
     let mut report = String::new();
+    if policy::confirmations_suppressed() {
+        report.push_str(
+            "*** DANGEROUS MODE ***\nNothing will ask you before it runs. No prompts, no size \
+             limit, no rate limit.\nEverything is still recorded in the audit log below.\n\n",
+        );
+    }
     report.push_str(if listening {
         "Server:  RUNNING\n"
     } else {
@@ -1308,6 +1324,9 @@ pub(crate) fn status_report() -> String {
 pub(crate) fn status_line() -> String {
     let port = SERVER_PORT.load(Ordering::Relaxed);
     if SERVER_LISTENING.load(Ordering::Acquire) {
+        if policy::confirmations_suppressed() {
+            return format!("Running - http://127.0.0.1:{port}/mcp   (!) DANGEROUS - nothing asks");
+        }
         format!("Running - http://127.0.0.1:{port}/mcp")
     } else if last_server_error().is_empty() {
         "Stopped - nothing can reach the editor".to_string()
@@ -1403,7 +1422,11 @@ fn handle_control_policy(stream: &mut TcpStream, request: &HttpRequest) -> std::
             // the same socket the model uses, so it may well *be* the model
             // asking to widen its own permissions. A policy the caller can
             // rewrite is not a policy.
-            if change.grants_anything() {
+            // Already in dangerous mode means the operator has said not to be
+            // asked. Entering it is the exception: `grants_anything` reports
+            // true for that transition even though no capability bit moves, so
+            // the one prompt that turns the prompts off is never skipped.
+            if change.grants_anything() && !policy::confirmations_suppressed() {
                 let decision = request_confirmation(
                     "RenX MCP - Allow this policy change?",
                     change.summary(),
@@ -2015,7 +2038,9 @@ fn dispatch_tool_call(body: &str) -> Result<String, (i32, String)> {
             let action = match action_name.as_str() {
                 "duplicate" => ActorAction::Duplicate,
                 "delete" => {
-                    if json_field_bool(arguments, "confirm") != Some(true) {
+                    if json_field_bool(arguments, "confirm") != Some(true)
+                        && !policy::confirmations_suppressed()
+                    {
                         return Ok(tool_error("delete requires confirm=true"));
                     }
                     ActorAction::Delete
