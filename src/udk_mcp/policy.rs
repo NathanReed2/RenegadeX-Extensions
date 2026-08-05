@@ -63,6 +63,8 @@ pub enum Capability {
     Exec = 9,
     ReadViewport = 10,
     ControlViewport = 11,
+    ReadScene = 12,
+    ReadState = 13,
 }
 
 impl Capability {
@@ -86,6 +88,8 @@ impl Capability {
             Capability::Exec => "exec.command",
             Capability::ReadViewport => "read.viewport",
             Capability::ControlViewport => "control.viewport",
+            Capability::ReadScene => "read.scene",
+            Capability::ReadState => "read.state",
         }
     }
 
@@ -107,6 +111,12 @@ impl Capability {
             }
             Capability::ControlViewport => {
                 "Move only the active viewport camera to frame an actor; does not edit the map."
+            }
+            Capability::ReadScene => {
+                "Search loaded actors and return stable object paths without changing selection."
+            }
+            Capability::ReadState => {
+                "Capture and compare bounded map, actor, selection, transform, and camera state."
             }
         }
     }
@@ -130,6 +140,8 @@ impl Capability {
                 | Capability::ReadProperties
                 | Capability::ReadMap
                 | Capability::ReadViewport
+                | Capability::ReadScene
+                | Capability::ReadState
                 // Camera navigation changes editor UI state, but not map or
                 // package state. It is intentionally available in context mode.
                 | Capability::ControlViewport
@@ -137,7 +149,7 @@ impl Capability {
     }
 }
 
-pub const ALL: [Capability; 12] = [
+pub const ALL: [Capability; 14] = [
     Capability::ReadStatus,
     Capability::ReadSelection,
     Capability::ReadProperties,
@@ -150,6 +162,8 @@ pub const ALL: [Capability; 12] = [
     Capability::Exec,
     Capability::ReadViewport,
     Capability::ControlViewport,
+    Capability::ReadScene,
+    Capability::ReadState,
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
