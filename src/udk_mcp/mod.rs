@@ -24,6 +24,7 @@ pub mod panel;
 pub mod policy;
 mod assets;
 mod changes;
+mod dependencies;
 pub(crate) mod exceptions;
 mod health;
 mod object;
@@ -42,6 +43,9 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const MAP_HEALTH_TIMEOUT: Duration = Duration::from_secs(60);
 const MAP_HEALTH_SLOW_TIMEOUT: Duration = Duration::from_secs(120);
 const ASSET_USAGE_TIMEOUT: Duration = Duration::from_secs(60);
+// Each inbound hop is a whole-heap scan, so the budget rather than the
+// depth is what bounds this one.
+const REFERENCE_GRAPH_TIMEOUT: Duration = Duration::from_secs(300);
 
 const EDITOR_TICK_RVA: usize = 0x013C_6960;
 const EDITOR_EXEC_RVA: usize = 0x013C_EA70;
@@ -194,6 +198,14 @@ enum EditorOperation {
         object_path: String,
         scope: String,
         limit: usize,
+    },
+    ReferenceGraph {
+        object_path: String,
+        direction: String,
+        class_filter: String,
+        max_depth: usize,
+        max_nodes: usize,
+        max_inbound_scans: usize,
     },
     CaptureEditorState,
     DiffEditorState {
@@ -857,6 +869,7 @@ fn operation_touches_selection(operation: &EditorOperation) -> bool {
         | EditorOperation::FindActors { .. }
         | EditorOperation::ChangeState { .. }
         | EditorOperation::AssetUsage { .. }
+        | EditorOperation::ReferenceGraph { .. }
         | EditorOperation::ViewportScreenshot { .. }
         | EditorOperation::FocusViewportActor {
             source: ViewportActorSource::ScreenPoint { .. },
@@ -942,6 +955,14 @@ fn operation_description(operation: &EditorOperation) -> String {
         EditorOperation::AssetUsage { object_path, .. } => {
             format!("find loaded objects that reference exact object '{object_path}'")
         }
+        EditorOperation::ReferenceGraph {
+            object_path,
+            direction,
+            max_depth,
+            ..
+        } => format!(
+            "walk {direction} references of exact object '{object_path}' to depth {max_depth}"
+        ),
         EditorOperation::CaptureEditorState => "capture a bounded editor state snapshot".to_string(),
         EditorOperation::DiffEditorState {
             from_snapshot,
@@ -1279,6 +1300,21 @@ fn execute_editor_operation(
             &scope,
             limit,
         )?)),
+        EditorOperation::ReferenceGraph {
+            object_path,
+            direction,
+            class_filter,
+            max_depth,
+            max_nodes,
+            max_inbound_scans,
+        } => Ok(EditorValue::Json(dependencies::graph(
+            &object_path,
+            &direction,
+            &class_filter,
+            max_depth,
+            max_nodes,
+            max_inbound_scans,
+        )?)),
         EditorOperation::CaptureEditorState => {
             let selected = selected_actor_pointers(editor)?;
             Ok(EditorValue::Json(state::capture(editor, &selected)?))
@@ -1332,7 +1368,9 @@ fn required_capability(operation: &EditorOperation) -> policy::Capability {
         | EditorOperation::ViewportScreenshot { .. } => policy::Capability::ReadViewport,
         EditorOperation::FocusViewportActor { .. } => policy::Capability::ControlViewport,
         EditorOperation::FindActors { .. } => policy::Capability::ReadScene,
-        EditorOperation::AssetUsage { .. } => policy::Capability::ReadScene,
+        EditorOperation::AssetUsage { .. } | EditorOperation::ReferenceGraph { .. } => {
+            policy::Capability::ReadScene
+        }
         EditorOperation::ChangeState { .. }
         | EditorOperation::CaptureEditorState
         | EditorOperation::DiffEditorState { .. } => {
@@ -1422,6 +1460,7 @@ fn submit_guarded(operation: EditorOperation, guards: Guards) -> Result<EditorVa
         } => MAP_HEALTH_SLOW_TIMEOUT,
         EditorOperation::MapHealth { .. } => MAP_HEALTH_TIMEOUT,
         EditorOperation::AssetUsage { .. } => ASSET_USAGE_TIMEOUT,
+        EditorOperation::ReferenceGraph { .. } => REFERENCE_GRAPH_TIMEOUT,
         _ => REQUEST_TIMEOUT,
     };
     let (sender, receiver) = mpsc::sync_channel(1);
@@ -2112,7 +2151,7 @@ fn handle_json_rpc(body: &str) -> Option<String> {
 fn initialize_result() -> String {
     let mode = policy::current_mode();
     format!(
-        "{{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{{\"tools\":{{\"listChanged\":false}}}},\"serverInfo\":{{\"name\":\"renx-udk-editor\",\"version\":\"0.7.0\"}},\"instructions\":\"Controls the local Renegade X Win64 UDK editor. Actor indices refer to the current selection and can change whenever selection changes. Object paths returned by scene search are stable for the current loaded map. Mutation tools participate in UE3 undo transactions.\\n\\nEditor policy mode is '{}': {} Only the tools this mode permits are listed; the operator sets this in the RenX MCP control panel and it cannot be changed through this connection. If a task needs something the mode forbids, say so rather than looking for another route to the same effect.\"}}",
+        "{{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{{\"tools\":{{\"listChanged\":false}}}},\"serverInfo\":{{\"name\":\"renx-udk-editor\",\"version\":\"0.8.0\"}},\"instructions\":\"Controls the local Renegade X Win64 UDK editor. Actor indices refer to the current selection and can change whenever selection changes. Object paths returned by scene search are stable for the current loaded map. Viewport point inspection returns an exact UE3 scene-view ray; check cameraRay.approximate before trusting a world hit position. Mutation tools participate in UE3 undo transactions.\\n\\nEditor policy mode is '{}': {} Only the tools this mode permits are listed; the operator sets this in the RenX MCP control panel and it cannot be changed through this connection. If a task needs something the mode forbids, say so rather than looking for another route to the same effect.\"}}",
         mode.id(),
         json_escape(mode.describe())
     )
@@ -2143,9 +2182,10 @@ fn tool_capability(tool: &str) -> Option<policy::Capability> {
             policy::Capability::ReadViewport
         }
         "renx_focus_viewport_actor" => policy::Capability::ControlViewport,
-        "renx_find_actors" | "renx_get_asset_usage" | "renx_get_missing_asset_diagnostics" => {
-            policy::Capability::ReadScene
-        }
+        "renx_find_actors"
+        | "renx_get_asset_usage"
+        | "renx_get_missing_asset_diagnostics"
+        | "renx_get_reference_graph" => policy::Capability::ReadScene,
         "renx_get_change_state" | "renx_capture_editor_state" | "renx_diff_editor_state" => {
             policy::Capability::ReadState
         }
@@ -2214,6 +2254,7 @@ const TOOL_DEFINITIONS: &[(&str, &str)] = &[
     ("renx_get_exception_context", r#"{"name":"renx_get_exception_context","description":"Read persistent first-chance Windows exception context, register state, possible previous-session crash candidates, and nearby dump artifacts. First-chance records may have been handled and never imply a confirmed crash by themselves.","inputSchema":{"type":"object","properties":{"sinceSequence":{"type":"integer","minimum":0,"default":0},"limit":{"type":"integer","minimum":1,"maximum":64,"default":32},"includePreviousSessions":{"type":"boolean","default":true}},"additionalProperties":false}}"#),
     ("renx_get_change_state", r#"{"name":"renx_get_change_state","description":"Inspect UE3's native undo/redo history and loaded dirty packages without changing either. Undo and redo entries are ordered with the next action first.","inputSchema":{"type":"object","properties":{"historyLimit":{"type":"integer","minimum":1,"maximum":128,"default":32},"includeCleanPackages":{"type":"boolean","default":false},"packageQuery":{"type":"string","default":"","description":"Optional case-insensitive loaded-package path substring."},"packageLimit":{"type":"integer","minimum":1,"maximum":500,"default":100}},"additionalProperties":false}}"#),
     ("renx_get_asset_usage", r#"{"name":"renx_get_asset_usage","description":"Find loaded objects that reference one exact loaded asset/object path using UE3's native reference serializer. Returns external/internal referencers and referencing properties without changing selection.","inputSchema":{"type":"object","properties":{"objectPath":{"type":"string","description":"Exact loaded object path without a class prefix."},"scope":{"type":"string","enum":["all","external","internal"],"default":"all"},"limit":{"type":"integer","minimum":1,"maximum":200,"default":50}},"required":["objectPath"],"additionalProperties":false}}"#),
+    ("renx_get_reference_graph", r#"{"name":"renx_get_reference_graph","description":"Walk the reference graph around one exact loaded object. Outbound edges come from UE3's reflected property export and are cheap to follow; inbound edges come from the native referencer scan, where every hop re-serialises all loaded objects, so inbound depth is bounded by maxInboundScans rather than by maxDepth. Native C++ references are visible inbound but not outbound. Makes no selection or map change.","inputSchema":{"type":"object","properties":{"objectPath":{"type":"string","description":"Exact loaded object path without a class prefix."},"direction":{"type":"string","enum":["outbound","inbound","both"],"default":"outbound"},"classFilter":{"type":"string","default":"","description":"Optional bare UE3 class name; only edges whose far end has this exact class are followed."},"maxDepth":{"type":"integer","minimum":1,"maximum":8,"default":2},"maxNodes":{"type":"integer","minimum":1,"maximum":400,"default":60},"maxInboundScans":{"type":"integer","minimum":1,"maximum":8,"default":1,"description":"How many whole-heap referencer scans this call may spend. Each one can take seconds."}},"required":["objectPath"],"additionalProperties":false}}"#),
     ("renx_get_missing_asset_diagnostics", r#"{"name":"renx_get_missing_asset_diagnostics","description":"Scan bounded tails of recent UE3 editor logs for failed asset/package loads and unresolved imports, including referring object/property when UE3 logged them.","inputSchema":{"type":"object","properties":{"query":{"type":"string","default":"","description":"Optional case-insensitive missing path or message substring."},"limit":{"type":"integer","minimum":1,"maximum":200,"default":50},"maxLogFiles":{"type":"integer","minimum":1,"maximum":8,"default":3}},"additionalProperties":false}}"#),
     ("renx_editor_status", "{\"name\":\"renx_editor_status\",\"description\":\"Report whether the Renegade X editor-thread bridge is ready.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}}"),
     ("renx_get_selection_counts", "{\"name\":\"renx_get_selection_counts\",\"description\":\"Return selected actor and selected object counts from the editor.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}}"),
@@ -2702,6 +2743,40 @@ fn dispatch_tool_call(body: &str) -> Result<String, (i32, String)> {
                 Err(error) => Ok(tool_error(&error)),
             }
         }
+        "renx_get_reference_graph" => {
+            let arguments = tool_arguments(params, &name)?;
+            let object_path = required_string(arguments, "objectPath")?;
+            let direction = json_field_string(arguments, "direction")
+                .unwrap_or_else(|| "outbound".to_string());
+            let class_filter = json_field_string(arguments, "classFilter").unwrap_or_default();
+            let max_depth =
+                optional_usize(arguments, "maxDepth")?.unwrap_or(dependencies::DEFAULT_MAX_DEPTH);
+            let max_nodes =
+                optional_usize(arguments, "maxNodes")?.unwrap_or(dependencies::DEFAULT_MAX_NODES);
+            let max_inbound_scans = optional_usize(arguments, "maxInboundScans")?
+                .unwrap_or(dependencies::DEFAULT_INBOUND_SCANS);
+            if let Err(error) = dependencies::validate_query(
+                &direction,
+                &class_filter,
+                max_depth,
+                max_nodes,
+                max_inbound_scans,
+            ) {
+                return Err((-32602, error));
+            }
+            match submit_editor_operation(EditorOperation::ReferenceGraph {
+                object_path,
+                direction,
+                class_filter,
+                max_depth,
+                max_nodes,
+                max_inbound_scans,
+            }) {
+                Ok(EditorValue::Json(structured)) => Ok(tool_success(&structured)),
+                Ok(_) => unreachable!(),
+                Err(error) => Ok(tool_error(&error)),
+            }
+        }
         "renx_capture_editor_state" => {
             match submit_editor_operation(EditorOperation::CaptureEditorState) {
                 Ok(EditorValue::Json(structured)) => Ok(tool_success(&structured)),
@@ -3177,7 +3252,7 @@ mod tests {
         );
     }
 
-    const READ_TOOLS: [&str; 20] = [
+    const READ_TOOLS: [&str; 21] = [
         "renx_get_viewport_context",
         "renx_inspect_viewport_point",
         "renx_focus_viewport_actor",
@@ -3189,6 +3264,7 @@ mod tests {
         "renx_get_exception_context",
         "renx_get_change_state",
         "renx_get_asset_usage",
+        "renx_get_reference_graph",
         "renx_get_missing_asset_diagnostics",
         "renx_editor_status",
         "renx_get_selection_counts",
@@ -3236,7 +3312,7 @@ mod tests {
     #[test]
     fn operations_are_classified_consistently() {
         use policy::Capability;
-        let cases: [(EditorOperation, Capability); 17] = [
+        let cases: [(EditorOperation, Capability); 18] = [
             (EditorOperation::SelectionCounts, Capability::ReadSelection),
             (EditorOperation::MapInfo, Capability::ReadMap),
             (
@@ -3317,6 +3393,17 @@ mod tests {
                     object_path: "Pkg.Asset".to_string(),
                     scope: "all".to_string(),
                     limit: 50,
+                },
+                Capability::ReadScene,
+            ),
+            (
+                EditorOperation::ReferenceGraph {
+                    object_path: "Pkg.Asset".to_string(),
+                    direction: "outbound".to_string(),
+                    class_filter: String::new(),
+                    max_depth: 2,
+                    max_nodes: 60,
+                    max_inbound_scans: 1,
                 },
                 Capability::ReadScene,
             ),
