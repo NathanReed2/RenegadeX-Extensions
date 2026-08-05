@@ -18,6 +18,8 @@ use std::time::Duration;
 use crate::dll::UDK_RANGE;
 use crate::patch_utils::debug_log;
 
+pub mod policy;
+
 const DEFAULT_PORT: u16 = 8765;
 const MAX_HTTP_BODY: usize = 1024 * 1024;
 const MAX_HTTP_HEADERS: usize = 64 * 1024;
@@ -704,7 +706,44 @@ fn request_queue() -> &'static Mutex<VecDeque<EditorRequest>> {
     REQUEST_QUEUE.get_or_init(|| Mutex::new(VecDeque::new()))
 }
 
+/// The capability an operation needs.
+///
+/// Classified from the decoded operation rather than from the tool name, so the
+/// check cannot be skipped by a tool that builds an operation some other way,
+/// and so a new `ActorAction` variant has to be placed in a bucket before it
+/// will compile.
+fn required_capability(operation: &EditorOperation) -> policy::Capability {
+    match operation {
+        EditorOperation::Exec(_) => policy::Capability::Exec,
+        EditorOperation::SelectionCounts | EditorOperation::SelectedActors => {
+            policy::Capability::ReadSelection
+        }
+        EditorOperation::ListActorProperties { .. } | EditorOperation::GetActorProperty { .. } => {
+            policy::Capability::ReadProperties
+        }
+        EditorOperation::SetActorProperty { .. } => policy::Capability::WriteActorProperty,
+        EditorOperation::SetObjectProperty { .. } => policy::Capability::WriteObjectProperty,
+        EditorOperation::MapInfo => policy::Capability::ReadMap,
+        EditorOperation::ActorAction { action } => match action {
+            ActorAction::Delete => policy::Capability::WriteDelete,
+            ActorAction::Duplicate => policy::Capability::WriteDuplicate,
+            ActorAction::ResetLocation
+            | ActorAction::ResetRotation
+            | ActorAction::ResetScale
+            | ActorAction::SnapToFloor
+            | ActorAction::MoveToGrid => policy::Capability::WriteTransform,
+        },
+    }
+}
+
 fn submit_editor_operation(operation: EditorOperation) -> Result<EditorValue, String> {
+    // Before the readiness check and before anything is queued: a denied
+    // operation must never reach the editor thread, and must not be able to
+    // distinguish "forbidden" from "editor busy" by the error it gets back.
+    let capability = required_capability(&operation);
+    if !policy::allows(capability) {
+        return Err(policy::deny_message(capability));
+    }
     if EDITOR_THIS.load(Ordering::Acquire) == 0 {
         return Err("the editor has not reached UUnrealEdEngine::Tick yet".to_string());
     }
@@ -795,9 +834,14 @@ fn handle_connection(mut stream: TcpStream) -> std::io::Result<()> {
         Err(message) => return write_http(&mut stream, 400, "text/plain", &message),
     };
 
-    if request.method != "POST" || request.path.split('?').next() != Some("/mcp") {
-        return write_http(&mut stream, 405, "text/plain", "POST /mcp required");
+    let path = request.path.split('?').next().unwrap_or("");
+    if !matches!(path, "/mcp" | "/control/policy") {
+        return write_http(&mut stream, 404, "text/plain", "no such endpoint");
     }
+
+    // The control endpoint carries the same origin and bearer checks as /mcp.
+    // It is strictly more sensitive - it decides what /mcp may do - so it must
+    // never be the easier door.
     if !origin_allowed(request.header("origin")) {
         return write_http(&mut stream, 403, "text/plain", "Origin is not allowed");
     }
@@ -805,9 +849,46 @@ fn handle_connection(mut stream: TcpStream) -> std::io::Result<()> {
         return write_http(&mut stream, 401, "text/plain", "Bearer token required");
     }
 
+    if path == "/control/policy" {
+        return handle_control_policy(&mut stream, &request);
+    }
+
+    if request.method != "POST" {
+        return write_http(&mut stream, 405, "text/plain", "POST /mcp required");
+    }
     match handle_json_rpc(&request.body) {
         Some(body) => write_http(&mut stream, 200, "application/json", &body),
         None => write_http(&mut stream, 202, "application/json", ""),
+    }
+}
+
+/// The surface a GUI drives.
+///
+/// `GET` returns the whole policy - current mode, every mode with its
+/// description, every capability with its description and destructive flag - so
+/// a panel can render the mode picker and the advanced menu without hardcoding
+/// a list that would drift from [`policy`].
+///
+/// `POST` takes `{"mode":"context"}`, `{"capabilities":{"exec.command":false}}`,
+/// or both, and returns the resulting policy so the GUI can redraw from the
+/// authoritative answer rather than assuming its request applied verbatim -
+/// which matters because editing a preset's bits moves it to `custom`.
+fn handle_control_policy(stream: &mut TcpStream, request: &HttpRequest) -> std::io::Result<()> {
+    match request.method.as_str() {
+        "GET" => write_http(stream, 200, "application/json", &policy::policy_json()),
+        "POST" => match policy::apply(&request.body) {
+            Ok(updated) => {
+                debug_log!("RenX MCP policy changed to {}", policy::current_mode().id());
+                write_http(stream, 200, "application/json", &updated)
+            }
+            Err(message) => write_http(
+                stream,
+                400,
+                "application/json",
+                &format!("{{\"error\":\"{}\"}}", json_escape(&message)),
+            ),
+        },
+        _ => write_http(stream, 405, "text/plain", "GET or POST required"),
     }
 }
 
@@ -962,43 +1043,134 @@ fn handle_json_rpc(body: &str) -> Option<String> {
     })
 }
 
+/// Names the active mode in `instructions`.
+///
+/// The tool list already reflects the policy, but a model that is told *why*
+/// the list is short will report the restriction instead of hunting for a way
+/// around it. `listChanged` stays false: this transport closes the connection
+/// after every response, so there is no channel to push a notification down if
+/// the operator changes the mode mid-session.
 fn initialize_result() -> String {
-    "{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{\"tools\":{\"listChanged\":false}},\"serverInfo\":{\"name\":\"renx-udk-editor\",\"version\":\"0.2.0\"},\"instructions\":\"Controls the local Renegade X Win64 UDK editor. Actor indices refer to the current selection and can change whenever selection changes. Mutation tools participate in UE3 undo transactions.\"}".to_string()
+    let mode = policy::current_mode();
+    format!(
+        "{{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{{\"tools\":{{\"listChanged\":false}}}},\"serverInfo\":{{\"name\":\"renx-udk-editor\",\"version\":\"0.3.0\"}},\"instructions\":\"Controls the local Renegade X Win64 UDK editor. Actor indices refer to the current selection and can change whenever selection changes. Mutation tools participate in UE3 undo transactions.\\n\\nEditor policy mode is '{}': {} Only the tools this mode permits are listed; the operator sets this in the RenX MCP control panel and it cannot be changed through this connection. If a task needs something the mode forbids, say so rather than looking for another route to the same effect.\"}}",
+        mode.id(),
+        json_escape(mode.describe())
+    )
 }
 
-fn tools_list_result() -> String {
-    concat!(
-        "{\"tools\":[",
-        "{\"name\":\"renx_editor_status\",\"description\":\"Report whether the Renegade X editor-thread bridge is ready.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}},",
-        "{\"name\":\"renx_get_selection_counts\",\"description\":\"Return selected actor and selected object counts from the editor.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}},",
-        "{\"name\":\"renx_get_selected_actors\",\"description\":\"Return selected actor names, paths, classes, levels, locations, rotations, and scales.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}},",
-        "{\"name\":\"renx_list_actor_properties\",\"description\":\"List reflected properties on a selected actor class using UE3 UProperty metadata.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"actorIndex\":{\"type\":\"integer\",\"minimum\":0},\"pattern\":{\"type\":\"string\",\"default\":\"*\",\"description\":\"Property wildcard using * and ?\"}},\"required\":[\"actorIndex\"],\"additionalProperties\":false}},",
-        "{\"name\":\"renx_get_actor_property\",\"description\":\"Export one reflected property from a selected actor through UProperty::ExportText.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"actorIndex\":{\"type\":\"integer\",\"minimum\":0},\"property\":{\"type\":\"string\"}},\"required\":[\"actorIndex\",\"property\"],\"additionalProperties\":false}},",
-        "{\"name\":\"renx_set_actor_property\",\"description\":\"Import one reflected property on a selected actor inside an undo transaction.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"actorIndex\":{\"type\":\"integer\",\"minimum\":0},\"property\":{\"type\":\"string\"},\"value\":{\"type\":\"string\"}},\"required\":[\"actorIndex\",\"property\",\"value\"],\"additionalProperties\":false}},",
-        "{\"name\":\"renx_set_object_property\",\"description\":\"Import one reflected property on a UObject path inside an undo transaction.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"objectPath\":{\"type\":\"string\",\"description\":\"UE3 object path without the class prefix\"},\"property\":{\"type\":\"string\"},\"value\":{\"type\":\"string\"}},\"required\":[\"objectPath\",\"property\",\"value\"],\"additionalProperties\":false}},",
-        "{\"name\":\"renx_actor_action\",\"description\":\"Run an undo-aware native editor action on selected actors. Delete requires confirm=true.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"action\":{\"type\":\"string\",\"enum\":[\"duplicate\",\"delete\",\"reset_location\",\"reset_rotation\",\"reset_scale\",\"snap_to_floor\",\"move_to_grid\"]},\"confirm\":{\"type\":\"boolean\",\"default\":false}},\"required\":[\"action\"],\"additionalProperties\":false}},",
-        "{\"name\":\"renx_get_map_info\",\"description\":\"Report the current map inferred from selected actors, selected levels, and UE3 WorldInfo listing.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}},",
-        "{\"name\":\"renx_exec\",\"description\":\"Execute a UE3 editor command on the editor thread and return captured FOutputDevice text. Commands may modify maps and packages.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\",\"description\":\"UE3 editor Exec command\"}},\"required\":[\"command\"],\"additionalProperties\":false}}",
-        "]}"
-    )
-    .to_string()
+/// Which capability each tool needs, for filtering `tools/list` and rejecting
+/// `tools/call` early. `renx_actor_action` is absent because its capability
+/// depends on the action argument - it is gated per call in
+/// [`submit_editor_operation`] instead, and listed whenever any action is
+/// permitted.
+fn tool_capability(tool: &str) -> Option<policy::Capability> {
+    Some(match tool {
+        "renx_editor_status" => policy::Capability::ReadStatus,
+        "renx_get_selection_counts" | "renx_get_selected_actors" => {
+            policy::Capability::ReadSelection
+        }
+        "renx_list_actor_properties" | "renx_get_actor_property" => {
+            policy::Capability::ReadProperties
+        }
+        "renx_get_map_info" => policy::Capability::ReadMap,
+        "renx_set_actor_property" => policy::Capability::WriteActorProperty,
+        "renx_set_object_property" => policy::Capability::WriteObjectProperty,
+        "renx_exec" => policy::Capability::Exec,
+        _ => return None,
+    })
 }
+
+/// True when at least one of the actions `renx_actor_action` offers is allowed.
+fn any_actor_action_allowed() -> bool {
+    policy::allows(policy::Capability::WriteTransform)
+        || policy::allows(policy::Capability::WriteDuplicate)
+        || policy::allows(policy::Capability::WriteDelete)
+}
+
+fn tool_permitted(tool: &str) -> bool {
+    match tool_capability(tool) {
+        Some(capability) => policy::allows(capability),
+        None if tool == "renx_actor_action" => any_actor_action_allowed(),
+        None => false,
+    }
+}
+
+/// Advertises only what the current mode permits.
+///
+/// Filtering here rather than returning everything and failing later is what
+/// stops a read-only session from reading like a broken one: the model never
+/// sees `renx_exec`, so it never plans around it. The per-call check in
+/// [`submit_editor_operation`] remains the actual boundary.
+fn tools_list_result() -> String {
+    tools_list_with(tool_permitted)
+}
+
+/// Split from [`tools_list_result`] so it can be exercised against a chosen
+/// policy without writing to the process-wide one, which every other test would
+/// then race against.
+fn tools_list_with(permitted: impl Fn(&str) -> bool) -> String {
+    let mut tools = String::from("{\"tools\":[");
+    let mut first = true;
+    for (name, definition) in TOOL_DEFINITIONS {
+        if !permitted(name) {
+            continue;
+        }
+        if !first {
+            tools.push(',');
+        }
+        first = false;
+        tools.push_str(definition);
+    }
+    tools.push_str("]}");
+    tools
+}
+
+/// Paired with their names so the list can be filtered without parsing it back.
+const TOOL_DEFINITIONS: &[(&str, &str)] = &[
+    ("renx_editor_status", "{\"name\":\"renx_editor_status\",\"description\":\"Report whether the Renegade X editor-thread bridge is ready.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}}"),
+    ("renx_get_selection_counts", "{\"name\":\"renx_get_selection_counts\",\"description\":\"Return selected actor and selected object counts from the editor.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}}"),
+    ("renx_get_selected_actors", "{\"name\":\"renx_get_selected_actors\",\"description\":\"Return selected actor names, paths, classes, levels, locations, rotations, and scales.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}}"),
+    ("renx_list_actor_properties", "{\"name\":\"renx_list_actor_properties\",\"description\":\"List reflected properties on a selected actor class using UE3 UProperty metadata.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"actorIndex\":{\"type\":\"integer\",\"minimum\":0},\"pattern\":{\"type\":\"string\",\"default\":\"*\",\"description\":\"Property wildcard using * and ?\"}},\"required\":[\"actorIndex\"],\"additionalProperties\":false}}"),
+    ("renx_get_actor_property", "{\"name\":\"renx_get_actor_property\",\"description\":\"Export one reflected property from a selected actor through UProperty::ExportText.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"actorIndex\":{\"type\":\"integer\",\"minimum\":0},\"property\":{\"type\":\"string\"}},\"required\":[\"actorIndex\",\"property\"],\"additionalProperties\":false}}"),
+    ("renx_set_actor_property", "{\"name\":\"renx_set_actor_property\",\"description\":\"Import one reflected property on a selected actor inside an undo transaction.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"actorIndex\":{\"type\":\"integer\",\"minimum\":0},\"property\":{\"type\":\"string\"},\"value\":{\"type\":\"string\"}},\"required\":[\"actorIndex\",\"property\",\"value\"],\"additionalProperties\":false}}"),
+    ("renx_set_object_property", "{\"name\":\"renx_set_object_property\",\"description\":\"Import one reflected property on a UObject path inside an undo transaction.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"objectPath\":{\"type\":\"string\",\"description\":\"UE3 object path without the class prefix\"},\"property\":{\"type\":\"string\"},\"value\":{\"type\":\"string\"}},\"required\":[\"objectPath\",\"property\",\"value\"],\"additionalProperties\":false}}"),
+    ("renx_actor_action", "{\"name\":\"renx_actor_action\",\"description\":\"Run an undo-aware native editor action on selected actors. Delete requires confirm=true. Individual actions may be disabled by editor policy.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"action\":{\"type\":\"string\",\"enum\":[\"duplicate\",\"delete\",\"reset_location\",\"reset_rotation\",\"reset_scale\",\"snap_to_floor\",\"move_to_grid\"]},\"confirm\":{\"type\":\"boolean\",\"default\":false}},\"required\":[\"action\"],\"additionalProperties\":false}}"),
+    ("renx_get_map_info", "{\"name\":\"renx_get_map_info\",\"description\":\"Report the current map inferred from selected actors, selected levels, and UE3 WorldInfo listing.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}}"),
+    ("renx_exec", "{\"name\":\"renx_exec\",\"description\":\"Execute a UE3 editor command on the editor thread and return captured FOutputDevice text. Commands may modify maps and packages.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\",\"description\":\"UE3 editor Exec command\"}},\"required\":[\"command\"],\"additionalProperties\":false}}"),
+];
 
 fn tools_call(body: &str) -> Result<String, (i32, String)> {
     let params = json_field_raw(body, "params")
         .ok_or_else(|| (-32602, "tools/call requires params".to_string()))?;
     let name = json_field_string(params, "name")
         .ok_or_else(|| (-32602, "tools/call requires a tool name".to_string()))?;
+
+    // Refuse before any argument parsing, so a forbidden tool cannot be probed
+    // for what it would have accepted. `renx_actor_action` is not decided here -
+    // its capability depends on which action was asked for.
+    if !tool_permitted(&name) {
+        if let Some(capability) = tool_capability(&name) {
+            return Ok(tool_error(&policy::deny_message(capability)));
+        }
+        if name == "renx_actor_action" {
+            return Ok(tool_error(&policy::deny_message(
+                policy::Capability::WriteTransform,
+            )));
+        }
+    }
+
     match name.as_str() {
         "renx_editor_status" => {
             let ticks = TICK_COUNT.load(Ordering::Relaxed);
             let port = SERVER_PORT.load(Ordering::Relaxed);
             let listening = SERVER_LISTENING.load(Ordering::Acquire);
             let structured = format!(
-                "{{\"editorReady\":{},\"listening\":{},\"port\":{port},\"tickCount\":{ticks},\"processId\":{}}}",
+                "{{\"editorReady\":{},\"listening\":{},\"port\":{port},\"tickCount\":{ticks},\"processId\":{},\"policyMode\":\"{}\"}}",
                 EDITOR_THIS.load(Ordering::Acquire) != 0,
                 listening,
-                std::process::id()
+                std::process::id(),
+                policy::current_mode().id()
             );
             Ok(tool_success(&structured))
         }
@@ -1367,7 +1539,8 @@ pub fn init() -> anyhow::Result<()> {
 mod tests {
     use super::{
         editor_exec_this, handle_json_rpc, json_escape, json_field_raw, json_field_string,
-        origin_allowed,
+        origin_allowed, policy, required_capability, tool_capability, tools_list_with, ActorAction,
+        EditorOperation,
     };
     use std::ffi::c_void;
 
@@ -1402,21 +1575,92 @@ mod tests {
         );
     }
 
+    const READ_TOOLS: [&str; 6] = [
+        "renx_editor_status",
+        "renx_get_selection_counts",
+        "renx_get_selected_actors",
+        "renx_list_actor_properties",
+        "renx_get_actor_property",
+        "renx_get_map_info",
+    ];
+    const WRITE_TOOLS: [&str; 4] = [
+        "renx_set_actor_property",
+        "renx_set_object_property",
+        "renx_actor_action",
+        "renx_exec",
+    ];
+
     #[test]
-    fn lists_expected_tools() {
-        let response =
-            handle_json_rpc(r#"{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}"#)
-                .unwrap();
-        assert!(response.contains("renx_editor_status"));
-        assert!(response.contains("renx_get_selection_counts"));
-        assert!(response.contains("renx_get_selected_actors"));
-        assert!(response.contains("renx_list_actor_properties"));
-        assert!(response.contains("renx_get_actor_property"));
-        assert!(response.contains("renx_set_actor_property"));
-        assert!(response.contains("renx_set_object_property"));
-        assert!(response.contains("renx_actor_action"));
-        assert!(response.contains("renx_get_map_info"));
-        assert!(response.contains("renx_exec"));
+    fn lists_every_tool_when_everything_is_permitted() {
+        let response = tools_list_with(|_| true);
+        for tool in READ_TOOLS.iter().chain(WRITE_TOOLS.iter()) {
+            assert!(response.contains(tool), "{tool} missing");
+        }
+    }
+
+    /// The property the whole policy layer exists for: in a read-only mode a
+    /// mutation tool is not merely refused, it is never offered.
+    #[test]
+    fn context_mode_advertises_no_mutation_tools() {
+        let response = tools_list_with(|tool| match tool_capability(tool) {
+            Some(capability) => capability.is_read_only(),
+            None => false, // renx_actor_action: every action mutates
+        });
+        for tool in READ_TOOLS {
+            assert!(response.contains(tool), "{tool} should still be listed");
+        }
+        for tool in WRITE_TOOLS {
+            assert!(!response.contains(tool), "{tool} must not be listed");
+        }
+    }
+
+    /// Every operation must map to a capability, and no read operation may map
+    /// to a write one - the classification is what actually contains a tool that
+    /// forgets to check.
+    #[test]
+    fn operations_are_classified_consistently() {
+        use policy::Capability;
+        let cases: [(EditorOperation, Capability); 6] = [
+            (EditorOperation::SelectionCounts, Capability::ReadSelection),
+            (EditorOperation::MapInfo, Capability::ReadMap),
+            (
+                EditorOperation::Exec("MAP REBUILD".to_string()),
+                Capability::Exec,
+            ),
+            (
+                EditorOperation::ActorAction {
+                    action: ActorAction::Delete,
+                },
+                Capability::WriteDelete,
+            ),
+            (
+                EditorOperation::ActorAction {
+                    action: ActorAction::SnapToFloor,
+                },
+                Capability::WriteTransform,
+            ),
+            (
+                EditorOperation::SetObjectProperty {
+                    object_path: "a".to_string(),
+                    property: "b".to_string(),
+                    value: "c".to_string(),
+                },
+                Capability::WriteObjectProperty,
+            ),
+        ];
+        for (operation, expected) in cases {
+            let actual = required_capability(&operation);
+            assert!(actual == expected, "{} misclassified", expected.id());
+        }
+    }
+
+    /// A denial has to say which switch would lift it, and has to steer away
+    /// from the obvious workaround.
+    #[test]
+    fn denial_names_the_capability_and_discourages_routing_around_it() {
+        let message = policy::deny_message(policy::Capability::WriteDelete);
+        assert!(message.contains("write.delete"));
+        assert!(message.contains("another tool"));
     }
 
     #[test]
