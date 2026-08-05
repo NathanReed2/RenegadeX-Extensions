@@ -10,7 +10,7 @@
 //! actor's origin says very little about where it is: a building whose pivot
 //! sits outside the query sphere is still in the query sphere.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 
 use super::{
@@ -22,6 +22,9 @@ const GWORLD_RVA: usize = 0x0369_13D8;
 const GET_WORLD_INFO_RVA: usize = 0x009F_D770;
 const WORLD_ACTORS_DATA_SITE_RVA: usize = 0x009F_D7AC;
 const ACTOR_COMPONENTS_SITE_RVA: usize = 0x0128_DBAE;
+const MARK_COMPONENTS_PENDING_KILL_RVA: usize = 0x0053_E8B0;
+const ACTOR_ALL_COMPONENTS_NUM_SITE_RVA: usize = 0x0053_E974;
+const ACTOR_ALL_COMPONENTS_DATA_SITE_RVA: usize = 0x0053_E9B6;
 const COMPONENT_BOUNDS_SITE_RVA: usize = 0x0128_DC09;
 
 const WORLD_LEVELS_DATA_OFFSET: usize = 0x70;
@@ -31,6 +34,8 @@ const LEVEL_ACTORS_DATA_OFFSET: usize = 0x60;
 const LEVEL_ACTORS_NUM_OFFSET: usize = 0x68;
 const ACTOR_COMPONENTS_DATA_OFFSET: usize = 0x60;
 const ACTOR_COMPONENTS_NUM_OFFSET: usize = 0x68;
+const ACTOR_ALL_COMPONENTS_DATA_OFFSET: usize = 0x70;
+const ACTOR_ALL_COMPONENTS_NUM_OFFSET: usize = 0x78;
 const COMPONENT_ATTACHED_OFFSET: usize = 0x80;
 const COMPONENT_BOUNDS_ORIGIN_OFFSET: usize = 0x8C;
 const COMPONENT_BOUNDS_EXTENT_OFFSET: usize = 0x98;
@@ -48,6 +53,18 @@ const WORLD_ACTORS_DATA_GUARD: &[u8] = &[0x48, 0x8B, 0x43, 0x60, 0x48, 0x8B, 0x1
 /// editor's own bounding-box walk.
 const ACTOR_COMPONENTS_GUARD: &[u8] = &[
     0x49, 0x8B, 0x44, 0x24, 0x60, 0x48, 0x8B, 0x1C, 0x06, 0x48, 0x85, 0xDB,
+];
+/// `AActor::MarkComponentsAsPendingKill` walks `Components` and then
+/// `AllComponents`, so one function pins both arrays. The prologue anchors it
+/// and the two sites below carry the offsets.
+const MARK_COMPONENTS_PENDING_KILL_PROLOGUE: &[u8] = &[
+    0x48, 0x89, 0x5C, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x48, 0x89, 0x7C, 0x24, 0x20,
+];
+/// `CMP dword ptr [RSI+0x78],EDI` - the `AllComponents` count.
+const ACTOR_ALL_COMPONENTS_NUM_GUARD: &[u8] = &[0x39, 0x7E, 0x78, 0x0F, 0x8E];
+/// `MOV RAX,[RSI+0x70]; MOV RBX,[RAX+RDI*8]; TEST RBX,RBX` - its data pointer.
+const ACTOR_ALL_COMPONENTS_DATA_GUARD: &[u8] = &[
+    0x48, 0x8B, 0x46, 0x70, 0x48, 0x8B, 0x1C, 0xF8, 0x48, 0x85, 0xDB, 0x74, 0x30,
 ];
 /// The attached test and the `FBoxSphereBounds` reads that follow it, taken
 /// from `UEditorEngine::MoveViewportCamerasToActor`. The offsets this module
@@ -67,7 +84,9 @@ pub(super) const DEFAULT_MAX_SCAN: usize = 20_000;
 pub(super) const MAX_MAX_SCAN: usize = 200_000;
 const MAX_LEVELS: usize = 4096;
 const MAX_ACTORS_PER_LEVEL: usize = 1_000_000;
-const MAX_COMPONENTS_PER_ACTOR: usize = 512;
+// A landscape attaches one component per terrain patch; CNC-Field's has 236,
+// and a larger map's can run well past that.
+const MAX_COMPONENTS_PER_ACTOR: usize = 16_384;
 const MAX_CLASS_CHAIN: usize = 128;
 const MAX_FILTER_LENGTH: usize = 256;
 const HALF_WORLD_MAX: f64 = 262_144.0;
@@ -281,6 +300,21 @@ fn verify_layout() -> Result<(), String> {
         ACTOR_COMPONENTS_GUARD,
     )?;
     guarded_site(
+        MARK_COMPONENTS_PENDING_KILL_RVA,
+        "AActor::MarkComponentsAsPendingKill",
+        MARK_COMPONENTS_PENDING_KILL_PROLOGUE,
+    )?;
+    guarded_site(
+        ACTOR_ALL_COMPONENTS_NUM_SITE_RVA,
+        "AActor::AllComponents count site",
+        ACTOR_ALL_COMPONENTS_NUM_GUARD,
+    )?;
+    guarded_site(
+        ACTOR_ALL_COMPONENTS_DATA_SITE_RVA,
+        "AActor::AllComponents data site",
+        ACTOR_ALL_COMPONENTS_DATA_GUARD,
+    )?;
+    guarded_site(
         COMPONENT_BOUNDS_SITE_RVA,
         "UPrimitiveComponent::Bounds layout site",
         COMPONENT_BOUNDS_GUARD,
@@ -348,63 +382,91 @@ impl ClassCache {
     }
 }
 
+/// One component's contribution, or `None` if it has nothing to contribute.
+fn component_bounds(
+    component: *mut c_void,
+    primitives: &mut ClassCache,
+) -> Result<Option<Bounds>, String> {
+    if component.is_null() || !primitives.matches(component)? {
+        return Ok(None);
+    }
+    // The engine's own rule at the site these offsets came from: a primitive
+    // component contributes its bounds only once attached, because an
+    // unattached one has never had them computed.
+    let attached = unsafe { *((component as *const u8).add(COMPONENT_ATTACHED_OFFSET)) } & 1 != 0;
+    if !attached {
+        return Ok(None);
+    }
+    let origin =
+        unsafe { *((component as *const u8).add(COMPONENT_BOUNDS_ORIGIN_OFFSET) as *const Vector3) };
+    let extent =
+        unsafe { *((component as *const u8).add(COMPONENT_BOUNDS_EXTENT_OFFSET) as *const Vector3) };
+    let radius =
+        unsafe { *((component as *const u8).add(COMPONENT_BOUNDS_RADIUS_OFFSET) as *const f32) }
+            as f64;
+    let origin = [origin.x as f64, origin.y as f64, origin.z as f64];
+    let extent = [extent.x as f64, extent.y as f64, extent.z as f64];
+    if !origin
+        .iter()
+        .chain(extent.iter())
+        .all(|value| value.is_finite())
+    {
+        return Ok(None);
+    }
+    Ok(Some(Bounds {
+        min: std::array::from_fn(|i| origin[i] - extent[i].abs()),
+        max: std::array::from_fn(|i| origin[i] + extent[i].abs()),
+        sphere_radius: if radius.is_finite() { radius } else { 0.0 },
+    }))
+}
+
+/// Both component arrays, because neither alone is the actor's extent.
+///
+/// `Components` is the editable list, and it is what the editor's own framing
+/// walk uses. `AllComponents` is what `UActorComponent::Attach` appends to, so
+/// it holds everything actually attached - including components an actor
+/// creates outside the editable list. A Landscape is the case that matters:
+/// its `Components` holds one editor sprite while its 236 terrain patches live
+/// only in `AllComponents`, so walking `Components` alone would place a
+/// map-sized landscape at a point and miss it in every volume query.
 fn actor_bounds(
     actor: *mut c_void,
     location: [f64; 3],
     primitives: &mut ClassCache,
 ) -> Result<(Bounds, usize), String> {
-    let Some((data, count)) = (unsafe {
-        read_array(
-            actor,
-            ACTOR_COMPONENTS_DATA_OFFSET,
-            ACTOR_COMPONENTS_NUM_OFFSET,
-            MAX_COMPONENTS_PER_ACTOR,
-        )
-    }) else {
-        return Ok((Bounds::point(location), 0));
-    };
     let mut bounds: Option<Bounds> = None;
     let mut used = 0usize;
-    for index in 0..count {
-        let component = unsafe { *data.add(index) };
-        if component.is_null() {
+    // A landscape brings hundreds of components; a linear membership scan
+    // would be quadratic in exactly the case this walk was widened for.
+    let mut seen: HashSet<usize> = HashSet::new();
+    for (data_offset, num_offset) in [
+        (ACTOR_COMPONENTS_DATA_OFFSET, ACTOR_COMPONENTS_NUM_OFFSET),
+        (
+            ACTOR_ALL_COMPONENTS_DATA_OFFSET,
+            ACTOR_ALL_COMPONENTS_NUM_OFFSET,
+        ),
+    ] {
+        let Some((data, count)) = (unsafe {
+            read_array(actor, data_offset, num_offset, MAX_COMPONENTS_PER_ACTOR)
+        }) else {
             continue;
-        }
-        // The engine's own rule at this site: a primitive component contributes
-        // its bounds only once attached, because an unattached one has never
-        // had them computed.
-        if !primitives.matches(component)? {
-            continue;
-        }
-        let attached =
-            unsafe { *((component as *const u8).add(COMPONENT_ATTACHED_OFFSET)) } & 1 != 0;
-        if !attached {
-            continue;
-        }
-        let origin = unsafe {
-            *((component as *const u8).add(COMPONENT_BOUNDS_ORIGIN_OFFSET) as *const Vector3)
         };
-        let extent = unsafe {
-            *((component as *const u8).add(COMPONENT_BOUNDS_EXTENT_OFFSET) as *const Vector3)
-        };
-        let radius = unsafe {
-            *((component as *const u8).add(COMPONENT_BOUNDS_RADIUS_OFFSET) as *const f32)
-        } as f64;
-        let origin = [origin.x as f64, origin.y as f64, origin.z as f64];
-        let extent = [extent.x as f64, extent.y as f64, extent.z as f64];
-        if !origin.iter().chain(extent.iter()).all(|value| value.is_finite()) {
-            continue;
+        for index in 0..count {
+            let component = unsafe { *data.add(index) };
+            // The two arrays overlap heavily, and a component counted twice
+            // would inflate componentCount without changing the union.
+            if !seen.insert(component as usize) {
+                continue;
+            }
+            let Some(contribution) = component_bounds(component, primitives)? else {
+                continue;
+            };
+            bounds = Some(match bounds {
+                Some(existing) => existing.union(contribution),
+                None => contribution,
+            });
+            used += 1;
         }
-        let component_bounds = Bounds {
-            min: std::array::from_fn(|i| origin[i] - extent[i].abs()),
-            max: std::array::from_fn(|i| origin[i] + extent[i].abs()),
-            sphere_radius: if radius.is_finite() { radius } else { 0.0 },
-        };
-        bounds = Some(match bounds {
-            Some(existing) => existing.union(component_bounds),
-            None => component_bounds,
-        });
-        used += 1;
     }
     Ok((bounds.unwrap_or_else(|| Bounds::point(location)), used))
 }
