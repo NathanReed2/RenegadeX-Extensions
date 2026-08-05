@@ -18,6 +18,8 @@ use std::time::Duration;
 use crate::dll::UDK_RANGE;
 use crate::patch_utils::debug_log;
 
+pub mod audit;
+pub mod guard;
 pub mod panel;
 pub mod policy;
 
@@ -93,6 +95,13 @@ static SERVER_STOP: AtomicBool = AtomicBool::new(false);
 static CONNECTIONS_ACCEPTED: AtomicU64 = AtomicU64::new(0);
 static TOOL_CALLS: AtomicU64 = AtomicU64::new(0);
 static POLICY_REFUSALS: AtomicU64 = AtomicU64::new(0);
+/// Mutations that actually reached the editor and succeeded. This is how many
+/// undo steps the bridge is responsible for, which is the number a user needs
+/// after something unexpected.
+static MUTATIONS_APPLIED: AtomicU64 = AtomicU64::new(0);
+/// Numbers the named transactions this bridge opens, so a run of them is
+/// recognisable in the editor's Undo History.
+static TRANSACTIONS_OPENED: AtomicU64 = AtomicU64::new(0);
 /// Last bind or accept failure, kept so the status view can explain a server
 /// that is not listening rather than just saying that it is not.
 static LAST_SERVER_ERROR: Mutex<String> = Mutex::new(String::new());
@@ -136,8 +145,35 @@ enum ActorAction {
     MoveToGrid,
 }
 
+/// Per-call safety arguments, kept apart from the operation itself.
+///
+/// They travel with the request rather than living in each variant because they
+/// apply to whole classes of operation, and because a new variant that forgets
+/// to carry them would silently opt out of every limit.
+#[derive(Default, Clone)]
+struct Guards {
+    /// The caller has told the user how many actors this touches and been told
+    /// to go ahead. See [`guard::check_blast_radius`].
+    confirm_large_change: bool,
+    /// The selection the caller believes it is acting on.
+    selection_token: Option<String>,
+    /// Report what would happen; change nothing.
+    dry_run: bool,
+}
+
+impl Guards {
+    fn from_arguments(arguments: &str) -> Guards {
+        Guards {
+            confirm_large_change: json_field_bool(arguments, "confirmLargeChange") == Some(true),
+            selection_token: json_field_string(arguments, "selectionToken"),
+            dry_run: json_field_bool(arguments, "dryRun") == Some(true),
+        }
+    }
+}
+
 struct EditorRequest {
     operation: EditorOperation,
+    guards: Guards,
     response: SyncSender<Result<EditorValue, String>>,
 }
 
@@ -279,7 +315,7 @@ extern "C" fn editor_tick_hook(editor: *mut c_void, delta_seconds: f32) {
     let ticks = TICK_COUNT.fetch_add(1, Ordering::Relaxed);
     start_server_once();
     drain_editor_requests(editor);
-    drain_policy_confirmations();
+    drain_confirmations();
 
     // The panel and its menu item have to be created and repaired on the thread
     // that pumps them, which is this one. Throttled because the check walks the
@@ -304,7 +340,7 @@ fn drain_editor_requests(editor: *mut c_void) {
         let Some(request) = request else {
             break;
         };
-        let result = execute_editor_operation(editor, request.operation);
+        let result = guard_and_execute(editor, request.operation, &request.guards);
         let _ = request.response.send(result);
     }
 }
@@ -490,6 +526,193 @@ fn actor_json(index: usize, actor: *mut c_void) -> Result<String, String> {
     ))
 }
 
+/// The checks that can only be made on the editor thread, then the work.
+///
+/// Blast radius and selection staleness both depend on the live selection, and
+/// the live selection is only knowable here. Doing them off-thread would mean
+/// trusting a count the caller supplied, which is precisely the number that goes
+/// stale between a read and the mutation that follows it.
+fn guard_and_execute(
+    editor: *mut c_void,
+    operation: EditorOperation,
+    guards: &Guards,
+) -> Result<EditorValue, String> {
+    let capability = required_capability(&operation);
+    let touches_selection = operation_touches_selection(&operation);
+
+    let mut selection_size = None;
+    if touches_selection {
+        let count = selected_actor_pointers(editor)?.len();
+        selection_size = Some(count);
+        guard::note_selection(count);
+        guard::check_selection_token(guards.selection_token.as_deref(), count)?;
+
+        // Before the blast-radius check, not after. A dry run changes nothing,
+        // and finding out that this would touch 741 actors is exactly what the
+        // blast-radius refusal tells the caller to go and do - refusing the dry
+        // run too would leave it no safe way to answer the question it was just
+        // asked.
+        if guards.dry_run {
+            let large = count as i32 > guard::BLAST_RADIUS;
+            return Ok(EditorValue::Json(format!(
+                "{{\"dryRun\":true,\"wouldRun\":\"{}\",\"selectedActors\":{count},\"applied\":false,\
+                 \"needsConfirmLargeChange\":{large},\"note\":\"Nothing was changed.{}\"}}",
+                json_escape(&operation_description(&operation)),
+                if large {
+                    format!(
+                        " This would affect {count} actors, which is over the limit of {}. Tell \
+                         the user the count and what you intend to do, and only pass \
+                         confirmLargeChange after they agree.",
+                        guard::BLAST_RADIUS
+                    )
+                } else {
+                    " Repeat without dryRun to apply this.".to_string()
+                }
+            )));
+        }
+
+        if !capability.is_read_only() {
+            guard::check_blast_radius(
+                count as i32,
+                operation_description(&operation).as_str(),
+                guards.confirm_large_change,
+            )?;
+        }
+    } else if guards.dry_run && !capability.is_read_only() {
+        return Ok(EditorValue::Json(format!(
+            "{{\"dryRun\":true,\"wouldRun\":\"{}\",\"applied\":false,\"note\":\"Nothing was \
+             changed. Repeat without dryRun to apply this.\"}}",
+            json_escape(&operation_description(&operation))
+        )));
+    }
+
+    let mutating = is_mutation(&operation);
+    let mut result = execute_editor_operation(editor, operation);
+
+    // A read of the selection hands back the token naming what it saw, so the
+    // caller has something to pass to the mutation that follows.
+    if !mutating {
+        if let (Ok(EditorValue::Json(structured)), Some(count)) = (&mut result, selection_size) {
+            *structured = with_selection_token(structured, &guard::selection_token(count));
+        }
+    }
+
+    if mutating && result.is_ok() {
+        MUTATIONS_APPLIED.fetch_add(1, Ordering::Relaxed);
+        // Duplicate and delete change the selection as a side effect, and a
+        // property write can change what a name resolves to. Cheaper to retire
+        // every outstanding token than to work out which ones survived.
+        guard::invalidate_selection();
+    }
+    result
+}
+
+/// Names a transaction so the editor's Undo History says where it came from.
+///
+/// UE3 shows the transaction name in Edit > Undo History, so numbering them
+/// turns "something changed my map" into a contiguous run of numbered entries
+/// the user can undo back through and recognise on sight. That is as close to a
+/// session checkpoint as this can safely get from outside the engine: UE3 has no
+/// nested-transaction API reachable here, and holding one transaction open
+/// across HTTP calls would leave the editor in an open transaction for as long
+/// as a client stayed connected - or forever, if it went away mid-edit.
+///
+/// The actions in [`ActorAction`] are not covered: `ACTOR DELETE` and friends
+/// open their own transactions inside the engine, named by the engine. The
+/// undoable-edit count in the status report covers those instead.
+fn transaction_label(what: &str) -> String {
+    format!(
+        "MCP #{}: {what}",
+        TRANSACTIONS_OPENED.fetch_add(1, Ordering::Relaxed) + 1
+    )
+}
+
+/// Adds `selectionToken` to a JSON object this module built.
+///
+/// Safe as string surgery only because every value here is constructed by this
+/// module and is always an object; it is never applied to anything parsed from
+/// the wire.
+fn with_selection_token(structured: &str, token: &str) -> String {
+    let trimmed = structured.trim_end();
+    let Some(head) = trimmed.strip_suffix('}') else {
+        return structured.to_string();
+    };
+    if head.trim_end().ends_with('{') {
+        format!("{head}\"selectionToken\":\"{token}\"}}")
+    } else {
+        format!("{head},\"selectionToken\":\"{token}\"}}")
+    }
+}
+
+/// Whether this operation actually changes the map, for accounting and for the
+/// rate limit.
+///
+/// Not the same question as which capability it needs. `exec.command` is a write
+/// capability because most editor commands write, but the ones on the read-only
+/// allowlist genuinely do not - and charging `OBJ LIST` against the mutation
+/// budget, or reporting it as an undoable edit, would make both numbers lie in
+/// the direction that matters: it inflates how much the bridge appears to have
+/// changed, which is the figure someone reads when deciding how far to undo.
+fn is_mutation(operation: &EditorOperation) -> bool {
+    match operation {
+        EditorOperation::Exec(command) => !guard::exec_is_read_only(command),
+        other => !required_capability(other).is_read_only(),
+    }
+}
+
+/// Whether the operation reads or writes the editor's current selection, and so
+/// whether the selection guards apply to it.
+fn operation_touches_selection(operation: &EditorOperation) -> bool {
+    match operation {
+        EditorOperation::SelectedActors
+        | EditorOperation::SelectionCounts
+        | EditorOperation::ListActorProperties { .. }
+        | EditorOperation::GetActorProperty { .. }
+        | EditorOperation::SetActorProperty { .. }
+        | EditorOperation::ActorAction { .. } => true,
+        EditorOperation::Exec(_)
+        | EditorOperation::SetObjectProperty { .. }
+        | EditorOperation::MapInfo => false,
+    }
+}
+
+/// A one-line description, for prompts, dry runs and the audit log.
+fn operation_description(operation: &EditorOperation) -> String {
+    match operation {
+        EditorOperation::Exec(command) => format!("exec {command}"),
+        EditorOperation::SelectionCounts => "read selection counts".to_string(),
+        EditorOperation::SelectedActors => "read selected actors".to_string(),
+        EditorOperation::ListActorProperties { actor_index, .. } => {
+            format!("list properties of actor {actor_index}")
+        }
+        EditorOperation::GetActorProperty {
+            actor_index,
+            property,
+        } => format!("read {property} of actor {actor_index}"),
+        EditorOperation::SetActorProperty {
+            actor_index,
+            property,
+            value,
+        } => format!("set {property} = {value} on actor {actor_index}"),
+        EditorOperation::SetObjectProperty {
+            object_path,
+            property,
+            value,
+        } => format!("set {property} = {value} on {object_path}"),
+        EditorOperation::ActorAction { action } => format!("{} on the selected actors", match action
+        {
+            ActorAction::Duplicate => "ACTOR DUPLICATE",
+            ActorAction::Delete => "ACTOR DELETE",
+            ActorAction::ResetLocation => "ACTOR RESET LOCATION",
+            ActorAction::ResetRotation => "ACTOR RESET ROTATION",
+            ActorAction::ResetScale => "ACTOR RESET SCALE",
+            ActorAction::SnapToFloor => "ACTOR ALIGN SNAPTOFLOOR",
+            ActorAction::MoveToGrid => "ACTOR ALIGN MOVETOGRID",
+        }),
+        EditorOperation::MapInfo => "read map info".to_string(),
+    }
+}
+
 fn execute_editor_operation(
     editor: *mut c_void,
     operation: EditorOperation,
@@ -595,8 +818,9 @@ fn execute_editor_operation(
             if object_path.chars().any(char::is_whitespace) {
                 return Err("selected actor path contains whitespace".to_string());
             }
-            let transaction_name = widestring::U16CString::from_str("MCP Set Actor Property")
-                .map_err(|_| "invalid transaction name".to_string())?;
+            let transaction_name =
+                widestring::U16CString::from_str(transaction_label("Set Actor Property"))
+                    .map_err(|_| "invalid transaction name".to_string())?;
             let begin: BeginTransactionFn = unsafe {
                 std::mem::transmute(
                     image_address(BEGIN_TRANSACTION_RVA, 1, "UEditorEngine::BeginTransaction")
@@ -638,8 +862,9 @@ fn execute_editor_operation(
             if value.contains(['\0', '\r', '\n']) || value.len() > MAX_COMMAND_UNITS {
                 return Err("property value is invalid or too long".to_string());
             }
-            let transaction_name = widestring::U16CString::from_str("MCP Set Object Property")
-                .map_err(|_| "invalid transaction name".to_string())?;
+            let transaction_name =
+                widestring::U16CString::from_str(transaction_label("Set Object Property"))
+                    .map_err(|_| "invalid transaction name".to_string())?;
             let begin: BeginTransactionFn = unsafe {
                 std::mem::transmute(
                     image_address(BEGIN_TRANSACTION_RVA, 1, "UEditorEngine::BeginTransaction")
@@ -766,6 +991,10 @@ fn required_capability(operation: &EditorOperation) -> policy::Capability {
 }
 
 fn submit_editor_operation(operation: EditorOperation) -> Result<EditorValue, String> {
+    submit_guarded(operation, Guards::default())
+}
+
+fn submit_guarded(operation: EditorOperation, guards: Guards) -> Result<EditorValue, String> {
     // Before the readiness check and before anything is queued: a denied
     // operation must never reach the editor thread, and must not be able to
     // distinguish "forbidden" from "editor busy" by the error it gets back.
@@ -773,6 +1002,43 @@ fn submit_editor_operation(operation: EditorOperation) -> Result<EditorValue, St
     if !policy::allows(capability) {
         POLICY_REFUSALS.fetch_add(1, Ordering::Relaxed);
         return Err(policy::deny_message(capability));
+    }
+
+    // A dry run changes nothing, so it is not spent against the mutation budget
+    // and does not need a command approved - otherwise "show me what this would
+    // do" would cost the same as doing it.
+    if is_mutation(&operation) && !guards.dry_run {
+        guard::check_rate()?;
+    }
+
+    // `exec.command` is the one capability that subsumes all the others: with it
+    // granted, every limit above can be reached round the side by typing the
+    // equivalent console command. So a command that is not known to be read-only
+    // is confirmed individually, which turns a single broad grant into a series
+    // of specific ones.
+    if let EditorOperation::Exec(command) = &operation {
+        if !guards.dry_run && !guard::exec_is_read_only(command) {
+            let approved = request_confirmation(
+                "RenX MCP - Allow this editor command?",
+                guard::exec_confirmation(command),
+                "The user did not answer the approval prompt in the editor within two minutes, so \
+                 the command was not run and nothing changed.",
+            )?;
+            if !approved {
+                POLICY_REFUSALS.fetch_add(1, Ordering::Relaxed);
+                audit::record(
+                    audit::Entry::new("exec", "renx_exec", audit::Outcome::Blocked)
+                        .detail(command)
+                        .note("declined by the user"),
+                );
+                return Err(guard::EXEC_DECLINED.to_string());
+            }
+            audit::record(
+                audit::Entry::new("exec", "renx_exec", audit::Outcome::Ok)
+                    .detail(command)
+                    .note("approved by the user"),
+            );
+        }
     }
     if EDITOR_THIS.load(Ordering::Acquire) == 0 {
         return Err("The editor is still starting up and has not run a frame yet. This is not a \
@@ -789,6 +1055,7 @@ fn submit_editor_operation(operation: EditorOperation) -> Result<EditorValue, St
         }
         queue.push_back(EditorRequest {
             operation,
+            guards,
             response: sender,
         });
     }
@@ -1005,18 +1272,30 @@ pub(crate) fn status_report() -> String {
 
     report.push_str("\nActivity\n");
     report.push_str(&format!(
-        "  Connections      {}\n  Tool calls       {}\n  Policy refusals  {}\n  Editor ticks     \
-         {}\n",
+        "  Connections      {}\n  Tool calls       {}\n  Policy refusals  {}\n  Rate blocks      \
+         {}\n  Editor ticks     {}\n",
         CONNECTIONS_ACCEPTED.load(Ordering::Relaxed),
         TOOL_CALLS.load(Ordering::Relaxed),
         POLICY_REFUSALS.load(Ordering::Relaxed),
+        guard::rate_blocks(),
         TICK_COUNT.load(Ordering::Relaxed),
     ));
 
+    // The number that matters after something went wrong: how many times to
+    // press Ctrl+Z to put the map back the way it was.
     report.push_str(&format!(
-        "\nProcess {}\nPolicy file {}\n",
+        "\nChanges this session\n  Undoable edits   {}  (each is one step in the editor's Undo \
+         history)\n  Mutation budget  {}\n",
+        MUTATIONS_APPLIED.load(Ordering::Relaxed),
+        guard::rate_usage(),
+    ));
+
+    report.push_str(&format!(
+        "\nProcess {}\nPolicy file {}\nAudit log   {} ({} entries this session)\n",
         std::process::id(),
-        policy::policy_file_path().to_string_lossy()
+        policy::policy_file_path().to_string_lossy(),
+        audit::path().to_string_lossy(),
+        audit::entries_written(),
     ));
 
     if !error.is_empty() {
@@ -1125,9 +1404,24 @@ fn handle_control_policy(stream: &mut TcpStream, request: &HttpRequest) -> std::
             // asking to widen its own permissions. A policy the caller can
             // rewrite is not a policy.
             if change.grants_anything() {
-                match request_policy_confirmation(&change) {
-                    Ok(true) => {}
+                let decision = request_confirmation(
+                    "RenX MCP - Allow this policy change?",
+                    change.summary(),
+                    "The user did not answer the approval prompt in the editor within two \
+                     minutes, so this was treated as a refusal. The policy is unchanged.",
+                );
+                match decision {
+                    Ok(true) => audit::record(
+                        audit::Entry::new("policy", "control/policy", audit::Outcome::Ok)
+                            .detail(&request.body)
+                            .note("approved by the user"),
+                    ),
                     Ok(false) => {
+                        audit::record(
+                            audit::Entry::new("policy", "control/policy", audit::Outcome::Denied)
+                                .detail(&request.body)
+                                .note("declined by the user"),
+                        );
                         return write_http(
                             stream,
                             403,
@@ -1174,47 +1468,52 @@ const POLICY_CHANGE_DECLINED: &str =
 /// The prompt has to be raised on the editor thread - it owns the windows - so
 /// the request is queued for the tick to pick up, exactly like every other piece
 /// of editor work here. A timeout counts as "no", because an unattended editor
-/// must not be a way to get permissions by waiting.
-fn request_policy_confirmation(change: &policy::Change) -> Result<bool, String> {
+/// must not be a way to get past a prompt by waiting.
+fn request_confirmation(title: &str, summary: String, on_timeout: &str) -> Result<bool, String> {
     if EDITOR_THIS.load(Ordering::Acquire) == 0 {
         return Err("The editor is not running a frame yet, so the user cannot be asked to \
-                    approve this. The policy is unchanged."
+                    approve this. Nothing was changed."
             .to_string());
     }
     let (sender, receiver) = mpsc::sync_channel(1);
+    // Cleared as soon as this caller stops listening, whether that is because it
+    // got an answer or because it gave up waiting. The tick reads it before
+    // raising the prompt, so an abandoned request cannot put a dialog in front
+    // of the user minutes later for something nobody is waiting on.
+    let waiting = std::sync::Arc::new(AtomicBool::new(true));
     {
-        let mut queue = policy_confirmations()
+        let mut queue = confirmations()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if !queue.is_empty() {
-            return Err("Another policy change is already waiting for the user to approve it. \
-                        The policy is unchanged."
+        // Queued rather than refused. Two prompts is a person answering two
+        // questions; refusing the second would fail a concurrent client for a
+        // reason that has nothing to do with what it asked.
+        if queue.len() >= MAX_QUEUED_CONFIRMATIONS {
+            return Err("Too many approval prompts are already waiting for the user. Nothing was \
+                        changed."
                 .to_string());
         }
-        queue.push_back(PolicyConfirmation {
-            summary: change.summary(),
+        queue.push_back(Confirmation {
+            title: title.to_string(),
+            summary,
+            waiting: waiting.clone(),
             response: sender,
         });
     }
-    receiver.recv_timeout(POLICY_CONFIRM_TIMEOUT).map_err(|_| {
-        // Leave nothing behind for a later tick to pop up out of nowhere.
-        policy_confirmations()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clear();
-        "The user did not answer the approval prompt in the editor within two minutes, so this \
-         was treated as a refusal. The policy is unchanged."
-            .to_string()
-    })
+    let answer = receiver.recv_timeout(CONFIRM_TIMEOUT);
+    waiting.store(false, Ordering::Release);
+    answer.map_err(|_| on_timeout.to_string())
 }
 
-struct PolicyConfirmation {
+struct Confirmation {
+    title: String,
     summary: String,
+    waiting: std::sync::Arc<AtomicBool>,
     response: SyncSender<bool>,
 }
 
-fn policy_confirmations() -> &'static Mutex<VecDeque<PolicyConfirmation>> {
-    static QUEUE: OnceLock<Mutex<VecDeque<PolicyConfirmation>>> = OnceLock::new();
+fn confirmations() -> &'static Mutex<VecDeque<Confirmation>> {
+    static QUEUE: OnceLock<Mutex<VecDeque<Confirmation>>> = OnceLock::new();
     QUEUE.get_or_init(|| Mutex::new(VecDeque::new()))
 }
 
@@ -1223,21 +1522,35 @@ fn policy_confirmations() -> &'static Mutex<VecDeque<PolicyConfirmation>> {
 ///
 /// One per tick: the prompt is modal and stops the editor's loop until it is
 /// answered, so there is never a second one to show until this returns anyway.
-fn drain_policy_confirmations() {
-    let pending = {
-        let mut queue = policy_confirmations()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        queue.pop_front()
-    };
-    let Some(pending) = pending else {
+///
+/// A prompt whose asker has already gone - client disconnected, or it timed out
+/// and stopped listening - is dropped without being shown. Otherwise a dialog
+/// nobody is waiting for appears in front of the user and holds the editor's
+/// main loop until they dismiss something they never triggered.
+fn drain_confirmations() {
+    loop {
+        let pending = {
+            let mut queue = confirmations()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            queue.pop_front()
+        };
+        let Some(pending) = pending else {
+            return;
+        };
+        // Nobody is listening any more: skip to the next rather than interrupt
+        // the user for a question that can no longer be answered usefully.
+        if !pending.waiting.load(Ordering::Acquire) {
+            continue;
+        }
+        let approved = panel::confirm_change(&pending.title, &pending.summary);
+        let _ = pending.response.send(approved);
         return;
-    };
-    let approved = panel::confirm_policy_change(&pending.summary);
-    let _ = pending.response.send(approved);
+    }
 }
 
-const POLICY_CONFIRM_TIMEOUT: Duration = Duration::from_secs(120);
+const CONFIRM_TIMEOUT: Duration = Duration::from_secs(120);
+const MAX_QUEUED_CONFIRMATIONS: usize = 4;
 
 fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {
     let mut bytes = Vec::new();
@@ -1484,17 +1797,101 @@ fn tools_list_with(permitted: impl Fn(&str) -> bool) -> String {
 const TOOL_DEFINITIONS: &[(&str, &str)] = &[
     ("renx_editor_status", "{\"name\":\"renx_editor_status\",\"description\":\"Report whether the Renegade X editor-thread bridge is ready.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}}"),
     ("renx_get_selection_counts", "{\"name\":\"renx_get_selection_counts\",\"description\":\"Return selected actor and selected object counts from the editor.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}}"),
-    ("renx_get_selected_actors", "{\"name\":\"renx_get_selected_actors\",\"description\":\"Return selected actor names, paths, classes, levels, locations, rotations, and scales.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}}"),
+    ("renx_get_selected_actors", "{\"name\":\"renx_get_selected_actors\",\"description\":\"Return selected actor names, paths, classes, levels, locations, rotations, and scales. Also returns selectionToken: pass it to a later mutation and that mutation is refused if the user changed the selection in between.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}}"),
     ("renx_list_actor_properties", "{\"name\":\"renx_list_actor_properties\",\"description\":\"List reflected properties on a selected actor class using UE3 UProperty metadata.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"actorIndex\":{\"type\":\"integer\",\"minimum\":0},\"pattern\":{\"type\":\"string\",\"default\":\"*\",\"description\":\"Property wildcard using * and ?\"}},\"required\":[\"actorIndex\"],\"additionalProperties\":false}}"),
     ("renx_get_actor_property", "{\"name\":\"renx_get_actor_property\",\"description\":\"Export one reflected property from a selected actor through UProperty::ExportText.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"actorIndex\":{\"type\":\"integer\",\"minimum\":0},\"property\":{\"type\":\"string\"}},\"required\":[\"actorIndex\",\"property\"],\"additionalProperties\":false}}"),
-    ("renx_set_actor_property", "{\"name\":\"renx_set_actor_property\",\"description\":\"Import one reflected property on a selected actor inside an undo transaction.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"actorIndex\":{\"type\":\"integer\",\"minimum\":0},\"property\":{\"type\":\"string\"},\"value\":{\"type\":\"string\"}},\"required\":[\"actorIndex\",\"property\",\"value\"],\"additionalProperties\":false}}"),
-    ("renx_set_object_property", "{\"name\":\"renx_set_object_property\",\"description\":\"Import one reflected property on a UObject path inside an undo transaction.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"objectPath\":{\"type\":\"string\",\"description\":\"UE3 object path without the class prefix\"},\"property\":{\"type\":\"string\"},\"value\":{\"type\":\"string\"}},\"required\":[\"objectPath\",\"property\",\"value\"],\"additionalProperties\":false}}"),
-    ("renx_actor_action", "{\"name\":\"renx_actor_action\",\"description\":\"Run an undo-aware native editor action on selected actors. Delete requires confirm=true. Individual actions may be disabled by editor policy.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"action\":{\"type\":\"string\",\"enum\":[\"duplicate\",\"delete\",\"reset_location\",\"reset_rotation\",\"reset_scale\",\"snap_to_floor\",\"move_to_grid\"]},\"confirm\":{\"type\":\"boolean\",\"default\":false}},\"required\":[\"action\"],\"additionalProperties\":false}}"),
+    ("renx_set_actor_property", "{\"name\":\"renx_set_actor_property\",\"description\":\"Import one reflected property on a selected actor inside an undo transaction.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"actorIndex\":{\"type\":\"integer\",\"minimum\":0},\"property\":{\"type\":\"string\"},\"value\":{\"type\":\"string\"},\"dryRun\":{\"type\":\"boolean\",\"default\":false,\"description\":\"Report what would change without changing it.\"},\"selectionToken\":{\"type\":\"string\",\"description\":\"Token from renx_get_selected_actors; refuses the call if the selection changed since.\"},\"confirmLargeChange\":{\"type\":\"boolean\",\"default\":false,\"description\":\"Required when more than 50 actors are selected. Only pass this after telling the user the count and being told to proceed.\"}},\"required\":[\"actorIndex\",\"property\",\"value\"],\"additionalProperties\":false}}"),
+    ("renx_set_object_property", "{\"name\":\"renx_set_object_property\",\"description\":\"Import one reflected property on a UObject path inside an undo transaction.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"objectPath\":{\"type\":\"string\",\"description\":\"UE3 object path without the class prefix\"},\"property\":{\"type\":\"string\"},\"value\":{\"type\":\"string\"},\"dryRun\":{\"type\":\"boolean\",\"default\":false,\"description\":\"Report what would change without changing it.\"}},\"required\":[\"objectPath\",\"property\",\"value\"],\"additionalProperties\":false}}"),
+    ("renx_actor_action", "{\"name\":\"renx_actor_action\",\"description\":\"Run an undo-aware native editor action on selected actors. Delete requires confirm=true. Individual actions may be disabled by editor policy.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"action\":{\"type\":\"string\",\"enum\":[\"duplicate\",\"delete\",\"reset_location\",\"reset_rotation\",\"reset_scale\",\"snap_to_floor\",\"move_to_grid\"]},\"confirm\":{\"type\":\"boolean\",\"default\":false},\"dryRun\":{\"type\":\"boolean\",\"default\":false,\"description\":\"Report what would change without changing it.\"},\"selectionToken\":{\"type\":\"string\",\"description\":\"Token from renx_get_selected_actors; refuses the call if the selection changed since.\"},\"confirmLargeChange\":{\"type\":\"boolean\",\"default\":false,\"description\":\"Required when more than 50 actors are selected. Only pass this after telling the user the count and being told to proceed.\"}},\"required\":[\"action\"],\"additionalProperties\":false}}"),
     ("renx_get_map_info", "{\"name\":\"renx_get_map_info\",\"description\":\"Report the current map inferred from selected actors, selected levels, and UE3 WorldInfo listing.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}}"),
-    ("renx_exec", "{\"name\":\"renx_exec\",\"description\":\"Execute a UE3 editor command on the editor thread and return captured FOutputDevice text. Commands may modify maps and packages.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\",\"description\":\"UE3 editor Exec command\"}},\"required\":[\"command\"],\"additionalProperties\":false}}"),
+    ("renx_exec", "{\"name\":\"renx_exec\",\"description\":\"Execute a UE3 editor command on the editor thread and return captured FOutputDevice text. Commands may modify maps and packages. Read-only commands (OBJ LIST, LISTPROPS, GETALL, SHOW, STAT, SELECT, CAMERA, MODE) run directly; anything else raises a prompt in the editor that the user must accept, so expect a delay and a possible refusal.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\",\"description\":\"UE3 editor Exec command\"},\"dryRun\":{\"type\":\"boolean\",\"default\":false,\"description\":\"Report what would run without running it, and without prompting the user.\"}},\"required\":[\"command\"],\"additionalProperties\":false}}"),
 ];
 
+/// Records every call, then dispatches it.
+///
+/// Wrapping rather than sprinkling `audit::record` through the arms: a tool
+/// added later is logged whether or not its author remembered to, which is the
+/// same reason the policy check lives on the one path to the editor thread.
 fn tools_call(body: &str) -> Result<String, (i32, String)> {
+    let started = std::time::Instant::now();
+    let name = json_field_raw(body, "params")
+        .and_then(|params| json_field_string(params, "name"))
+        .unwrap_or_else(|| "?".to_string());
+    let arguments = json_field_raw(body, "params")
+        .and_then(|params| json_field_raw(params, "arguments"))
+        .unwrap_or("{}")
+        .to_string();
+
+    let result = dispatch_tool_call(body);
+
+    let outcome = match &result {
+        Ok(payload) if payload.contains("\"isError\":true") => {
+            // Matched on the fixed opening words of each refusal, which are
+            // constants in this crate rather than anything a caller can supply.
+            // A decline counts as denied, not failed: a person said no, and
+            // filing that under "something went wrong" would misread the log in
+            // exactly the direction that matters.
+            if payload.contains("Blocked by MCP policy") || payload.contains("The user declined") {
+                audit::Outcome::Denied
+            } else if payload.contains("Blocked by the MCP") {
+                audit::Outcome::Blocked
+            } else {
+                audit::Outcome::Failed
+            }
+        }
+        Ok(_) => audit::Outcome::Ok,
+        Err(_) => audit::Outcome::Failed,
+    };
+    let note = match &result {
+        Ok(payload) if outcome != audit::Outcome::Ok => first_text_field(payload),
+        Err((_, message)) => message.clone(),
+        _ => String::new(),
+    };
+    audit::record(
+        audit::Entry::new("tool", &name, outcome)
+            .detail(&arguments)
+            .note(&note)
+            .millis(started.elapsed().as_millis() as u64),
+    );
+    result
+}
+
+/// Pulls the human-readable message out of a tool payload, for the audit note.
+fn first_text_field(payload: &str) -> String {
+    let Some(start) = payload.find("\"text\":\"") else {
+        return String::new();
+    };
+    let rest = &payload[start + 8..];
+    let mut text = String::new();
+    let mut escaped = false;
+    for character in rest.chars() {
+        if escaped {
+            // Decode, rather than skip. Skipping silently deleted every escaped
+            // character, which turned "granted.\n\nIf you" into "granted.If you"
+            // and would have swallowed any quote or backslash in a property
+            // value - in the one field whose whole job is to say what happened.
+            text.push(match character {
+                'n' => '\n',
+                't' => '\t',
+                'r' => '\r',
+                other => other,
+            });
+            escaped = false;
+            continue;
+        }
+        match character {
+            '\\' => escaped = true,
+            '"' => break,
+            _ => text.push(character),
+        }
+        if text.len() > 300 {
+            break;
+        }
+    }
+    text
+}
+
+fn dispatch_tool_call(body: &str) -> Result<String, (i32, String)> {
     let params = json_field_raw(body, "params")
         .ok_or_else(|| (-32602, "tools/call requires params".to_string()))?;
     let name = json_field_string(params, "name")
@@ -1535,7 +1932,8 @@ fn tools_call(body: &str) -> Result<String, (i32, String)> {
         "renx_get_selection_counts" => {
             match submit_editor_operation(EditorOperation::SelectionCounts) {
                 Ok(EditorValue::SelectionCounts { actors, objects }) => Ok(tool_success(&format!(
-                    "{{\"actorCount\":{actors},\"objectCount\":{objects}}}"
+                    "{{\"actorCount\":{actors},\"objectCount\":{objects},\"selectionToken\":\"{}\"}}",
+                    guard::selection_token(actors.max(0) as usize)
                 ))),
                 Ok(_) => unreachable!(),
                 Err(error) => Ok(tool_error(&error)),
@@ -1580,11 +1978,14 @@ fn tools_call(body: &str) -> Result<String, (i32, String)> {
             let actor_index = required_usize(arguments, "actorIndex")?;
             let property = required_string(arguments, "property")?;
             let value = required_string(arguments, "value")?;
-            match submit_editor_operation(EditorOperation::SetActorProperty {
-                actor_index,
-                property,
-                value,
-            }) {
+            match submit_guarded(
+                EditorOperation::SetActorProperty {
+                    actor_index,
+                    property,
+                    value,
+                },
+                Guards::from_arguments(arguments),
+            ) {
                 Ok(EditorValue::Json(structured)) => Ok(tool_success(&structured)),
                 Ok(_) => unreachable!(),
                 Err(error) => Ok(tool_error(&error)),
@@ -1595,11 +1996,14 @@ fn tools_call(body: &str) -> Result<String, (i32, String)> {
             let object_path = required_string(arguments, "objectPath")?;
             let property = required_string(arguments, "property")?;
             let value = required_string(arguments, "value")?;
-            match submit_editor_operation(EditorOperation::SetObjectProperty {
-                object_path,
-                property,
-                value,
-            }) {
+            match submit_guarded(
+                EditorOperation::SetObjectProperty {
+                    object_path,
+                    property,
+                    value,
+                },
+                Guards::from_arguments(arguments),
+            ) {
                 Ok(EditorValue::Json(structured)) => Ok(tool_success(&structured)),
                 Ok(_) => unreachable!(),
                 Err(error) => Ok(tool_error(&error)),
@@ -1623,7 +2027,10 @@ fn tools_call(body: &str) -> Result<String, (i32, String)> {
                 "move_to_grid" => ActorAction::MoveToGrid,
                 _ => return Err((-32602, format!("unknown actor action: {action_name}"))),
             };
-            match submit_editor_operation(EditorOperation::ActorAction { action }) {
+            match submit_guarded(
+                EditorOperation::ActorAction { action },
+                Guards::from_arguments(arguments),
+            ) {
                 Ok(EditorValue::Json(structured)) => Ok(tool_success(&structured)),
                 Ok(_) => unreachable!(),
                 Err(error) => Ok(tool_error(&error)),
@@ -1643,11 +2050,16 @@ fn tools_call(body: &str) -> Result<String, (i32, String)> {
                     "renx_exec requires string argument 'command'".to_string(),
                 )
             })?;
-            match submit_editor_operation(EditorOperation::Exec(command)) {
+            match submit_guarded(
+                EditorOperation::Exec(command),
+                Guards::from_arguments(arguments),
+            ) {
                 Ok(EditorValue::ExecResult { handled, output }) => Ok(tool_success(&format!(
                     "{{\"handled\":{handled},\"output\":\"{}\"}}",
                     json_escape(&output)
                 ))),
+                // A dry run answers with a description instead of running.
+                Ok(EditorValue::Json(structured)) => Ok(tool_success(&structured)),
                 Ok(_) => unreachable!(),
                 Err(error) => Ok(tool_error(&error)),
             }
@@ -1901,6 +2313,56 @@ mod tests {
         EditorOperation,
     };
     use std::ffi::c_void;
+
+    /// The audit note is extracted from an already-escaped payload, so it has to
+    /// decode what it finds. An earlier version skipped escaped characters
+    /// instead, which quietly deleted every newline, quote and backslash from
+    /// the field whose only job is to record what happened.
+    /// The mutation count is what tells a user how far to undo, so a read must
+    /// never inflate it - including a read that arrives as an Exec.
+    #[test]
+    fn read_only_exec_does_not_count_as_a_mutation() {
+        assert!(!super::is_mutation(&EditorOperation::Exec(
+            "OBJ LIST CLASS=WorldInfo".to_string()
+        )));
+        assert!(!super::is_mutation(&EditorOperation::Exec(
+            "ACTOR SELECT OFCLASS CLASS=StaticMeshActor".to_string()
+        )));
+        assert!(super::is_mutation(&EditorOperation::Exec(
+            "MAP SAVE FILE=x.udk".to_string()
+        )));
+        assert!(!super::is_mutation(&EditorOperation::MapInfo));
+        assert!(super::is_mutation(&EditorOperation::ActorAction {
+            action: ActorAction::Delete
+        }));
+    }
+
+    #[test]
+    fn audit_note_decodes_escapes_rather_than_dropping_them() {
+        let payload = r#"{"content":[{"type":"text","text":"line one\n\nsaid \"no\" to C:\\path"}],"isError":true}"#;
+        assert_eq!(
+            super::first_text_field(payload),
+            "line one\n\nsaid \"no\" to C:\\path"
+        );
+    }
+
+    #[test]
+    fn audit_note_is_empty_when_there_is_no_text() {
+        assert_eq!(super::first_text_field(r#"{"isError":false}"#), "");
+    }
+
+    #[test]
+    fn selection_token_is_appended_to_objects_this_module_built() {
+        assert_eq!(
+            super::with_selection_token(r#"{"actorCount":2}"#, "sel-1-2"),
+            r#"{"actorCount":2,"selectionToken":"sel-1-2"}"#
+        );
+        // An empty object must not gain a stray comma.
+        assert_eq!(
+            super::with_selection_token("{}", "sel-1-0"),
+            r#"{"selectionToken":"sel-1-0"}"#
+        );
+    }
 
     #[test]
     fn adjusts_exec_receiver_to_secondary_base() {

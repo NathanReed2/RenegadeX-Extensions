@@ -792,19 +792,21 @@ unsafe extern "system" fn panel_proc(
     }
 }
 
-/// Asks the user to approve a policy change that arrived over the bridge.
+/// Asks the user to approve something that arrived over the bridge - a policy
+/// change, or an editor command that is not known to be read-only.
 ///
 /// Owned by the editor frame rather than by the panel, because the panel is
 /// usually closed and a prompt with no visible owner can end up behind the
 /// editor window where nobody sees it. Defaults to No.
-pub(crate) fn confirm_policy_change(summary: &str) -> bool {
+pub(crate) fn confirm_change(title: &str, summary: &str) -> bool {
     let owner = find_editor_frame().unwrap_or(HWND(0));
     let body = wide(summary);
+    let caption = wide(title);
     let answer = unsafe {
         MessageBoxW(
             owner,
             PCWSTR(body.as_ptr()),
-            w!("RenX MCP - Allow this policy change?"),
+            PCWSTR(caption.as_ptr()),
             MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2 | MB_SETFOREGROUND,
         )
     };
