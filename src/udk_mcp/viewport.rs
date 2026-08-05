@@ -26,6 +26,9 @@ const GET_HIT_PROXY_RVA: usize = 0x005C_1D80;
 const MOVE_VIEWPORT_TO_ACTOR_RVA: usize = 0x0129_1F80;
 const SINGLE_LINE_CHECK_RVA: usize = 0x0072_9860;
 const GWORLD_RVA: usize = 0x0369_13D8;
+const INVERSE_ROTATION_MATRIX_RVA: usize = 0x0035_7220;
+const CALCULATE_VIEW_EXTENTS_RVA: usize = 0x005A_DE20;
+const GNEAR_CLIPPING_PLANE_RVA: usize = 0x0345_3FC8;
 
 const CLIENT_VIEWPORT_OFFSET: usize = 0x20;
 const CLIENT_LOCATION_OFFSET: usize = 0x28;
@@ -33,8 +36,16 @@ const CLIENT_ROTATION_OFFSET: usize = 0x40;
 const CLIENT_FOV_OFFSET: usize = 0x4C;
 const CLIENT_TYPE_OFFSET: usize = 0x50;
 const CLIENT_ORTHO_ZOOM_OFFSET: usize = 0x54;
+const CLIENT_VARIABLE_FAR_PLANE_OFFSET: usize = 0xC4;
+const CLIENT_ALLOW_MAYA_CAM_OFFSET: usize = 0x3D0;
+const CLIENT_CONSTRAIN_ASPECT_RATIO_OFFSET: usize = 0x43C;
+const CLIENT_ASPECT_RATIO_OFFSET: usize = 0x440;
+const CLIENT_NEAR_PLANE_OFFSET: usize = 0x444;
 const EDITOR_VIEWPORT_CLIENTS_OFFSET: usize = 0x97C;
 const EDITOR_VIEWPORT_CLIENT_COUNT_OFFSET: usize = 0x984;
+const EDITOR_FAR_CLIPPING_PLANE_OFFSET: usize = 0x98C;
+const EDITOR_USER_SETTINGS_OFFSET: usize = 0xB88;
+const USER_SETTINGS_ASPECT_AXIS_CONSTRAINT_OFFSET: usize = 0x69;
 const HIT_PROXY_ACTOR_OFFSET: usize = 0x18;
 const HIT_PROXY_GET_TYPE_SLOT: usize = 1;
 const GET_SIZE_X_SLOT: usize = 2;
@@ -53,6 +64,14 @@ const MOVE_VIEWPORT_TO_ACTOR_PROLOGUE: &[u8] = &[
 const SINGLE_LINE_CHECK_PROLOGUE: &[u8] = &[
     0x48, 0x8B, 0xC4, 0x55, 0x41, 0x54, 0x41, 0x55, 0x48, 0x8B, 0xEC, 0x48, 0x81, 0xEC,
     0x80, 0x00, 0x00, 0x00,
+];
+const INVERSE_ROTATION_MATRIX_PROLOGUE: &[u8] = &[
+    0x4C, 0x8B, 0xDC, 0x55, 0x49, 0x8D, 0x6B, 0xD8, 0x48, 0x81, 0xEC, 0x20, 0x01, 0x00,
+    0x00,
+];
+const CALCULATE_VIEW_EXTENTS_PROLOGUE: &[u8] = &[
+    0x48, 0x89, 0x5C, 0x24, 0x08, 0x48, 0x89, 0x74, 0x24, 0x10, 0x57, 0x48, 0x83, 0xEC,
+    0x50, 0x48, 0x8B, 0x01,
 ];
 const HALF_WORLD_MAX: f32 = 262_144.0;
 const TRACE_WORLD_AND_ACTORS_COMPLEX_MATERIAL: u32 = 0x0002_2897;
@@ -74,6 +93,9 @@ type GetViewportSizeFn = unsafe extern "C" fn(*mut c_void) -> u32;
 type GetHitProxyFn = unsafe extern "C" fn(*mut c_void, i32, i32) -> *mut c_void;
 type GetHitProxyTypeFn = unsafe extern "C" fn(*mut c_void) -> *mut c_void;
 type MoveViewportToActorFn = unsafe extern "C" fn(*mut c_void, *mut c_void, u32);
+type InverseRotationMatrixFn = unsafe extern "C" fn(*mut Matrix, *const Rotator) -> *mut Matrix;
+type CalculateViewExtentsFn =
+    unsafe extern "C" fn(*mut c_void, f32, *mut i32, *mut i32, *mut u32, *mut u32);
 type SingleLineCheckFn = unsafe extern "C" fn(
     *mut c_void,
     *mut CheckResult,
@@ -126,9 +148,167 @@ impl CheckResult {
 
 const _: [(); 0x68] = [(); std::mem::size_of::<CheckResult>()];
 
+/// UE3 `FMatrix`. Row-major with row vectors, so translation lives in row 3 and
+/// `v * M` is the transform. Declared 16-byte aligned because the native
+/// `FInverseRotationMatrix` constructor writes it with aligned SSE stores.
+#[repr(C, align(16))]
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct Matrix {
+    m: [[f32; 4]; 4],
+}
+
+const _: [(); 0x40] = [(); std::mem::size_of::<Matrix>()];
+
+impl Matrix {
+    fn rows(rows: [[f32; 4]; 4]) -> Self {
+        Self { m: rows }
+    }
+
+    fn identity() -> Self {
+        Self::rows([
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ])
+    }
+
+    fn translation(delta: Vector3) -> Self {
+        Self::rows([
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 1.0, 0.0],
+            [delta.x, delta.y, delta.z, 1.0],
+        ])
+    }
+
+    fn multiply(&self, other: &Self) -> Self {
+        let mut result = [[0.0f32; 4]; 4];
+        for (row, output) in result.iter_mut().enumerate() {
+            for (column, cell) in output.iter_mut().enumerate() {
+                let mut sum = 0.0f64;
+                for inner in 0..4 {
+                    sum += self.m[row][inner] as f64 * other.m[inner][column] as f64;
+                }
+                *cell = sum as f32;
+            }
+        }
+        Self::rows(result)
+    }
+
+    /// Cofactor inverse accumulated in f64. UE3 calls D3DXMatrixInverse here;
+    /// the wider accumulator only removes float cancellation, and a view matrix
+    /// carrying a large world translation is exactly where that matters.
+    fn inverse(&self) -> Option<Self> {
+        let a: [[f64; 4]; 4] = std::array::from_fn(|row| std::array::from_fn(|col| self.m[row][col] as f64));
+        let mut cofactor = [[0.0f64; 4]; 4];
+        for row in 0..4 {
+            for column in 0..4 {
+                let minor_rows: Vec<usize> = (0..4).filter(|value| *value != row).collect();
+                let minor_columns: Vec<usize> = (0..4).filter(|value| *value != column).collect();
+                let minor = |r: usize, c: usize| a[minor_rows[r]][minor_columns[c]];
+                let determinant = minor(0, 0) * (minor(1, 1) * minor(2, 2) - minor(1, 2) * minor(2, 1))
+                    - minor(0, 1) * (minor(1, 0) * minor(2, 2) - minor(1, 2) * minor(2, 0))
+                    + minor(0, 2) * (minor(1, 0) * minor(2, 1) - minor(1, 1) * minor(2, 0));
+                let sign = if (row + column) % 2 == 0 { 1.0 } else { -1.0 };
+                // Transposed on write: adjugate = transpose of the cofactors.
+                cofactor[column][row] = sign * determinant;
+            }
+        }
+        let determinant = (0..4).map(|column| a[0][column] * cofactor[column][0]).sum::<f64>();
+        if !determinant.is_finite() || determinant.abs() < 1e-12 {
+            return None;
+        }
+        let mut result = [[0.0f32; 4]; 4];
+        for row in 0..4 {
+            for column in 0..4 {
+                let value = cofactor[row][column] / determinant;
+                if !value.is_finite() {
+                    return None;
+                }
+                result[row][column] = value as f32;
+            }
+        }
+        Some(Self::rows(result))
+    }
+
+    fn transform_vector4(&self, point: [f64; 4]) -> [f64; 4] {
+        std::array::from_fn(|column| {
+            (0..4)
+                .map(|row| point[row] * self.m[row][column] as f64)
+                .sum()
+        })
+    }
+
+    fn transform_normal(&self, normal: [f64; 3]) -> [f64; 3] {
+        let transformed = self.transform_vector4([normal[0], normal[1], normal[2], 0.0]);
+        [transformed[0], transformed[1], transformed[2]]
+    }
+
+    fn origin(&self) -> [f64; 3] {
+        [
+            self.m[3][0] as f64,
+            self.m[3][1] as f64,
+            self.m[3][2] as f64,
+        ]
+    }
+}
+
+fn safe_normal(vector: [f64; 3]) -> [f64; 3] {
+    let square = vector[0] * vector[0] + vector[1] * vector[1] + vector[2] * vector[2];
+    // UE3's SafeNormal leaves a degenerate vector at zero rather than dividing.
+    if square < 1e-16 {
+        return [0.0, 0.0, 0.0];
+    }
+    let length = square.sqrt();
+    [vector[0] / length, vector[1] / length, vector[2] / length]
+}
+
+/// How a ray was produced. The exact path is UE3's own scene view; the derived
+/// path is the older camera-field approximation kept as a labelled fallback.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RaySource {
+    SceneView,
+    CameraFields,
+}
+
+impl RaySource {
+    fn approximate(self) -> bool {
+        self == RaySource::CameraFields
+    }
+
+    fn projection(self) -> &'static str {
+        match self {
+            RaySource::SceneView => {
+                "exact UE3 scene view (CalcSceneView projection + FViewportCursorLocation)"
+            }
+            RaySource::CameraFields => "camera-derived perspective approximation",
+        }
+    }
+
+    fn note(self) -> &'static str {
+        match self {
+            RaySource::SceneView => {
+                "Built from the same view and projection matrices CalcSceneView hands the renderer, \
+                 so aspect constraints, near/far plane overrides and orthographic viewports are included."
+            }
+            RaySource::CameraFields => {
+                "Derived from camera location, rotation and FOV only. It does not include UE3 \
+                 projection-matrix overrides, aspect-ratio constraints or orthographic projection."
+            }
+        }
+    }
+}
+
 struct CameraRay {
     origin: Vector3,
     direction: Vector3,
+    source: RaySource,
+    /// Perspective rays start at the eye, so UE3 traces HALF_WORLD_MAX from
+    /// there. An orthographic ray starts a world-radius behind the view plane,
+    /// so the same length would stop at the camera plane and miss the scene.
+    trace_distance: f32,
+    fallback_reason: Option<String>,
 }
 
 #[derive(Clone)]
@@ -535,6 +715,367 @@ fn proxy_json(info: &ProxyInfo) -> Result<String, String> {
     ))
 }
 
+/// The projection and view state CalcSceneView would hand the renderer for this
+/// viewport, reproduced without calling CalcSceneView itself: that function
+/// pushes camera state onto other viewport clients, schedules redraws, resolves
+/// post-process volumes and can run an Exec, none of which a read tool may do.
+struct SceneView {
+    view_matrix: Matrix,
+    projection_matrix: Matrix,
+    /// Letterbox offset from CalculateViewExtents; zero unless the viewport
+    /// constrains its aspect ratio.
+    view_x: i32,
+    view_y: i32,
+    size_x: u32,
+    size_y: u32,
+    perspective: bool,
+    constrained_aspect_ratio: bool,
+    /// GNearClippingPlane, read once here so the ray math stays pure.
+    near_clipping_plane: f32,
+}
+
+fn perspective_matrix(
+    half_fov_x: f32,
+    half_fov_y: f32,
+    mult_fov_x: f32,
+    mult_fov_y: f32,
+    min_z: f32,
+    max_z: f32,
+) -> Matrix {
+    const Z_PRECISION: f32 = 0.001;
+    // MinZ == MaxZ is UE3's marker for an infinite far plane, not a degenerate
+    // range; CalcSceneView sets MaxZ = MinZ deliberately to select it.
+    let depth = if min_z == max_z {
+        1.0 - Z_PRECISION
+    } else {
+        max_z / (max_z - min_z)
+    };
+    Matrix::rows([
+        [mult_fov_x / half_fov_x.tan(), 0.0, 0.0, 0.0],
+        [0.0, mult_fov_y / half_fov_y.tan(), 0.0, 0.0],
+        [0.0, 0.0, depth, 1.0],
+        [0.0, 0.0, -min_z * depth, 0.0],
+    ])
+}
+
+fn ortho_matrix(width: f32, height: f32, z_scale: f32, z_offset: f32) -> Matrix {
+    Matrix::rows([
+        [1.0 / width, 0.0, 0.0, 0.0],
+        [0.0, 1.0 / height, 0.0, 0.0],
+        [0.0, 0.0, z_scale, 0.0],
+        [0.0, 0.0, z_offset * z_scale, 1.0],
+    ])
+}
+
+/// UE3 builds its rotation matrices from a 16384-entry trig table rather than
+/// from libm, so the only way to land on the same matrix the renderer used is
+/// to call the engine's own constructor.
+fn native_inverse_rotation_matrix(rotation: Rotator) -> Result<Matrix, String> {
+    let function: InverseRotationMatrixFn = unsafe {
+        std::mem::transmute(mapped_function(
+            INVERSE_ROTATION_MATRIX_RVA,
+            "FInverseRotationMatrix::FInverseRotationMatrix",
+            INVERSE_ROTATION_MATRIX_PROLOGUE,
+        )?)
+    };
+    let mut result = Matrix::identity();
+    unsafe { function(&mut result, &rotation) };
+    Ok(result)
+}
+
+fn native_view_extents(
+    viewport: *mut c_void,
+    aspect_ratio: f32,
+    size_x: u32,
+    size_y: u32,
+) -> Result<(i32, i32, u32, u32), String> {
+    let function: CalculateViewExtentsFn = unsafe {
+        std::mem::transmute(mapped_function(
+            CALCULATE_VIEW_EXTENTS_RVA,
+            "FViewport::CalculateViewExtents",
+            CALCULATE_VIEW_EXTENTS_PROLOGUE,
+        )?)
+    };
+    let mut x = 0i32;
+    let mut y = 0i32;
+    let mut width = size_x;
+    let mut height = size_y;
+    unsafe { function(viewport, aspect_ratio, &mut x, &mut y, &mut width, &mut height) };
+    if width == 0 || height == 0 {
+        return Err("the constrained view extents collapsed to zero".to_string());
+    }
+    Ok((x, y, width, height))
+}
+
+fn aspect_axis_multipliers(editor: *mut c_void, size_x: u32, size_y: u32) -> Result<(f32, f32), String> {
+    // GetUserSettings() lazily constructs a UObject on first use. CalcSceneView
+    // has already called it for every frame this viewport has drawn, so the
+    // pointer is read rather than a UObject allocated from a read tool.
+    let settings = unsafe { read_pointer(editor, EDITOR_USER_SETTINGS_OFFSET) };
+    if settings.is_null() {
+        return Err("the editor has not created its user settings yet".to_string());
+    }
+    let constraint = unsafe {
+        *((settings as *const u8).add(USER_SETTINGS_ASPECT_AXIS_CONSTRAINT_OFFSET))
+    };
+    // 1 is AspectRatio_MaintainXFOV and 2 is AspectRatio_MajorAxisFOV, read back
+    // from the comparisons the target build performs at this site.
+    if (size_x > size_y && constraint == 2) || constraint == 1 {
+        Ok((1.0, size_x as f32 / size_y as f32))
+    } else {
+        Ok((size_y as f32 / size_x as f32, 1.0))
+    }
+}
+
+fn scene_view(
+    editor: *mut c_void,
+    client: *mut c_void,
+    viewport: *mut c_void,
+) -> Result<SceneView, String> {
+    let (size_x, size_y) = unsafe { viewport_size(viewport)? };
+    let viewport_type = unsafe { *((client as *const u8).add(CLIENT_TYPE_OFFSET) as *const i32) };
+    let location = unsafe { *((client as *const u8).add(CLIENT_LOCATION_OFFSET) as *const Vector3) };
+    let translation = Matrix::translation(Vector3 {
+        x: -location.x,
+        y: -location.y,
+        z: -location.z,
+    });
+
+    let (view_matrix, perspective) = match viewport_type {
+        0 => (
+            translation.multiply(&Matrix::rows([
+                [0.0, 1.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, -1.0, 0.0],
+                [0.0, 0.0, -location.z, 1.0],
+            ])),
+            false,
+        ),
+        1 => (
+            translation.multiply(&Matrix::rows([
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, -1.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, -location.y, 1.0],
+            ])),
+            false,
+        ),
+        2 => (
+            translation.multiply(&Matrix::rows([
+                [0.0, 0.0, 1.0, 0.0],
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, location.x, 1.0],
+            ])),
+            false,
+        ),
+        3 => {
+            // A viewport that allows the Maya camera builds its view matrix from
+            // orbit state instead, and CalcSceneView writes location/rotation
+            // back while doing it. Refuse the exact path rather than reproduce
+            // half of it.
+            let maya = unsafe {
+                *((client as *const u8).add(CLIENT_ALLOW_MAYA_CAM_OFFSET) as *const i32)
+            };
+            if maya != 0 {
+                return Err(
+                    "this viewport allows the Maya orbit camera, whose view matrix is not derived \
+                     from the camera fields"
+                        .to_string(),
+                );
+            }
+            let rotation =
+                unsafe { *((client as *const u8).add(CLIENT_ROTATION_OFFSET) as *const Rotator) };
+            let rotated = translation.multiply(&native_inverse_rotation_matrix(rotation)?);
+            (
+                rotated.multiply(&Matrix::rows([
+                    [0.0, 0.0, 1.0, 0.0],
+                    [1.0, 0.0, 0.0, 0.0],
+                    [0.0, 1.0, 0.0, 0.0],
+                    [0.0, 0.0, 0.0, 1.0],
+                ])),
+                true,
+            )
+        }
+        other => return Err(format!("unknown viewport type {other}")),
+    };
+
+    let near_clipping_plane = unsafe {
+        *(image_address(GNEAR_CLIPPING_PLANE_RVA, 4, "GNearClippingPlane")
+            .map_err(|error| error.to_string())? as *const f32)
+    };
+    if !near_clipping_plane.is_finite() || near_clipping_plane <= 0.0 {
+        return Err("GNearClippingPlane is invalid".to_string());
+    }
+
+    let mut view_x = 0i32;
+    let mut view_y = 0i32;
+    let mut view_size_x = size_x;
+    let mut view_size_y = size_y;
+    let mut constrained_aspect_ratio = false;
+
+    let projection_matrix = if perspective {
+        let fov = unsafe { *((client as *const u8).add(CLIENT_FOV_OFFSET) as *const f32) };
+        if !fov.is_finite() || !(1.0..179.0).contains(&fov) {
+            return Err("the viewport FOV is invalid".to_string());
+        }
+        let near_plane =
+            unsafe { *((client as *const u8).add(CLIENT_NEAR_PLANE_OFFSET) as *const f32) };
+        if !near_plane.is_finite() || near_plane <= 0.0 {
+            return Err("the viewport near plane is invalid".to_string());
+        }
+        let variable_far_plane = unsafe {
+            *((client as *const u8).add(CLIENT_VARIABLE_FAR_PLANE_OFFSET) as *const i32)
+        };
+        let far_clipping_plane = unsafe {
+            *((editor as *const u8).add(EDITOR_FAR_CLIPPING_PLANE_OFFSET) as *const f32)
+        };
+        let max_z = if variable_far_plane != 0 && far_clipping_plane > near_clipping_plane {
+            far_clipping_plane
+        } else {
+            near_plane
+        };
+        let matrix_fov = fov * std::f32::consts::PI / 360.0;
+        constrained_aspect_ratio = unsafe {
+            *((client as *const u8).add(CLIENT_CONSTRAIN_ASPECT_RATIO_OFFSET) as *const i32) != 0
+        };
+        if constrained_aspect_ratio {
+            let aspect_ratio =
+                unsafe { *((client as *const u8).add(CLIENT_ASPECT_RATIO_OFFSET) as *const f32) };
+            if !aspect_ratio.is_finite() || aspect_ratio <= 0.0 {
+                return Err("the constrained aspect ratio is invalid".to_string());
+            }
+            let extents = native_view_extents(viewport, aspect_ratio, size_x, size_y)?;
+            view_x = extents.0;
+            view_y = extents.1;
+            view_size_x = extents.2;
+            view_size_y = extents.3;
+            perspective_matrix(matrix_fov, matrix_fov, 1.0, aspect_ratio, near_plane, max_z)
+        } else {
+            let (x_multiplier, y_multiplier) = aspect_axis_multipliers(editor, size_x, size_y)?;
+            perspective_matrix(
+                matrix_fov,
+                matrix_fov,
+                x_multiplier,
+                y_multiplier,
+                near_plane,
+                max_z,
+            )
+        }
+    } else {
+        let ortho_zoom =
+            unsafe { *((client as *const u8).add(CLIENT_ORTHO_ZOOM_OFFSET) as *const f32) };
+        if !ortho_zoom.is_finite() || ortho_zoom <= 0.0 {
+            return Err("the orthographic zoom is invalid".to_string());
+        }
+        // CAMERA_ZOOM_DIV is (Viewport->GetSizeX() * 15.0f), so the divisor is
+        // the full viewport width even when the view is letterboxed.
+        let zoom = ortho_zoom / (size_x as f32 * 15.0);
+        ortho_matrix(
+            zoom * size_x as f32 / 2.0,
+            zoom * size_y as f32 / 2.0,
+            0.5 / HALF_WORLD_MAX,
+            HALF_WORLD_MAX,
+        )
+    };
+
+    Ok(SceneView {
+        view_matrix,
+        projection_matrix,
+        view_x,
+        view_y,
+        size_x: view_size_x,
+        size_y: view_size_y,
+        perspective,
+        constrained_aspect_ratio,
+        near_clipping_plane,
+    })
+}
+
+/// `FViewportCursorLocation`, the helper behind every editor click, drag and
+/// placement. Matching it - rather than `DeprojectFVector2D`, which takes a
+/// different route to a near-identical answer - is what makes a returned ray the
+/// same ray the editor would have used for the same pixel.
+fn scene_view_ray(view: &SceneView, x: i32, y: i32) -> Result<CameraRay, String> {
+    let inverse_view = view
+        .view_matrix
+        .inverse()
+        .ok_or_else(|| "the viewport view matrix is not invertible".to_string())?;
+    let inverse_projection = view
+        .projection_matrix
+        .inverse()
+        .ok_or_else(|| "the viewport projection matrix is not invertible".to_string())?;
+    // PixelToScreen. UE3 passes raw viewport pixels here and does not subtract
+    // the letterbox offset, so a constrained view is reproduced with its own
+    // skew rather than silently corrected.
+    let screen_x = -1.0 + (x as f64 / view.size_x as f64) * 2.0;
+    let screen_y = 1.0 + (y as f64 / view.size_y as f64) * -2.0;
+
+    let (origin, direction, trace_distance) = if view.perspective {
+        let near = view.near_clipping_plane as f64;
+        let view_space = inverse_projection.transform_vector4([
+            screen_x * near,
+            screen_y * near,
+            0.0,
+            near,
+        ]);
+        let direction = safe_normal(inverse_view.transform_normal([
+            view_space[0],
+            view_space[1],
+            view_space[2],
+        ]));
+        (inverse_view.origin(), direction, HALF_WORLD_MAX)
+    } else {
+        let view_space = inverse_projection.transform_vector4([screen_x, screen_y, 0.0, 1.0]);
+        let world = inverse_view.transform_vector4(view_space);
+        let direction = safe_normal(inverse_view.transform_normal([0.0, 0.0, 1.0]));
+        // The orthographic ray starts a world radius behind the view plane, so
+        // it needs twice that length to cross the whole world in front of it.
+        ([world[0], world[1], world[2]], direction, HALF_WORLD_MAX * 2.0)
+    };
+    if direction == [0.0, 0.0, 0.0] {
+        return Err("the viewport produced a degenerate ray direction".to_string());
+    }
+    Ok(CameraRay {
+        origin: Vector3 {
+            x: origin[0] as f32,
+            y: origin[1] as f32,
+            z: origin[2] as f32,
+        },
+        direction: Vector3 {
+            x: direction[0] as f32,
+            y: direction[1] as f32,
+            z: direction[2] as f32,
+        },
+        source: RaySource::SceneView,
+        trace_distance,
+        fallback_reason: None,
+    })
+}
+
+/// Exact first, with the camera-field approximation kept only for the cases the
+/// exact path refuses. A caller can tell which it got from `approximate`.
+fn viewport_ray(
+    editor: *mut c_void,
+    client: *mut c_void,
+    viewport: *mut c_void,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+) -> Result<CameraRay, String> {
+    let exact = scene_view(editor, client, viewport)
+        .and_then(|view| scene_view_ray(&view, x, y));
+    let reason = match exact {
+        Ok(ray) => return Ok(ray),
+        Err(reason) => reason,
+    };
+    let mut fallback = camera_ray(client, x, y, width, height)
+        .map_err(|error| format!("{reason}; the camera-derived fallback also failed: {error}"))?;
+    fallback.fallback_reason = Some(reason);
+    Ok(fallback)
+}
+
 fn camera_ray(
     client: *mut c_void,
     x: i32,
@@ -591,19 +1132,32 @@ fn camera_ray(
             y: direction[1] as f32,
             z: direction[2] as f32,
         },
+        source: RaySource::CameraFields,
+        trace_distance: HALF_WORLD_MAX,
+        fallback_reason: None,
     })
 }
 
 fn camera_ray_json(ray: &Result<CameraRay, String>) -> String {
     match ray {
         Ok(ray) => format!(
-            r#"{{"available":true,"origin":{{"x":{},"y":{},"z":{}}},"direction":{{"x":{},"y":{},"z":{}}},"projection":"camera-derived perspective","approximate":true,"note":"The hit-proxy identity is exact. The ray is derived from camera fields and does not yet include UE3 projection-matrix overrides."}}"#,
+            r#"{{"available":true,"origin":{{"x":{},"y":{},"z":{}}},"direction":{{"x":{},"y":{},"z":{}}},"projection":"{}","approximate":{},"traceDistance":{},"fallbackReason":{},"note":"The hit-proxy identity is exact. {}"}}"#,
             ray.origin.x,
             ray.origin.y,
             ray.origin.z,
             ray.direction.x,
             ray.direction.y,
             ray.direction.z,
+            ray.source.projection(),
+            ray.source.approximate(),
+            ray.trace_distance,
+            ray.fallback_reason
+                .as_ref()
+                .map_or_else(|| "null".to_string(), |reason| format!(
+                    "\"{}\"",
+                    json_escape(reason)
+                )),
+            ray.source.note(),
         ),
         Err(reason) => format!(
             r#"{{"available":false,"reason":"{}"}}"#,
@@ -614,8 +1168,9 @@ fn camera_ray_json(ray: &Result<CameraRay, String>) -> String {
 
 fn world_trace_json(ray: &Result<CameraRay, String>) -> Result<String, String> {
     let Ok(ray) = ray else {
-        return Ok(r#"{"available":false,"reason":"no perspective camera ray is available"}"#.to_string());
+        return Ok(r#"{"available":false,"reason":"no viewport ray is available"}"#.to_string());
     };
+    let approximate = ray.source.approximate();
     let world_slot = image_address(GWORLD_RVA, std::mem::size_of::<usize>(), "GWorld")
         .map_err(|error| error.to_string())? as *const *mut c_void;
     let world = unsafe { *world_slot };
@@ -630,9 +1185,9 @@ fn world_trace_json(ray: &Result<CameraRay, String>) -> Result<String, String> {
         )?)
     };
     let end = Vector3 {
-        x: ray.origin.x + ray.direction.x * HALF_WORLD_MAX,
-        y: ray.origin.y + ray.direction.y * HALF_WORLD_MAX,
-        z: ray.origin.z + ray.direction.z * HALF_WORLD_MAX,
+        x: ray.origin.x + ray.direction.x * ray.trace_distance,
+        y: ray.origin.y + ray.direction.y * ray.trace_distance,
+        z: ray.origin.z + ray.direction.z * ray.trace_distance,
     };
     let extent = Vector3 { x: 0.0, y: 0.0, z: 0.0 };
     let mut hit = CheckResult::empty();
@@ -650,8 +1205,14 @@ fn world_trace_json(ray: &Result<CameraRay, String>) -> Result<String, String> {
     };
     if clear {
         return Ok(format!(
-            r#"{{"available":true,"hit":false,"start":{{"x":{},"y":{},"z":{}}},"end":{{"x":{},"y":{},"z":{}}},"distance":{HALF_WORLD_MAX},"rayApproximate":true}}"#,
-            ray.origin.x, ray.origin.y, ray.origin.z, end.x, end.y, end.z
+            r#"{{"available":true,"hit":false,"start":{{"x":{},"y":{},"z":{}}},"end":{{"x":{},"y":{},"z":{}}},"distance":{},"rayApproximate":{approximate}}}"#,
+            ray.origin.x,
+            ray.origin.y,
+            ray.origin.z,
+            end.x,
+            end.y,
+            end.z,
+            ray.trace_distance,
         ));
     }
     let dx = hit.location.x - ray.origin.x;
@@ -659,7 +1220,7 @@ fn world_trace_json(ray: &Result<CameraRay, String>) -> Result<String, String> {
     let dz = hit.location.z - ray.origin.z;
     let distance = (dx * dx + dy * dy + dz * dz).sqrt();
     Ok(format!(
-        r#"{{"available":true,"hit":true,"location":{{"x":{},"y":{},"z":{}}},"normal":{{"x":{},"y":{},"z":{}}},"distance":{distance},"time":{},"item":{},"startPenetrating":{},"actor":{},"component":{},"material":{},"physicalMaterial":{},"level":{},"levelIndex":{},"traceFlags":["world","actors","complexCollision","material"],"rayApproximate":true}}"#,
+        r#"{{"available":true,"hit":true,"location":{{"x":{},"y":{},"z":{}}},"normal":{{"x":{},"y":{},"z":{}}},"distance":{distance},"time":{},"item":{},"startPenetrating":{},"actor":{},"component":{},"material":{},"physicalMaterial":{},"level":{},"levelIndex":{},"traceFlags":["world","actors","complexCollision","material"],"rayApproximate":{approximate}}}"#,
         hit.location.x,
         hit.location.y,
         hit.location.z,
@@ -692,7 +1253,7 @@ pub(super) fn inspect_point(
         ));
     }
     let info = get_hit_proxy(hit_proxy_function()?, viewport, x, y);
-    let ray = camera_ray(client, x, y, width, height);
+    let ray = viewport_ray(editor, client, viewport, x, y, width, height);
     let selected_index = info
         .actor
         .and_then(|actor| selected.iter().position(|selected| *selected == actor))
@@ -702,15 +1263,43 @@ pub(super) fn inspect_point(
         None => "null".to_string(),
     };
     Ok(format!(
-        r#"{{"viewportSelection":"{}","screenPoint":{{"x":{x},"y":{y},"normalizedX":{},"normalizedY":{}}},"camera":{},"cameraRay":{},"worldTrace":{},"hitProxy":{},"selectedActorIndex":{selected_index},"actor":{actor},"mapChanged":false,"selectionChanged":false}}"#,
+        r#"{{"viewportSelection":"{}","screenPoint":{{"x":{x},"y":{y},"normalizedX":{},"normalizedY":{}}},"camera":{},"sceneView":{},"cameraRay":{},"worldTrace":{},"hitProxy":{},"selectedActorIndex":{selected_index},"actor":{actor},"mapChanged":false,"selectionChanged":false}}"#,
         if was_active { "active" } else { "editor_fallback" },
         (x as f64 + 0.5) / width as f64,
         (y as f64 + 0.5) / height as f64,
         camera_json(client, width, height),
+        scene_view_json(editor, client, viewport),
         camera_ray_json(&ray),
         world_trace_json(&ray)?,
         proxy_json(&info)?,
     ))
+}
+
+fn scene_view_json(
+    editor: *mut c_void,
+    client: *mut c_void,
+    viewport: *mut c_void,
+) -> String {
+    match scene_view(editor, client, viewport) {
+        Ok(view) => format!(
+            r#"{{"available":true,"projection":"{}","viewX":{},"viewY":{},"viewSizeX":{},"viewSizeY":{},"constrainedAspectRatio":{},"letterboxed":{}}}"#,
+            if view.perspective {
+                "perspective"
+            } else {
+                "orthographic"
+            },
+            view.view_x,
+            view.view_y,
+            view.size_x,
+            view.size_y,
+            view.constrained_aspect_ratio,
+            view.view_x != 0 || view.view_y != 0,
+        ),
+        Err(reason) => format!(
+            r#"{{"available":false,"reason":"{}"}}"#,
+            json_escape(&reason)
+        ),
+    }
 }
 
 pub(super) fn validate_scan(
@@ -1320,6 +1909,186 @@ mod tests {
         assert_eq!(i32::from_le_bytes(bytes[22..26].try_into().unwrap()), -1);
         assert_eq!(u16::from_le_bytes(bytes[28..30].try_into().unwrap()), 32);
         assert_eq!(bytes.len(), 62);
+    }
+
+    /// A view built the way CalcSceneView builds one for a perspective level
+    /// viewport looking down +X, without the native rotation matrix: at zero
+    /// rotation FInverseRotationMatrix is the identity, so the whole view
+    /// matrix reduces to the translation and the basis swap.
+    fn test_perspective_view(size_x: u32, size_y: u32, fov_degrees: f32) -> SceneView {
+        let location = Vector3 { x: 10.0, y: 20.0, z: 30.0 };
+        let view_matrix = Matrix::translation(Vector3 {
+            x: -location.x,
+            y: -location.y,
+            z: -location.z,
+        })
+        .multiply(&Matrix::identity())
+        .multiply(&Matrix::rows([
+            [0.0, 0.0, 1.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 1.0],
+        ]));
+        let matrix_fov = fov_degrees * std::f32::consts::PI / 360.0;
+        let (x_multiplier, y_multiplier) = if size_x > size_y {
+            (1.0, size_x as f32 / size_y as f32)
+        } else {
+            (size_y as f32 / size_x as f32, 1.0)
+        };
+        SceneView {
+            view_matrix,
+            projection_matrix: perspective_matrix(
+                matrix_fov,
+                matrix_fov,
+                x_multiplier,
+                y_multiplier,
+                10.0,
+                10.0,
+            ),
+            view_x: 0,
+            view_y: 0,
+            size_x,
+            size_y,
+            perspective: true,
+            constrained_aspect_ratio: false,
+            near_clipping_plane: 10.0,
+        }
+    }
+
+    #[test]
+    fn matrix_inverse_round_trips_a_view_matrix() {
+        let view = test_perspective_view(1280, 720, 90.0);
+        let inverse = view.view_matrix.inverse().expect("invertible");
+        let product = view.view_matrix.multiply(&inverse);
+        let identity = Matrix::identity();
+        for row in 0..4 {
+            for column in 0..4 {
+                assert!(
+                    (product.m[row][column] - identity.m[row][column]).abs() < 1e-4,
+                    "M*inv(M) is not identity at [{row}][{column}]: {}",
+                    product.m[row][column]
+                );
+            }
+        }
+        // The inverse of the view matrix carries the camera position.
+        assert!((inverse.origin()[0] - 10.0).abs() < 1e-3);
+        assert!((inverse.origin()[1] - 20.0).abs() < 1e-3);
+        assert!((inverse.origin()[2] - 30.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn matrix_inverse_refuses_a_singular_matrix() {
+        let mut singular = Matrix::identity();
+        singular.m[2][2] = 0.0;
+        assert!(singular.inverse().is_none());
+    }
+
+    #[test]
+    fn perspective_center_ray_points_along_the_camera_forward_axis() {
+        let view = test_perspective_view(1280, 720, 90.0);
+        let ray = scene_view_ray(&view, 640, 360).expect("center ray");
+        assert_eq!(ray.source, RaySource::SceneView);
+        assert!(!ray.source.approximate());
+        // A zero rotator faces +X, and the eye is the camera location.
+        assert!((ray.direction.x - 1.0).abs() < 1e-4, "{:?}", ray.direction.x);
+        assert!(ray.direction.y.abs() < 1e-4);
+        assert!(ray.direction.z.abs() < 1e-4);
+        assert!((ray.origin.x - 10.0).abs() < 1e-3);
+        assert!((ray.origin.y - 20.0).abs() < 1e-3);
+        assert!((ray.origin.z - 30.0).abs() < 1e-3);
+    }
+
+    #[test]
+    fn perspective_corner_rays_are_symmetric_and_match_the_field_of_view() {
+        let view = test_perspective_view(1280, 720, 90.0);
+        let left = scene_view_ray(&view, 0, 360).expect("left ray");
+        let right = scene_view_ray(&view, 1280, 360).expect("right ray");
+        // Horizontal FOV is 90 degrees, so each edge sits 45 degrees off centre
+        // and the two edges mirror each other about the view axis.
+        assert!((left.direction.y + right.direction.y).abs() < 1e-4);
+        assert!((left.direction.x - right.direction.x).abs() < 1e-4);
+        let half_angle = (right.direction.y as f64).atan2(right.direction.x as f64);
+        assert!(
+            (half_angle.to_degrees() - 45.0).abs() < 0.05,
+            "half angle was {}",
+            half_angle.to_degrees()
+        );
+        let top = scene_view_ray(&view, 640, 0).expect("top ray");
+        let bottom = scene_view_ray(&view, 640, 720).expect("bottom ray");
+        assert!((top.direction.z + bottom.direction.z).abs() < 1e-4);
+        // 720p at a 90 degree horizontal FOV is a 58.7 degree vertical FOV.
+        let vertical = (top.direction.z as f64).atan2(top.direction.x as f64);
+        assert!(
+            (vertical.to_degrees() - 29.36).abs() < 0.1,
+            "vertical half angle was {}",
+            vertical.to_degrees()
+        );
+    }
+
+    #[test]
+    fn orthographic_rays_are_parallel_with_per_pixel_origins() {
+        // LVT_OrthoXY looks down -Z from the camera plane.
+        let location = Vector3 { x: 100.0, y: 200.0, z: 300.0 };
+        let view_matrix = Matrix::translation(Vector3 {
+            x: -location.x,
+            y: -location.y,
+            z: -location.z,
+        })
+        .multiply(&Matrix::rows([
+            [0.0, 1.0, 0.0, 0.0],
+            [1.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, -1.0, 0.0],
+            [0.0, 0.0, -location.z, 1.0],
+        ]));
+        let zoom = 1500.0 / (1000.0 * 15.0);
+        let view = SceneView {
+            view_matrix,
+            projection_matrix: ortho_matrix(
+                zoom * 1000.0 / 2.0,
+                zoom * 500.0 / 2.0,
+                0.5 / HALF_WORLD_MAX,
+                HALF_WORLD_MAX,
+            ),
+            view_x: 0,
+            view_y: 0,
+            size_x: 1000,
+            size_y: 500,
+            perspective: false,
+            constrained_aspect_ratio: false,
+            near_clipping_plane: 10.0,
+        };
+        let center = scene_view_ray(&view, 500, 250).expect("center ray");
+        let corner = scene_view_ray(&view, 0, 0).expect("corner ray");
+        // Parallel projection: one direction for every pixel.
+        assert!((center.direction.x - corner.direction.x).abs() < 1e-5);
+        assert!((center.direction.y - corner.direction.y).abs() < 1e-5);
+        assert!((center.direction.z - corner.direction.z).abs() < 1e-5);
+        assert!((center.direction.z + 1.0).abs() < 1e-4, "{}", center.direction.z);
+        // Distinct origins per pixel across the projection plane.
+        assert!((center.origin.x - corner.origin.x).abs() > 1.0);
+        // The ortho view matrix cancels its own Z translation, so the near
+        // plane sits a world radius up regardless of where the camera is. That
+        // is why a HALF_WORLD_MAX trace would stop at Z=0 and miss everything
+        // below it, and why the orthographic trace length is doubled.
+        assert!((center.origin.z - HALF_WORLD_MAX).abs() < 1.0, "{}", center.origin.z);
+        assert_eq!(corner.trace_distance, HALF_WORLD_MAX * 2.0);
+        assert_eq!(center.trace_distance, HALF_WORLD_MAX * 2.0);
+    }
+
+    #[test]
+    fn infinite_far_plane_is_selected_when_min_and_max_z_match() {
+        let infinite = perspective_matrix(0.5, 0.5, 1.0, 1.0, 10.0, 10.0);
+        assert!((infinite.m[2][2] - 0.999).abs() < 1e-6);
+        let finite = perspective_matrix(0.5, 0.5, 1.0, 1.0, 10.0, 20.0);
+        assert!((finite.m[2][2] - 2.0).abs() < 1e-6);
+        assert!((finite.m[3][2] + 20.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn ray_source_labels_only_call_the_scene_view_exact() {
+        assert!(!RaySource::SceneView.approximate());
+        assert!(RaySource::CameraFields.approximate());
+        assert!(RaySource::CameraFields.projection().contains("approximation"));
     }
 
     #[test]
