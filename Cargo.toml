@@ -41,6 +41,7 @@ features = [
 	"Win32_Graphics_Gdi",
 	"Win32_UI_WindowsAndMessaging",
 	"Win32_UI_Controls",
+	"Win32_UI_Input_KeyboardAndMouse",
 	"Win32_Media_Audio",
 	"Win32_Media_Audio_XAudio2",
 	"Win32_Media_Multimedia",

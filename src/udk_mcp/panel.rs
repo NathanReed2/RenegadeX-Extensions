@@ -1,5 +1,18 @@
-//! The in-editor control panel for [`super::policy`], and the menu item that
-//! opens it.
+//! The in-editor control panel for the MCP bridge - its capability policy and
+//! its server lifecycle - and the Tools menu that reaches it.
+//!
+//! # What is on the menu
+//!
+//! `Tools > RenX MCP` holds everything: the control panel, a status report, and
+//! Start / Stop / Restart for the server. Start and Stop grey themselves out
+//! according to what the server is actually doing, so the menu shows its state
+//! before anything is clicked. The same three actions are on the panel, routed
+//! through the same functions so the two surfaces cannot disagree.
+//!
+//! It hangs off Tools rather than sitting on the menu bar because the bar is the
+//! editor's, and a tenth top-level menu next to Help reads as part of UnrealEd
+//! rather than as something injected. Tools is found by label, never by index -
+//! see [`find_tools_menu`].
 //!
 //! # Why this is a tool window and not a browser tab
 //!
@@ -45,31 +58,47 @@ use windows::Win32::Graphics::Gdi::{
     COLOR_WINDOW, COLOR_WINDOWTEXT, DEFAULT_GUI_FONT, HDC, TRANSPARENT,
 };
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::Win32::UI::Input::KeyboardAndMouse::EnableWindow;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 use super::policy::{self, Capability, ALL, ALL_MODES};
 use crate::patch_utils::debug_log;
 
-/// Command id for our menu item. wx allocates its own ids from a low range and
-/// from negatives, so a value up near the top of the `WM_COMMAND` menu space is
-/// the least likely to collide with one the editor already uses.
-const MENU_COMMAND_ID: usize = 0x7F31;
+/// Command ids for our menu items. wx allocates its own ids from a low range and
+/// from negatives, so values up near the top of the `WM_COMMAND` menu space are
+/// the least likely to collide with ones the editor already uses.
+const MENU_PANEL_ID: usize = 0x7F31;
+const MENU_STATUS_ID: usize = 0x7F32;
+const MENU_START_ID: usize = 0x7F33;
+const MENU_STOP_ID: usize = 0x7F34;
+const MENU_RESTART_ID: usize = 0x7F35;
 
 /// Child control ids. Modes occupy `[MODE_BASE, MODE_BASE + ALL_MODES.len())`
 /// and capabilities `[CAP_BASE, CAP_BASE + ALL.len())`, so a `WM_COMMAND` maps
 /// back to its subject by subtraction.
 const MODE_BASE: usize = 0x1000;
 const CAP_BASE: usize = 0x2000;
+/// The server section's own controls, above both ranges.
+const SERVER_STATUS_TEXT: usize = 0x3000;
+const SERVER_START_BUTTON: usize = 0x3001;
+const SERVER_STOP_BUTTON: usize = 0x3002;
+const SERVER_RESTART_BUTTON: usize = 0x3003;
+const SERVER_DETAILS_BUTTON: usize = 0x3004;
 
 const PANEL_WIDTH: i32 = 470;
 const MARGIN: i32 = 14;
 const ROW_HEIGHT: i32 = 22;
+const BUTTON_HEIGHT: i32 = 26;
+const BUTTON_WIDTH: i32 = 104;
 
 static PANEL_HWND: AtomicIsize = AtomicIsize::new(0);
 static EDITOR_FRAME: AtomicIsize = AtomicIsize::new(0);
 static ORIGINAL_WNDPROC: AtomicIsize = AtomicIsize::new(0);
 static CLASS_REGISTERED: AtomicBool = AtomicBool::new(false);
 static MENU_ADDED: AtomicBool = AtomicBool::new(false);
+/// Our popup under Tools, so `WM_INITMENUPOPUP` can tell it apart from the
+/// editor's own menus before touching any item state.
+static SUBMENU: AtomicIsize = AtomicIsize::new(0);
 
 fn hinstance() -> HINSTANCE {
     unsafe { GetModuleHandleW(None) }
@@ -149,37 +178,101 @@ fn menu_item_present() -> bool {
     if menu.0 == 0 {
         return false;
     }
-    // A menu item we added is still there if its id still resolves to a state.
-    unsafe { GetMenuState(menu, MENU_COMMAND_ID as u32, MF_BYCOMMAND) != u32::MAX }
+    // `MF_BYCOMMAND` searches submenus as well as the bar, so this still finds
+    // the item now that it lives under Tools rather than on the bar itself.
+    unsafe { GetMenuState(menu, MENU_PANEL_ID as u32, MF_BYCOMMAND) != u32::MAX }
 }
 
-/// Appends the item to the editor's menu bar and subclasses the frame so its
-/// `WM_COMMAND` reaches us.
+fn menu_item_text(menu: HMENU, position: i32) -> String {
+    let mut buffer = [0u16; 128];
+    let length =
+        unsafe { GetMenuStringW(menu, position as u32, Some(&mut buffer), MF_BYPOSITION) };
+    if length <= 0 {
+        return String::new();
+    }
+    String::from_utf16_lossy(&buffer[..length as usize])
+}
+
+/// Finds the editor's Tools menu so our commands sit where the rest of the
+/// editor's tooling does.
+///
+/// Matched by label rather than by position, because the menu bar's layout is
+/// the editor's business and an index would silently point at Preferences the
+/// first time a menu is added. The `&` accelerator marker and any keyboard
+/// shortcut after the tab are stripped before comparing.
+fn find_tools_menu(bar: HMENU) -> Option<HMENU> {
+    let count = unsafe { GetMenuItemCount(bar) };
+    for position in 0..count {
+        let label = menu_item_text(bar, position);
+        let normalized = label
+            .split('\t')
+            .next()
+            .unwrap_or_default()
+            .replace('&', "")
+            .trim()
+            .to_ascii_lowercase();
+        if normalized == "tools" {
+            let submenu = unsafe { GetSubMenu(bar, position) };
+            if submenu.0 != 0 {
+                return Some(submenu);
+            }
+        }
+    }
+    None
+}
+
+/// Builds the "RenX MCP" popup and hangs it off Tools, then subclasses the frame
+/// so its `WM_COMMAND` reaches us.
 ///
 /// The subclass chains to wx's original procedure for everything else. Only our
-/// own id is consumed; wx never sees an id it did not allocate, and every other
+/// own ids are consumed; wx never sees an id it did not allocate, and every other
 /// message is passed through untouched.
 fn install_menu_item() {
     let Some(frame) = find_editor_frame() else {
         return;
     };
-    let menu = unsafe { GetMenu(frame) };
-    if menu.0 == 0 {
+    let bar = unsafe { GetMenu(frame) };
+    if bar.0 == 0 {
         return;
     }
 
-    if unsafe {
-        AppendMenuW(
-            menu,
-            MF_STRING,
-            MENU_COMMAND_ID,
-            w!("MCP Policy\tCtrl+Alt+M"),
-        )
-    }
-    .is_err()
-    {
+    let submenu = unsafe { CreatePopupMenu() }.unwrap_or_default();
+    if submenu.0 == 0 {
         return;
     }
+    unsafe {
+        let _ = AppendMenuW(
+            submenu,
+            MF_STRING,
+            MENU_PANEL_ID,
+            w!("Control Panel...\tCtrl+Alt+M"),
+        );
+        let _ = AppendMenuW(submenu, MF_STRING, MENU_STATUS_ID, w!("Server Status..."));
+        let _ = AppendMenuW(submenu, MF_SEPARATOR, 0, PCWSTR::null());
+        let _ = AppendMenuW(submenu, MF_STRING, MENU_START_ID, w!("Start Server"));
+        let _ = AppendMenuW(submenu, MF_STRING, MENU_STOP_ID, w!("Stop Server"));
+        let _ = AppendMenuW(submenu, MF_STRING, MENU_RESTART_ID, w!("Restart Server"));
+    }
+
+    // Tools if we can find it, the bar itself if the editor's menus are not what
+    // we expect - a top-level entry is worse placement but still reachable, and
+    // silently having no menu at all would be the worst outcome.
+    let (host, nested) = match find_tools_menu(bar) {
+        Some(tools) => (tools, true),
+        None => (bar, false),
+    };
+    if nested {
+        unsafe {
+            let _ = AppendMenuW(host, MF_SEPARATOR, 0, PCWSTR::null());
+        }
+    }
+    if unsafe { AppendMenuW(host, MF_POPUP, submenu.0 as usize, w!("RenX MCP")) }.is_err() {
+        unsafe {
+            let _ = DestroyMenu(submenu);
+        }
+        return;
+    }
+    SUBMENU.store(submenu.0, Ordering::Relaxed);
     unsafe {
         let _ = DrawMenuBar(frame);
     }
@@ -196,7 +289,69 @@ fn install_menu_item() {
     }
 
     MENU_ADDED.store(true, Ordering::Relaxed);
-    debug_log!("RenX MCP policy menu item installed");
+    debug_log!(
+        "RenX MCP menu installed {}",
+        if nested { "under Tools" } else { "on the menu bar" }
+    );
+}
+
+/// Runs the requested server action and reports what happened.
+///
+/// Every one of these is a deliberate click, so every one gets an answer -
+/// including the failures, which are the cases where saying nothing would leave
+/// the user staring at an editor that looks exactly the same either way.
+fn run_server_command(owner: HWND, id: usize) {
+    let (outcome, verb) = match id {
+        MENU_START_ID => (super::start_server(), "Start"),
+        MENU_STOP_ID => (super::stop_server(), "Stop"),
+        MENU_RESTART_ID => (super::restart_server(), "Restart"),
+        _ => return,
+    };
+    let (text, icon) = match outcome {
+        Ok(message) => (message, MB_ICONINFORMATION),
+        Err(message) => (message, MB_ICONWARNING),
+    };
+    let title = wide(&format!("RenX MCP - {verb} Server"));
+    let body = wide(&text);
+    unsafe {
+        MessageBoxW(
+            owner,
+            PCWSTR(body.as_ptr()),
+            PCWSTR(title.as_ptr()),
+            MB_OK | icon,
+        );
+    }
+    refresh();
+}
+
+/// The full report, in a message box because Windows lets Ctrl+C copy one - so
+/// the endpoint can be pasted straight into a client's configuration.
+fn show_status(owner: HWND) {
+    let body = wide(&super::status_report());
+    unsafe {
+        MessageBoxW(
+            owner,
+            PCWSTR(body.as_ptr()),
+            w!("RenX MCP - Server Status"),
+            MB_OK | MB_ICONINFORMATION,
+        );
+    }
+}
+
+/// Greys out whichever of Start/Stop cannot apply right now, so the menu shows
+/// the server's state before anything is clicked.
+fn update_menu_state(popup: HMENU) {
+    let running = super::server_running();
+    let enable = |id: usize, on: bool| unsafe {
+        EnableMenuItem(
+            popup,
+            id as u32,
+            MF_BYCOMMAND | if on { MF_ENABLED } else { MF_GRAYED },
+        );
+    };
+    enable(MENU_START_ID, !running);
+    enable(MENU_STOP_ID, running);
+    enable(MENU_RESTART_ID, true);
 }
 
 unsafe extern "system" fn frame_subclass(
@@ -205,9 +360,30 @@ unsafe extern "system" fn frame_subclass(
     wparam: WPARAM,
     lparam: LPARAM,
 ) -> LRESULT {
-    if message == WM_COMMAND && (wparam.0 & 0xFFFF) == MENU_COMMAND_ID {
-        open();
-        return LRESULT(0);
+    if message == WM_COMMAND {
+        match wparam.0 & 0xFFFF {
+            MENU_PANEL_ID => {
+                open();
+                return LRESULT(0);
+            }
+            MENU_STATUS_ID => {
+                show_status(hwnd);
+                return LRESULT(0);
+            }
+            id @ (MENU_START_ID | MENU_STOP_ID | MENU_RESTART_ID) => {
+                run_server_command(hwnd, id);
+                return LRESULT(0);
+            }
+            _ => {}
+        }
+    }
+    // Only ever for our own popup - wx owns every other menu in the frame and
+    // must not have its item states rewritten underneath it.
+    if message == WM_INITMENUPOPUP {
+        let popup = SUBMENU.load(Ordering::Relaxed);
+        if popup != 0 && wparam.0 as isize == popup {
+            update_menu_state(HMENU(popup));
+        }
     }
     // Unhook before the frame goes away. A subclass left installed on a dead
     // window is harmless, but one left installed while this DLL unloads points
@@ -282,11 +458,7 @@ fn create() {
     register_class();
     let owner = find_editor_frame().unwrap_or(HWND(0));
 
-    // Height is derived so adding a capability does not require re-measuring by
-    // hand and silently clipping the last row.
-    let height = MARGIN * 4
-        + ROW_HEIGHT * (ALL_MODES.len() as i32 + ALL.len() as i32 + 3)
-        + 40;
+    let height = panel_height();
 
     let hwnd = unsafe {
         CreateWindowExW(
@@ -309,6 +481,17 @@ fn create() {
         return;
     }
     PANEL_HWND.store(hwnd.0, Ordering::Relaxed);
+}
+
+/// Derived from the row counts so adding a mode or a capability cannot silently
+/// clip the last row off the bottom of the window.
+fn panel_height() -> i32 {
+    // Server heading, status line, button row, then the two labelled sections.
+    let server = ROW_HEIGHT * 2 + BUTTON_HEIGHT + MARGIN;
+    MARGIN * 4
+        + server
+        + ROW_HEIGHT * (ALL_MODES.len() as i32 + ALL.len() as i32 + 3)
+        + 40
 }
 
 fn wide(text: &str) -> Vec<u16> {
@@ -356,6 +539,54 @@ fn child(
 fn build_children(hwnd: HWND) {
     let mut y = MARGIN;
     let width = PANEL_WIDTH - MARGIN * 3;
+
+    child(
+        hwnd,
+        w!("STATIC"),
+        "Server - the loopback bridge a model connects to:",
+        WINDOW_STYLE(0),
+        MARGIN,
+        y,
+        width,
+        ROW_HEIGHT,
+        0,
+    );
+    y += ROW_HEIGHT;
+    child(
+        hwnd,
+        w!("STATIC"),
+        &super::status_line(),
+        WINDOW_STYLE(0),
+        MARGIN + 8,
+        y,
+        width - 8,
+        ROW_HEIGHT,
+        SERVER_STATUS_TEXT,
+    );
+    y += ROW_HEIGHT;
+
+    for (index, (label, id)) in [
+        ("Start", SERVER_START_BUTTON),
+        ("Stop", SERVER_STOP_BUTTON),
+        ("Restart", SERVER_RESTART_BUTTON),
+        ("Details...", SERVER_DETAILS_BUTTON),
+    ]
+    .iter()
+    .enumerate()
+    {
+        child(
+            hwnd,
+            w!("BUTTON"),
+            label,
+            WINDOW_STYLE(BS_PUSHBUTTON as u32),
+            MARGIN + 8 + index as i32 * (BUTTON_WIDTH + 6),
+            y,
+            BUTTON_WIDTH,
+            BUTTON_HEIGHT,
+            *id,
+        );
+    }
+    y += BUTTON_HEIGHT + MARGIN;
 
     child(
         hwnd,
@@ -449,6 +680,26 @@ fn refresh() {
     if hwnd.0 == 0 || !unsafe { IsWindow(hwnd) }.as_bool() {
         return;
     }
+    let running = super::server_running();
+    let status = unsafe { GetDlgItem(hwnd, SERVER_STATUS_TEXT as i32) };
+    if status.0 != 0 {
+        let text = wide(&super::status_line());
+        unsafe {
+            let _ = SetWindowTextW(status, PCWSTR(text.as_ptr()));
+        }
+    }
+    for (id, enabled) in [
+        (SERVER_START_BUTTON, !running),
+        (SERVER_STOP_BUTTON, running),
+    ] {
+        let button = unsafe { GetDlgItem(hwnd, id as i32) };
+        if button.0 != 0 {
+            unsafe {
+                let _ = EnableWindow(button, enabled);
+            }
+        }
+    }
+
     let mode = policy::current_mode();
     for (index, candidate) in ALL_MODES.iter().enumerate() {
         let button = unsafe { GetDlgItem(hwnd, (MODE_BASE + index) as i32) };
@@ -496,7 +747,18 @@ unsafe extern "system" fn panel_proc(
         }
         WM_COMMAND => {
             let id = wparam.0 & 0xFFFF;
-            if (MODE_BASE..MODE_BASE + ALL_MODES.len()).contains(&id) {
+            if id == SERVER_DETAILS_BUTTON {
+                show_status(hwnd);
+            } else if let Some(command) = match id {
+                SERVER_START_BUTTON => Some(MENU_START_ID),
+                SERVER_STOP_BUTTON => Some(MENU_STOP_ID),
+                SERVER_RESTART_BUTTON => Some(MENU_RESTART_ID),
+                _ => None,
+            } {
+                // Same path as the menu, so the two surfaces cannot drift in
+                // what they do or in what they report.
+                run_server_command(hwnd, command);
+            } else if (MODE_BASE..MODE_BASE + ALL_MODES.len()).contains(&id) {
                 policy::apply_mode(ALL_MODES[id - MODE_BASE]);
                 refresh();
             } else if (CAP_BASE..CAP_BASE + ALL.len()).contains(&id) {
@@ -577,15 +839,41 @@ mod tests {
     #[test]
     fn control_id_ranges_do_not_overlap() {
         assert!(MODE_BASE + ALL_MODES.len() <= CAP_BASE);
-        assert!(CAP_BASE + ALL.len() < MENU_COMMAND_ID);
+        assert!(CAP_BASE + ALL.len() <= SERVER_STATUS_TEXT);
+        // A `WM_COMMAND` carries only an id, so a panel control sharing a number
+        // with a menu command would fire the wrong action.
+        assert!(SERVER_DETAILS_BUTTON < MENU_PANEL_ID);
     }
 
     #[test]
-    fn every_mode_and_capability_gets_a_row() {
-        // The panel height is derived from these, so a new entry must not be
-        // able to appear without the window growing to fit it.
-        let height =
-            MARGIN * 4 + ROW_HEIGHT * (ALL_MODES.len() as i32 + ALL.len() as i32 + 3) + 40;
-        assert!(height > ROW_HEIGHT * (ALL_MODES.len() + ALL.len()) as i32);
+    fn menu_command_ids_are_distinct() {
+        let ids = [
+            MENU_PANEL_ID,
+            MENU_STATUS_ID,
+            MENU_START_ID,
+            MENU_STOP_ID,
+            MENU_RESTART_ID,
+        ];
+        for (index, left) in ids.iter().enumerate() {
+            for right in ids.iter().skip(index + 1) {
+                assert_ne!(left, right);
+            }
+        }
+    }
+
+    #[test]
+    fn panel_is_tall_enough_for_every_row_it_builds() {
+        // The height is derived from the row counts, so a new mode or capability
+        // must not be able to appear without the window growing to fit it.
+        let rows = ALL_MODES.len() as i32 + ALL.len() as i32
+            + 2  // the two section headings
+            + 2  // server heading and status line
+            + 1; // the persistence footnote
+        let content = ROW_HEIGHT * rows + BUTTON_HEIGHT + MARGIN * 5;
+        assert!(
+            panel_height() >= content,
+            "panel {} is shorter than its {content}px of content",
+            panel_height()
+        );
     }
 }

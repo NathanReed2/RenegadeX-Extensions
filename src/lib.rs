@@ -270,8 +270,8 @@ patch_group!(fn init_client_patches {
 //   even when not actively being used - only uncomment it if you also want it
 //   excluded from the build.
 patch_group!(fn init_tooling_patches {
-    //#[cfg(target_arch = "x86_64")]
-    //udk_mcp,
+    #[cfg(target_arch = "x86_64")]
+    udk_mcp,
     //#[cfg(target_arch = "x86_64")]
     //udk_script_profiler,
     #[cfg(target_arch = "x86_64")]

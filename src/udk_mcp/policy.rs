@@ -236,7 +236,15 @@ pub fn init() {
             store(mode, mode.mask().unwrap_or(Mode::Context.mask().unwrap()));
             return;
         }
-        if let Some(saved) = std::fs::read_to_string(policy_path()).ok().as_deref() {
+        if let Some(saved) = std::fs::read_to_string(policy_path())
+            .ok()
+            .as_deref()
+            // Every Windows text editor writes a UTF-8 BOM, and the JSON parser
+            // requires `{` as the first byte. Without this, hand-editing the
+            // policy file silently reverts it to read-only on the next launch -
+            // safe, but the user would never learn why their setting vanished.
+            .map(|text| text.trim_start_matches('\u{feff}'))
+        {
             if let Some(mode) =
                 super::json_field_string(saved, "mode").and_then(|value| Mode::parse(&value))
             {
@@ -255,6 +263,11 @@ pub fn init() {
 fn store(mode: Mode, mask: u32) {
     MASK.store(mask, Ordering::Release);
     MODE.store(mode as u8, Ordering::Release);
+}
+
+/// Where the policy is persisted, for the status view to show.
+pub fn policy_file_path() -> std::path::PathBuf {
+    policy_path()
 }
 
 /// Beside `UDK.exe`, like every other file this DLL writes.
@@ -292,17 +305,75 @@ pub fn current_mode() -> Mode {
     Mode::from_index(MODE.load(Ordering::Acquire))
 }
 
-/// The refusal a caller sees. It names the capability and the switch that would
-/// grant it, because a model that is told only "denied" will retry the same call
-/// or invent a workaround - and the workaround for a blocked tool is `renx_exec`.
+/// The refusal a caller sees.
+///
+/// Written for a language model reading it mid-task, and it has to answer four
+/// questions at once or the model will do the wrong thing:
+///
+/// 1. **This is not a failure.** A model that reads "denied" as a malfunction
+///    retries it, then retries it a third way. Say plainly that the tool works
+///    and a person switched it off.
+/// 2. **Which switch.** The capability id is what the panel shows, so the model
+///    can name the exact toggle when it asks.
+/// 3. **It is reversible, by the user, right now.** Without this the model
+///    treats the restriction as permanent and silently drops the request instead
+///    of asking - which is the worst outcome, because the user never learns
+///    their own setting is what blocked the work.
+/// 4. **Do not route around it.** The workaround for any blocked tool is
+///    `renx_exec`, so that door has to be closed explicitly.
 pub fn deny_message(capability: Capability) -> String {
     format!(
-        "blocked by editor policy: '{}' is disabled in {} mode. {} This is set by the operator in \
-         the RenX MCP control panel and cannot be changed from here; ask them to enable it. Do not \
-         attempt the same effect through another tool.",
+        "Blocked by MCP policy - this is a setting, not an error. The user has turned '{}' off \
+         for this editor bridge. ({}) The bridge is working normally and every other permitted \
+         tool still functions.\n\nCurrent mode is '{}'.{}\n\nThe user can re-enable it at any \
+         time, live, in the editor under Tools > RenX MCP > Control Panel (Ctrl+Alt+M), by \
+         picking a mode or ticking '{}' under Advanced. It applies immediately - no restart and \
+         no reconnect. If you need this capability, stop and ask the user to enable it, naming \
+         '{}' so they know which toggle to flip. Do not attempt the same effect through another \
+         tool or command.",
         capability.id(),
+        capability.describe(),
         current_mode().id(),
-        capability.describe()
+        granting_modes_sentence(capability),
+        capability.id(),
+        capability.id(),
+    )
+}
+
+/// Names the presets that would grant `capability`, so the user can be asked for
+/// the smallest change that unblocks the work rather than "give me full access".
+fn granting_modes_sentence(capability: Capability) -> String {
+    let granting: Vec<&str> = ALL_MODES
+        .iter()
+        .filter(|mode| matches!(mode.mask(), Some(mask) if mask & capability.bit() != 0))
+        .map(|mode| mode.id())
+        .collect();
+    match granting.len() {
+        0 => String::new(),
+        1 => format!(" This capability is granted by '{}' mode.", granting[0]),
+        _ => format!(
+            " This capability is granted by these modes: {}.",
+            granting.join(", ")
+        ),
+    }
+}
+
+/// The refusal when a tool needs any one of several capabilities and has none of
+/// them - `renx_actor_action`, whose capability depends on the `action`
+/// argument. Naming only the first would send the user to the wrong toggle.
+pub fn deny_message_any(capabilities: &[Capability]) -> String {
+    let ids: Vec<&str> = capabilities.iter().map(|item| item.id()).collect();
+    format!(
+        "Blocked by MCP policy - this is a setting, not an error. This tool needs one of {}, and \
+         the user has turned all of them off for this editor bridge. The bridge is working \
+         normally and every other permitted tool still functions.\n\nCurrent mode is '{}'.\n\nThe \
+         user can re-enable any of them at any time, live, in the editor under Tools > RenX MCP > \
+         Control Panel (Ctrl+Alt+M), by picking a mode or ticking the capability under Advanced. \
+         It applies immediately - no restart and no reconnect. If you need this, stop and ask the \
+         user, naming the specific capability you need so they know which toggle to flip. Do not \
+         attempt the same effect through another tool or command.",
+        ids.join(", "),
+        current_mode().id(),
     )
 }
 
@@ -494,6 +565,62 @@ mod tests {
                 assert_ne!(left.bit(), right.bit());
             }
         }
+    }
+
+    /// The refusal is the only thing a model sees when a capability is off, so
+    /// each of the four things it has to convey is asserted rather than assumed.
+    #[test]
+    fn deny_message_tells_the_model_a_person_switched_it_off_and_can_switch_it_back() {
+        for capability in ALL {
+            let message = deny_message(capability);
+            assert!(
+                message.contains(capability.id()),
+                "must name the toggle: {message}"
+            );
+            assert!(
+                message.contains("setting, not an error"),
+                "must not read as a malfunction: {message}"
+            );
+            assert!(
+                message.contains("The user can re-enable it"),
+                "must say it is reversible by the user: {message}"
+            );
+            assert!(
+                message.contains("Tools > RenX MCP"),
+                "must say where in the editor to find it: {message}"
+            );
+            assert!(
+                message.contains("ask the user"),
+                "must direct the model to ask rather than give up: {message}"
+            );
+            assert!(
+                message.contains("another tool"),
+                "must close the renx_exec workaround: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn deny_message_names_the_modes_that_would_grant_it() {
+        assert!(deny_message(Capability::Exec).contains("'full' mode"));
+        // Granted by both `edit` and `full`, so the user can be asked for the
+        // smaller of the two rather than for everything.
+        let transform = deny_message(Capability::WriteTransform);
+        assert!(transform.contains("edit"), "{transform}");
+        assert!(transform.contains("full"), "{transform}");
+    }
+
+    #[test]
+    fn deny_message_any_names_every_candidate_capability() {
+        let message = deny_message_any(&[
+            Capability::WriteTransform,
+            Capability::WriteDuplicate,
+            Capability::WriteDelete,
+        ]);
+        assert!(message.contains("write.transform"), "{message}");
+        assert!(message.contains("write.duplicate"), "{message}");
+        assert!(message.contains("write.delete"), "{message}");
+        assert!(message.contains("setting, not an error"), "{message}");
     }
 
     #[test]

@@ -10,9 +10,9 @@ use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, SyncSender};
-use std::sync::{Mutex, Once, OnceLock};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use crate::dll::UDK_RANGE;
@@ -75,11 +75,27 @@ static_detour! {
 }
 
 static REQUEST_QUEUE: OnceLock<Mutex<VecDeque<EditorRequest>>> = OnceLock::new();
-static SERVER_START: Once = Once::new();
 static SERVER_LISTENING: AtomicBool = AtomicBool::new(false);
 static SERVER_PORT: AtomicU16 = AtomicU16::new(DEFAULT_PORT);
 static EDITOR_THIS: AtomicUsize = AtomicUsize::new(0);
 static TICK_COUNT: AtomicU64 = AtomicU64::new(0);
+
+/// Set once, the first time a tick reaches us. Autostart is deliberately a
+/// one-shot rather than "start it whenever it is not running", so that stopping
+/// the server from the menu keeps it stopped instead of having the next frame
+/// put it straight back.
+static SERVER_AUTOSTARTED: AtomicBool = AtomicBool::new(false);
+/// Bumped per start. An accept loop whose generation is stale belongs to a
+/// previous server and retires itself, which is what makes restart safe even if
+/// a stop is slow to be noticed.
+static SERVER_GENERATION: AtomicU32 = AtomicU32::new(0);
+static SERVER_STOP: AtomicBool = AtomicBool::new(false);
+static CONNECTIONS_ACCEPTED: AtomicU64 = AtomicU64::new(0);
+static TOOL_CALLS: AtomicU64 = AtomicU64::new(0);
+static POLICY_REFUSALS: AtomicU64 = AtomicU64::new(0);
+/// Last bind or accept failure, kept so the status view can explain a server
+/// that is not listening rather than just saying that it is not.
+static LAST_SERVER_ERROR: Mutex<String> = Mutex::new(String::new());
 
 enum EditorOperation {
     Exec(String),
@@ -754,10 +770,13 @@ fn submit_editor_operation(operation: EditorOperation) -> Result<EditorValue, St
     // distinguish "forbidden" from "editor busy" by the error it gets back.
     let capability = required_capability(&operation);
     if !policy::allows(capability) {
+        POLICY_REFUSALS.fetch_add(1, Ordering::Relaxed);
         return Err(policy::deny_message(capability));
     }
     if EDITOR_THIS.load(Ordering::Acquire) == 0 {
-        return Err("the editor has not reached UUnrealEdEngine::Tick yet".to_string());
+        return Err("The editor is still starting up and has not run a frame yet. This is not a \
+                    policy refusal - retry in a few seconds."
+            .to_string());
     }
     let (sender, receiver) = mpsc::sync_channel(1);
     {
@@ -772,9 +791,18 @@ fn submit_editor_operation(operation: EditorOperation) -> Result<EditorValue, St
             response: sender,
         });
     }
-    receiver
-        .recv_timeout(REQUEST_TIMEOUT)
-        .map_err(|_| "timed out waiting for the editor thread".to_string())?
+    // Work is done on the editor's own thread, which only runs it between
+    // frames. Anything that suspends the editor's loop - an open menu, a modal
+    // dialog, a long import or build - stops that thread from getting here, and
+    // the symptom is this timeout. Saying so matters because the alternative
+    // reading is "the bridge is broken", which it is not.
+    receiver.recv_timeout(REQUEST_TIMEOUT).map_err(|_| {
+        "The editor did not process this within the timeout. This is not a policy refusal and not \
+         a bridge fault: the editor runs bridge work between frames, so anything holding its main \
+         loop - an open menu, a modal dialog, or a long operation such as a build or import - \
+         defers it. Ask the user to close any open menu or dialog in the editor, then retry."
+            .to_string()
+    })?
 }
 
 fn configured_port() -> u16 {
@@ -786,40 +814,230 @@ fn configured_port() -> u16 {
 }
 
 fn start_server_once() {
-    SERVER_START.call_once(|| {
-        let port = configured_port();
-        SERVER_PORT.store(port, Ordering::Relaxed);
-        if let Err(error) = std::thread::Builder::new()
-            .name("renx-mcp".to_string())
-            .spawn(move || server_main(port))
-        {
-            debug_log!("failed to spawn RenX MCP server: {error}");
-        }
-    });
+    if SERVER_AUTOSTARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    if let Err(error) = start_server() {
+        debug_log!("RenX MCP autostart failed: {error}");
+    }
 }
 
-fn server_main(port: u16) {
+fn record_server_error(message: &str) {
+    if let Ok(mut slot) = LAST_SERVER_ERROR.lock() {
+        slot.clear();
+        slot.push_str(message);
+    }
+}
+
+fn last_server_error() -> String {
+    LAST_SERVER_ERROR
+        .lock()
+        .map(|slot| slot.clone())
+        .unwrap_or_default()
+}
+
+/// Binds and serves, reporting the outcome of the bind back to the caller.
+///
+/// Starting is worth waiting for: the menu says "Start Server" and the user is
+/// entitled to be told the port was busy rather than to watch nothing happen.
+pub(crate) fn start_server() -> Result<String, String> {
+    if SERVER_LISTENING.load(Ordering::Acquire) {
+        return Err(format!(
+            "The MCP server is already listening on 127.0.0.1:{}.",
+            SERVER_PORT.load(Ordering::Relaxed)
+        ));
+    }
+    SERVER_STOP.store(false, Ordering::Release);
+    let port = configured_port();
+    SERVER_PORT.store(port, Ordering::Relaxed);
+    let generation = SERVER_GENERATION.fetch_add(1, Ordering::SeqCst) + 1;
+
+    let (ready, bound) = mpsc::sync_channel::<Result<(), String>>(1);
+    std::thread::Builder::new()
+        .name("renx-mcp".to_string())
+        .spawn(move || server_main(port, generation, ready))
+        .map_err(|error| format!("Could not spawn the MCP server thread: {error}"))?;
+
+    match bound.recv_timeout(SERVER_START_TIMEOUT) {
+        Ok(Ok(())) => Ok(format!(
+            "MCP server started.\n\nListening on http://127.0.0.1:{port}/mcp"
+        )),
+        Ok(Err(message)) => Err(message),
+        Err(_) => Err("The MCP server thread did not report back in time.".to_string()),
+    }
+}
+
+/// Stops the accept loop and releases the port.
+///
+/// This blocks the caller for as long as it takes the loop to notice, which is
+/// normally microseconds. It is called from a menu click on the editor thread,
+/// so the wait is bounded and short rather than unbounded: a server that will
+/// not stop is a bug to report, not a reason to freeze the editor.
+pub(crate) fn stop_server() -> Result<String, String> {
+    if !SERVER_LISTENING.load(Ordering::Acquire) {
+        return Err("The MCP server is not running.".to_string());
+    }
+    SERVER_STOP.store(true, Ordering::Release);
+    let port = SERVER_PORT.load(Ordering::Relaxed);
+
+    // `accept` cannot be interrupted by setting a flag - the thread is parked
+    // inside it. One throwaway loopback connection wakes it so it can see the
+    // flag and leave. It is refused rather than served, because the loop checks
+    // the flag before it looks at the connection.
+    let _ = TcpStream::connect(("127.0.0.1", port));
+
+    for _ in 0..SERVER_STOP_POLLS {
+        if !SERVER_LISTENING.load(Ordering::Acquire) {
+            return Ok(format!(
+                "MCP server stopped.\n\n127.0.0.1:{port} has been released. Nothing can reach the \
+                 editor over the bridge until it is started again."
+            ));
+        }
+        std::thread::sleep(SERVER_STOP_POLL_INTERVAL);
+    }
+    Err("The MCP server did not stop in time; it may still be holding the port.".to_string())
+}
+
+pub(crate) fn restart_server() -> Result<String, String> {
+    if SERVER_LISTENING.load(Ordering::Acquire) {
+        stop_server()?;
+    }
+    start_server().map(|message| message.replacen("started", "restarted", 1))
+}
+
+const SERVER_START_TIMEOUT: Duration = Duration::from_secs(3);
+const SERVER_STOP_POLLS: u32 = 60;
+const SERVER_STOP_POLL_INTERVAL: Duration = Duration::from_millis(50);
+
+fn server_main(port: u16, generation: u32, ready: mpsc::SyncSender<Result<(), String>>) {
     let listener = match TcpListener::bind(("127.0.0.1", port)) {
         Ok(listener) => listener,
         Err(error) => {
+            let message = format!(
+                "Could not bind 127.0.0.1:{port}: {error}\n\nAnother process is probably using \
+                 that port. Set RENX_MCP_PORT to choose a different one."
+            );
             debug_log!("RenX MCP failed to bind 127.0.0.1:{port}: {error}");
+            record_server_error(&message);
+            let _ = ready.send(Err(message));
             return;
         }
     };
     SERVER_LISTENING.store(true, Ordering::Release);
+    record_server_error("");
+    let _ = ready.send(Ok(()));
     debug_log!("RenX MCP listening at http://127.0.0.1:{port}/mcp");
 
     for connection in listener.incoming() {
+        // After the accept, not before: a stop wakes this loop *with* a
+        // connection, so the flag has to be read once that connection is in hand
+        // or the wake-up would be served as a request and the loop would park
+        // again.
+        if SERVER_STOP.load(Ordering::Acquire)
+            || SERVER_GENERATION.load(Ordering::Acquire) != generation
+        {
+            break;
+        }
         match connection {
             Ok(stream) => {
+                CONNECTIONS_ACCEPTED.fetch_add(1, Ordering::Relaxed);
                 if let Err(error) = handle_connection(stream) {
                     debug_log!("RenX MCP connection error: {error}");
                 }
             }
-            Err(error) => debug_log!("RenX MCP accept error: {error}"),
+            Err(error) => {
+                record_server_error(&format!("accept failed: {error}"));
+                debug_log!("RenX MCP accept error: {error}");
+            }
         }
     }
     SERVER_LISTENING.store(false, Ordering::Release);
+    debug_log!("RenX MCP server on port {port} stopped");
+}
+
+/// The human-readable report behind "Server Status".
+///
+/// It answers the two questions someone actually opens it for - "is it up" and
+/// "what do I point the client at" - before any of the diagnostics, and it names
+/// the policy mode because a bridge that is up but read-only looks identical to
+/// a broken one from the client's side.
+pub(crate) fn status_report() -> String {
+    let port = SERVER_PORT.load(Ordering::Relaxed);
+    let listening = SERVER_LISTENING.load(Ordering::Acquire);
+    let editor_ready = EDITOR_THIS.load(Ordering::Acquire) != 0;
+    let error = last_server_error();
+
+    let mut report = String::new();
+    report.push_str(if listening {
+        "Server:  RUNNING\n"
+    } else {
+        "Server:  STOPPED\n"
+    });
+    report.push_str(&format!("Policy:  {} mode\n", policy::current_mode().id()));
+    report.push_str(&format!(
+        "Editor:  {}\n",
+        if editor_ready {
+            "ready - the bridge has reached UUnrealEdEngine::Tick"
+        } else {
+            "not ready - no editor tick seen yet"
+        }
+    ));
+
+    report.push_str("\nConnection points\n");
+    if listening {
+        report.push_str(&format!("  MCP endpoint     http://127.0.0.1:{port}/mcp\n"));
+        report.push_str(&format!(
+            "  Policy control   http://127.0.0.1:{port}/control/policy  (GET, POST)\n"
+        ));
+    } else {
+        report.push_str("  none - the server is not listening\n");
+    }
+    report.push_str("  Bind address     127.0.0.1 (loopback only; not reachable from the network)\n");
+    report.push_str(&format!(
+        "  Port             {port} ({})\n",
+        if std::env::var("RENX_MCP_PORT").is_ok() {
+            "from RENX_MCP_PORT"
+        } else {
+            "default; override with RENX_MCP_PORT"
+        }
+    ));
+
+    report.push_str("\nActivity\n");
+    report.push_str(&format!(
+        "  Connections      {}\n  Tool calls       {}\n  Policy refusals  {}\n  Editor ticks     \
+         {}\n",
+        CONNECTIONS_ACCEPTED.load(Ordering::Relaxed),
+        TOOL_CALLS.load(Ordering::Relaxed),
+        POLICY_REFUSALS.load(Ordering::Relaxed),
+        TICK_COUNT.load(Ordering::Relaxed),
+    ));
+
+    report.push_str(&format!(
+        "\nProcess {}\nPolicy file {}\n",
+        std::process::id(),
+        policy::policy_file_path().to_string_lossy()
+    ));
+
+    if !error.is_empty() {
+        report.push_str(&format!("\nLast error\n  {error}\n"));
+    }
+    report
+}
+
+/// One line for the panel, where there is no room for the full report.
+pub(crate) fn status_line() -> String {
+    let port = SERVER_PORT.load(Ordering::Relaxed);
+    if SERVER_LISTENING.load(Ordering::Acquire) {
+        format!("Running - http://127.0.0.1:{port}/mcp")
+    } else if last_server_error().is_empty() {
+        "Stopped - nothing can reach the editor".to_string()
+    } else {
+        format!("Stopped - port {port} could not be bound")
+    }
+}
+
+pub(crate) fn server_running() -> bool {
+    SERVER_LISTENING.load(Ordering::Acquire)
 }
 
 struct HttpRequest {
@@ -945,13 +1163,20 @@ fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {
             .ok_or_else(|| "malformed HTTP header".to_string())?;
         headers.push((name.trim().to_string(), value.trim().to_string()));
     }
-    let content_length = headers
+    // Absent means no body, which is what a bodyless GET/DELETE sends and what
+    // RFC 7230 says to assume. Requiring the header made `GET /control/policy`
+    // fail with "Content-Length is required" for every well-formed client - a
+    // present-but-unparseable value is still an error, because that is a
+    // genuinely malformed request rather than an absent one.
+    let content_length = match headers
         .iter()
         .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
-        .ok_or_else(|| "Content-Length is required".to_string())?
-        .1
-        .parse::<usize>()
-        .map_err(|_| "invalid Content-Length".to_string())?;
+    {
+        Some((_, value)) => value
+            .parse::<usize>()
+            .map_err(|_| "invalid Content-Length".to_string())?,
+        None => 0,
+    };
     if content_length > MAX_HTTP_BODY {
         return Err("HTTP body is too large".to_string());
     }
@@ -1161,14 +1386,18 @@ fn tools_call(body: &str) -> Result<String, (i32, String)> {
     // Refuse before any argument parsing, so a forbidden tool cannot be probed
     // for what it would have accepted. `renx_actor_action` is not decided here -
     // its capability depends on which action was asked for.
+    TOOL_CALLS.fetch_add(1, Ordering::Relaxed);
     if !tool_permitted(&name) {
+        POLICY_REFUSALS.fetch_add(1, Ordering::Relaxed);
         if let Some(capability) = tool_capability(&name) {
             return Ok(tool_error(&policy::deny_message(capability)));
         }
         if name == "renx_actor_action" {
-            return Ok(tool_error(&policy::deny_message(
+            return Ok(tool_error(&policy::deny_message_any(&[
                 policy::Capability::WriteTransform,
-            )));
+                policy::Capability::WriteDuplicate,
+                policy::Capability::WriteDelete,
+            ])));
         }
     }
 
