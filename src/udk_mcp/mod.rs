@@ -279,6 +279,7 @@ extern "C" fn editor_tick_hook(editor: *mut c_void, delta_seconds: f32) {
     let ticks = TICK_COUNT.fetch_add(1, Ordering::Relaxed);
     start_server_once();
     drain_editor_requests(editor);
+    drain_policy_confirmations();
 
     // The panel and its menu item have to be created and repaired on the thread
     // that pumps them, which is this one. Throttled because the check walks the
@@ -1106,21 +1107,137 @@ fn handle_connection(mut stream: TcpStream) -> std::io::Result<()> {
 fn handle_control_policy(stream: &mut TcpStream, request: &HttpRequest) -> std::io::Result<()> {
     match request.method.as_str() {
         "GET" => write_http(stream, 200, "application/json", &policy::policy_json()),
-        "POST" => match policy::apply(&request.body) {
-            Ok(updated) => {
-                debug_log!("RenX MCP policy changed to {}", policy::current_mode().id());
-                write_http(stream, 200, "application/json", &updated)
+        "POST" => {
+            let change = match policy::plan(&request.body) {
+                Ok(change) => change,
+                Err(message) => {
+                    return write_http(
+                        stream,
+                        400,
+                        "application/json",
+                        &format!("{{\"error\":\"{}\"}}", json_escape(&message)),
+                    )
+                }
+            };
+
+            // Everything reaching this endpoint is untrusted: it arrived over
+            // the same socket the model uses, so it may well *be* the model
+            // asking to widen its own permissions. A policy the caller can
+            // rewrite is not a policy.
+            if change.grants_anything() {
+                match request_policy_confirmation(&change) {
+                    Ok(true) => {}
+                    Ok(false) => {
+                        return write_http(
+                            stream,
+                            403,
+                            "application/json",
+                            &format!(
+                                "{{\"error\":\"{}\",\"policy\":{}}}",
+                                json_escape(POLICY_CHANGE_DECLINED),
+                                policy::policy_json()
+                            ),
+                        )
+                    }
+                    Err(message) => {
+                        return write_http(
+                            stream,
+                            503,
+                            "application/json",
+                            &format!(
+                                "{{\"error\":\"{}\",\"policy\":{}}}",
+                                json_escape(&message),
+                                policy::policy_json()
+                            ),
+                        )
+                    }
+                }
             }
-            Err(message) => write_http(
-                stream,
-                400,
-                "application/json",
-                &format!("{{\"error\":\"{}\"}}", json_escape(&message)),
-            ),
-        },
+
+            let updated = policy::commit(&change);
+            debug_log!("RenX MCP policy changed to {}", policy::current_mode().id());
+            write_http(stream, 200, "application/json", &updated)
+        }
         _ => write_http(stream, 405, "text/plain", "GET or POST required"),
     }
 }
+
+const POLICY_CHANGE_DECLINED: &str =
+    "The user declined this policy change in the editor. The policy is unchanged and you still \
+     have exactly the capabilities you had before. This was a person's decision, not a fault: do \
+     not retry it, do not ask for a different set of permissions to get the same effect, and do \
+     not try to reach the same result through another tool. If you believe you need it, say so in \
+     conversation and let the user decide.";
+
+/// Asks the human at the editor, and blocks until they answer.
+///
+/// The prompt has to be raised on the editor thread - it owns the windows - so
+/// the request is queued for the tick to pick up, exactly like every other piece
+/// of editor work here. A timeout counts as "no", because an unattended editor
+/// must not be a way to get permissions by waiting.
+fn request_policy_confirmation(change: &policy::Change) -> Result<bool, String> {
+    if EDITOR_THIS.load(Ordering::Acquire) == 0 {
+        return Err("The editor is not running a frame yet, so the user cannot be asked to \
+                    approve this. The policy is unchanged."
+            .to_string());
+    }
+    let (sender, receiver) = mpsc::sync_channel(1);
+    {
+        let mut queue = policy_confirmations()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !queue.is_empty() {
+            return Err("Another policy change is already waiting for the user to approve it. \
+                        The policy is unchanged."
+                .to_string());
+        }
+        queue.push_back(PolicyConfirmation {
+            summary: change.summary(),
+            response: sender,
+        });
+    }
+    receiver.recv_timeout(POLICY_CONFIRM_TIMEOUT).map_err(|_| {
+        // Leave nothing behind for a later tick to pop up out of nowhere.
+        policy_confirmations()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clear();
+        "The user did not answer the approval prompt in the editor within two minutes, so this \
+         was treated as a refusal. The policy is unchanged."
+            .to_string()
+    })
+}
+
+struct PolicyConfirmation {
+    summary: String,
+    response: SyncSender<bool>,
+}
+
+fn policy_confirmations() -> &'static Mutex<VecDeque<PolicyConfirmation>> {
+    static QUEUE: OnceLock<Mutex<VecDeque<PolicyConfirmation>>> = OnceLock::new();
+    QUEUE.get_or_init(|| Mutex::new(VecDeque::new()))
+}
+
+/// Raises one pending approval prompt. Called from the tick, so it runs on the
+/// thread that owns the editor's windows.
+///
+/// One per tick: the prompt is modal and stops the editor's loop until it is
+/// answered, so there is never a second one to show until this returns anyway.
+fn drain_policy_confirmations() {
+    let pending = {
+        let mut queue = policy_confirmations()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        queue.pop_front()
+    };
+    let Some(pending) = pending else {
+        return;
+    };
+    let approved = panel::confirm_policy_change(&pending.summary);
+    let _ = pending.response.send(approved);
+}
+
+const POLICY_CONFIRM_TIMEOUT: Duration = Duration::from_secs(120);
 
 fn read_http_request(stream: &mut TcpStream) -> Result<HttpRequest, String> {
     let mut bytes = Vec::new();

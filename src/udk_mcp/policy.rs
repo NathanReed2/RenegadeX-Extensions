@@ -459,19 +459,80 @@ fn mode_for_mask(mask: u32) -> Mode {
     Mode::Custom
 }
 
-/// Applies a control request and returns the new policy.
+/// A requested policy change, worked out but not yet applied.
 ///
-/// `{"mode":"context"}` selects a preset. `{"capabilities":{"exec.command":false}}`
-/// toggles individual bits and moves the policy to `custom`, because a preset
-/// that no longer matches its own definition would be a lie in the GUI.
-pub fn apply(request: &str) -> Result<String, String> {
-    init();
-    let _guard = WRITE_LOCK.lock().map_err(|_| "policy lock poisoned")?;
+/// Separating deciding from doing is what lets an untrusted request be
+/// described to a human *before* it takes effect - see [`Change::summary`].
+pub struct Change {
+    mode: Mode,
+    mask: u32,
+    grants: Vec<Capability>,
+    revokes: Vec<Capability>,
+}
 
+impl Change {
+    /// Whether this hands out anything the bridge does not already have.
+    ///
+    /// This is the whole test for whether a human has to be asked. A request
+    /// that only gives permissions up cannot be an escalation no matter who
+    /// sent it, so it is applied without interrupting anyone; a request that
+    /// takes on even one new capability is exactly the thing the policy exists
+    /// to stop the caller doing for itself.
+    pub fn grants_anything(&self) -> bool {
+        !self.grants.is_empty()
+    }
+
+    /// The prompt text. Written so someone who did not expect the dialog can
+    /// tell what it is asking for and say no.
+    pub fn summary(&self) -> String {
+        let mut text = String::from(
+            "A program connected to this editor's MCP bridge is asking to change what it is \
+             allowed to do.\n\nOnly allow this if you were expecting it.\n\n",
+        );
+        text.push_str(&format!(
+            "Requested mode:  {}\nCurrent mode:    {}\n",
+            self.mode.id(),
+            current_mode().id()
+        ));
+        if !self.grants.is_empty() {
+            text.push_str("\nThis would GRANT:\n");
+            for capability in &self.grants {
+                text.push_str(&format!(
+                    "    {}{}\n        {}\n",
+                    capability.id(),
+                    if capability.is_destructive() {
+                        "   (!) can destroy work"
+                    } else {
+                        ""
+                    },
+                    capability.describe()
+                ));
+            }
+        }
+        if !self.revokes.is_empty() {
+            text.push_str("\nThis would remove:\n");
+            for capability in &self.revokes {
+                text.push_str(&format!("    {}\n", capability.id()));
+            }
+        }
+        text.push_str("\nChoosing No leaves the current policy exactly as it is.");
+        text
+    }
+}
+
+/// Works out what a control request would do, without doing it.
+pub fn plan(request: &str) -> Result<Change, String> {
+    init();
+    plan_from(request, MASK.load(Ordering::Acquire))
+}
+
+/// Split out so it can be exercised against a chosen starting mask rather than
+/// the process-wide one, which every other test would then race against.
+fn plan_from(request: &str, current: u32) -> Result<Change, String> {
     let requested_mode = match super::json_field_string(request, "mode") {
-        Some(value) => Some(
-            Mode::parse(&value).ok_or_else(|| format!("unknown mode '{value}'"))?,
-        ),
+        Some(value) => {
+            Some(Mode::parse(&value).ok_or_else(|| format!("unknown mode '{value}'"))?)
+        }
         None => None,
     };
     let has_capabilities = super::json_field_raw(request, "capabilities").is_some();
@@ -480,8 +541,8 @@ pub fn apply(request: &str) -> Result<String, String> {
     }
 
     let base = match requested_mode {
-        Some(mode) => mode.mask().unwrap_or_else(|| MASK.load(Ordering::Acquire)),
-        None => MASK.load(Ordering::Acquire),
+        Some(mode) => mode.mask().unwrap_or(current),
+        None => current,
     };
     let mask = mask_from_json(request, base);
 
@@ -493,10 +554,35 @@ pub fn apply(request: &str) -> Result<String, String> {
         _ => mode_for_mask(mask),
     };
 
-    store(mode, mask);
-    save(mode, mask);
-    Ok(policy_json())
+    Ok(Change {
+        mode,
+        mask,
+        grants: ALL
+            .into_iter()
+            .filter(|capability| {
+                mask & capability.bit() != 0 && current & capability.bit() == 0
+            })
+            .collect(),
+        revokes: ALL
+            .into_iter()
+            .filter(|capability| {
+                mask & capability.bit() == 0 && current & capability.bit() != 0
+            })
+            .collect(),
+    })
 }
+
+/// Puts a planned change into effect. Reaching here means it is authorised -
+/// either it granted nothing, or a human said yes.
+pub fn commit(change: &Change) -> String {
+    let Ok(_guard) = WRITE_LOCK.lock() else {
+        return policy_json();
+    };
+    store(change.mode, change.mask);
+    save(change.mode, change.mask);
+    policy_json()
+}
+
 
 /// Best effort: a policy that cannot be persisted is still enforced for this
 /// session, and saying so is more useful than refusing the change.
@@ -621,6 +707,57 @@ mod tests {
         assert!(message.contains("write.duplicate"), "{message}");
         assert!(message.contains("write.delete"), "{message}");
         assert!(message.contains("setting, not an error"), "{message}");
+    }
+
+    /// The whole point of the confirmation gate: widening needs a human, and
+    /// narrowing must not, or a model could not drop a permission it no longer
+    /// wants without interrupting someone.
+    #[test]
+    fn only_widening_a_policy_needs_confirmation() {
+        let context = Mode::Context.mask().unwrap();
+        let edit = Mode::Edit.mask().unwrap();
+        let full = Mode::Full.mask().unwrap();
+
+        let widen = plan_from(r#"{"mode":"full"}"#, context).unwrap();
+        assert!(widen.grants_anything(), "context -> full must ask");
+
+        let same = plan_from(r#"{"mode":"context"}"#, context).unwrap();
+        assert!(!same.grants_anything(), "no change must not ask");
+        assert!(same.revokes.is_empty(), "and takes nothing away either");
+
+        let narrow = plan_from(r#"{"mode":"context"}"#, full).unwrap();
+        assert!(!narrow.grants_anything(), "full -> context must not ask");
+        assert!(!narrow.revokes.is_empty());
+
+        // Mixed: one bit up and one down still counts as widening, or the gate
+        // could be walked past by pairing every grant with a throwaway revoke.
+        let mixed = plan_from(
+            r#"{"capabilities":{"exec.command":true,"write.transform":false}}"#,
+            edit,
+        )
+        .unwrap();
+        assert!(mixed.grants_anything(), "any new bit must ask");
+        assert!(!mixed.revokes.is_empty(), "and it still records the revoke");
+    }
+
+    #[test]
+    fn a_change_summary_names_what_it_would_grant() {
+        let summary = plan_from(r#"{"mode":"full"}"#, Mode::Context.mask().unwrap())
+            .unwrap()
+            .summary();
+        assert!(summary.contains("exec.command"), "{summary}");
+        assert!(summary.contains("write.delete"), "{summary}");
+        assert!(summary.contains("GRANT"), "{summary}");
+        assert!(summary.contains("can destroy work"), "{summary}");
+        assert!(summary.contains("No leaves the current policy"), "{summary}");
+    }
+
+    /// A plan that applied itself would defeat the point of asking first.
+    #[test]
+    fn planning_does_not_change_anything_on_its_own() {
+        let before = MASK.load(Ordering::Acquire);
+        let _ = plan_from(r#"{"mode":"full"}"#, Mode::Context.mask().unwrap()).unwrap();
+        assert_eq!(before, MASK.load(Ordering::Acquire));
     }
 
     #[test]

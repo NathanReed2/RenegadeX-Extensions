@@ -792,6 +792,27 @@ unsafe extern "system" fn panel_proc(
     }
 }
 
+/// Asks the user to approve a policy change that arrived over the bridge.
+///
+/// Owned by the editor frame rather than by the panel, because the panel is
+/// usually closed and a prompt with no visible owner can end up behind the
+/// editor window where nobody sees it. Defaults to No.
+pub(crate) fn confirm_policy_change(summary: &str) -> bool {
+    let owner = find_editor_frame().unwrap_or(HWND(0));
+    let body = wide(summary);
+    let answer = unsafe {
+        MessageBoxW(
+            owner,
+            PCWSTR(body.as_ptr()),
+            w!("RenX MCP - Allow this policy change?"),
+            MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2 | MB_SETFOREGROUND,
+        )
+    };
+    let approved = answer == IDYES;
+    refresh();
+    approved
+}
+
 /// Turning a destructive capability *on* asks first; turning one off never does.
 ///
 /// The prompt is the one place a human is unambiguously present, which is what
