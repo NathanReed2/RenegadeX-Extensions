@@ -21,8 +21,9 @@
 //! something unexpected and nobody can reconstruct what.
 
 use std::io::Write;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 
 /// Rotated at this size, keeping one previous generation. Big enough to hold a
 /// long session, small enough to open in an editor.
@@ -30,9 +31,31 @@ const MAX_BYTES: u64 = 8 * 1024 * 1024;
 /// Arguments are recorded to make a line reconstructable, not to archive
 /// content. A property value can be a whole material expression.
 const MAX_DETAIL: usize = 600;
+const MAX_RECENT_EVENTS: usize = 256;
+pub const DEFAULT_RECENT_LIMIT: usize = 50;
+pub const MAX_RECENT_LIMIT: usize = 200;
 
 static WRITE_LOCK: Mutex<()> = Mutex::new(());
 static WRITTEN: AtomicU64 = AtomicU64::new(0);
+static NEXT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+static RECENT_EVENTS: OnceLock<Mutex<VecDeque<RecentEvent>>> = OnceLock::new();
+
+#[derive(Clone)]
+struct RecentEvent {
+    sequence: u64,
+    time: String,
+    kind: String,
+    tool: String,
+    outcome: String,
+    mode: String,
+    detail: String,
+    note: String,
+    millis: u64,
+}
+
+fn recent_events() -> &'static Mutex<VecDeque<RecentEvent>> {
+    RECENT_EVENTS.get_or_init(|| Mutex::new(VecDeque::with_capacity(MAX_RECENT_EVENTS)))
+}
 
 /// What happened, and whether it was allowed to happen.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -112,16 +135,40 @@ pub fn entries_written() -> u64 {
 /// its log would turn a full disk into an outage. A failure here is silent in
 /// release, which is the one place a comment is worth more than the code.
 pub fn record(entry: Entry<'_>) {
+    let stamp = timestamp();
+    let detail = clamp(entry.detail);
+    let note = clamp(entry.note);
+    let sequence = NEXT_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+    let event = RecentEvent {
+        sequence,
+        time: stamp.clone(),
+        kind: entry.kind.to_string(),
+        tool: entry.tool.to_string(),
+        outcome: entry.outcome.id().to_string(),
+        mode: super::policy::current_mode().id().to_string(),
+        detail: detail.clone(),
+        note: note.clone(),
+        millis: entry.millis,
+    };
+    {
+        let mut events = recent_events()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if events.len() == MAX_RECENT_EVENTS {
+            events.pop_front();
+        }
+        events.push_back(event);
+    }
     let line = format!(
         "{{\"time\":\"{}\",\"kind\":\"{}\",\"tool\":\"{}\",\"outcome\":\"{}\",\"mode\":\"{}\",\
          \"detail\":\"{}\",\"note\":\"{}\",\"ms\":{}}}\n",
-        timestamp(),
+        stamp,
         super::json_escape(entry.kind),
         super::json_escape(entry.tool),
         entry.outcome.id(),
         super::policy::current_mode().id(),
-        super::json_escape(&clamp(entry.detail)),
-        super::json_escape(&clamp(entry.note)),
+        super::json_escape(&detail),
+        super::json_escape(&note),
         entry.millis,
     );
 
@@ -143,6 +190,56 @@ pub fn record(entry: Entry<'_>) {
             WRITTEN.fetch_add(1, Ordering::Relaxed);
         }
     }
+}
+
+pub fn validate_recent(limit: usize) -> Result<(), String> {
+    if !(1..=MAX_RECENT_LIMIT).contains(&limit) {
+        return Err(format!(
+            "limit must be between 1 and {MAX_RECENT_LIMIT}"
+        ));
+    }
+    Ok(())
+}
+
+/// Returns the in-process tail of the audit stream. The on-disk JSONL remains
+/// the durable record; this ring is deliberately small and model-friendly.
+pub fn recent_json(since_sequence: u64, limit: usize) -> Result<String, String> {
+    validate_recent(limit)?;
+    let events = recent_events()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let oldest = events.front().map(|event| event.sequence).unwrap_or(0);
+    let latest = events.back().map(|event| event.sequence).unwrap_or(0);
+    let dropped_before_window = since_sequence != 0 && oldest > since_sequence.saturating_add(1);
+    let matches = events
+        .iter()
+        .filter(|event| event.sequence > since_sequence)
+        .take(limit)
+        .map(|event| {
+            format!(
+                r#"{{"sequence":{},"time":"{}","kind":"{}","tool":"{}","outcome":"{}","mode":"{}","detail":"{}","note":"{}","ms":{}}}"#,
+                event.sequence,
+                super::json_escape(&event.time),
+                super::json_escape(&event.kind),
+                super::json_escape(&event.tool),
+                super::json_escape(&event.outcome),
+                super::json_escape(&event.mode),
+                super::json_escape(&event.detail),
+                super::json_escape(&event.note),
+                event.millis,
+            )
+        })
+        .collect::<Vec<_>>();
+    let next_sequence = matches
+        .last()
+        .and_then(|entry| super::json_field_raw(entry, "sequence"))
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(since_sequence);
+    Ok(format!(
+        r#"{{"source":"in-process MCP audit ring","oldestSequence":{oldest},"latestSequence":{latest},"sinceSequence":{since_sequence},"nextSequence":{next_sequence},"droppedBeforeWindow":{dropped_before_window},"returnedCount":{},"retainedEventLimit":{MAX_RECENT_EVENTS},"events":[{}]}}"#,
+        matches.len(),
+        matches.join(","),
+    ))
 }
 
 fn clamp(text: &str) -> String {
@@ -237,5 +334,12 @@ mod tests {
     #[test]
     fn short_detail_is_untouched() {
         assert_eq!(clamp("ACTOR DELETE"), "ACTOR DELETE");
+    }
+
+    #[test]
+    fn recent_limits_are_bounded() {
+        assert!(validate_recent(DEFAULT_RECENT_LIMIT).is_ok());
+        assert!(validate_recent(0).is_err());
+        assert!(validate_recent(MAX_RECENT_LIMIT + 1).is_err());
     }
 }
