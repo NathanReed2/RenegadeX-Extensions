@@ -18,7 +18,7 @@ use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
 
 use super::{
     actor_data_json, actor_identity, actor_json, find_actor_by_path, image_address, json_escape,
-    Rotator, Vector3,
+    unreal_object_string, Rotator, Vector3,
 };
 
 const ACTIVE_LEVEL_VIEWPORT_CLIENT_RVA: usize = 0x036B_9ED0;
@@ -108,10 +108,10 @@ type SingleLineCheckFn = unsafe extern "C" fn(
 ) -> u32;
 
 #[repr(C)]
-struct CheckResult {
+pub(super) struct CheckResult {
     next: *mut c_void,
     actor: *mut c_void,
-    location: Vector3,
+    pub(super) location: Vector3,
     normal: Vector3,
     time: f32,
     item: i32,
@@ -126,6 +126,16 @@ struct CheckResult {
 }
 
 impl CheckResult {
+    /// The blocking actor's `Class Path` identity, or `None` when the hit was
+    /// on level geometry with no owning actor.
+    pub(super) fn actor_full_name(&self) -> Option<String> {
+        if self.actor.is_null() {
+            None
+        } else {
+            unreal_object_string(self.actor, true).ok()
+        }
+    }
+
     fn empty() -> Self {
         Self {
             next: std::ptr::null_mut(),
@@ -1166,16 +1176,19 @@ fn camera_ray_json(ray: &Result<CameraRay, String>) -> String {
     }
 }
 
-fn world_trace_json(ray: &Result<CameraRay, String>) -> Result<String, String> {
-    let Ok(ray) = ray else {
-        return Ok(r#"{"available":false,"reason":"no viewport ray is available"}"#.to_string());
-    };
-    let approximate = ray.source.approximate();
+/// One `UWorld::SingleLineCheck` between two world points, shared by viewport
+/// point inspection and spatial line-of-sight. Returns `None` when the line is
+/// clear.
+pub(super) fn line_check(
+    start: Vector3,
+    end: Vector3,
+    trace_flags: u32,
+) -> Result<Option<CheckResult>, String> {
     let world_slot = image_address(GWORLD_RVA, std::mem::size_of::<usize>(), "GWorld")
         .map_err(|error| error.to_string())? as *const *mut c_void;
     let world = unsafe { *world_slot };
     if world.is_null() {
-        return Ok(r#"{"available":false,"reason":"GWorld is null"}"#.to_string());
+        return Err("GWorld is null".to_string());
     }
     let function: SingleLineCheckFn = unsafe {
         std::mem::transmute(mapped_function(
@@ -1183,11 +1196,6 @@ fn world_trace_json(ray: &Result<CameraRay, String>) -> Result<String, String> {
             "UWorld::SingleLineCheck",
             SINGLE_LINE_CHECK_PROLOGUE,
         )?)
-    };
-    let end = Vector3 {
-        x: ray.origin.x + ray.direction.x * ray.trace_distance,
-        y: ray.origin.y + ray.direction.y * ray.trace_distance,
-        z: ray.origin.z + ray.direction.z * ray.trace_distance,
     };
     let extent = Vector3 { x: 0.0, y: 0.0, z: 0.0 };
     let mut hit = CheckResult::empty();
@@ -1197,13 +1205,94 @@ fn world_trace_json(ray: &Result<CameraRay, String>) -> Result<String, String> {
             &mut hit,
             std::ptr::null_mut(),
             &end,
-            &ray.origin,
-            TRACE_WORLD_AND_ACTORS_COMPLEX_MATERIAL,
+            &start,
+            trace_flags,
             &extent,
             std::ptr::null_mut(),
         ) != 0
     };
-    if clear {
+    Ok((!clear).then_some(hit))
+}
+
+pub(super) const TRACE_WORLD_AND_ACTORS: u32 = TRACE_WORLD_AND_ACTORS_COMPLEX_MATERIAL;
+
+/// The six clip planes of the active viewport, as `(normal, distance)` with
+/// inward-facing normals: a point is inside when `dot(n, p) + d >= 0` for all
+/// six. Extracted from the same view-projection the renderer used, so "in the
+/// frustum" means the same thing here as "on screen".
+pub(super) fn active_frustum(editor: *mut c_void) -> Result<([[f64; 4]; 6], Vector3), String> {
+    let (client, viewport, _) = active_viewport(editor)?;
+    let view = scene_view(editor, client, viewport)?;
+    let view_projection = view.view_matrix.multiply(&view.projection_matrix);
+    let column = |index: usize| {
+        [
+            view_projection.m[0][index] as f64,
+            view_projection.m[1][index] as f64,
+            view_projection.m[2][index] as f64,
+            view_projection.m[3][index] as f64,
+        ]
+    };
+    let add = |left: [f64; 4], right: [f64; 4]| std::array::from_fn(|i| left[i] + right[i]);
+    let subtract = |left: [f64; 4], right: [f64; 4]| std::array::from_fn(|i| left[i] - right[i]);
+    let w = column(3);
+    // UE3 renders with a D3D clip volume, so z runs 0..w and the near plane is
+    // the z column alone rather than w + z.
+    let raw = [
+        add(w, column(0)),
+        subtract(w, column(0)),
+        add(w, column(1)),
+        subtract(w, column(1)),
+        column(2),
+        subtract(w, column(2)),
+    ];
+    let mut planes = [[0.0f64; 4]; 6];
+    for (plane, source) in planes.iter_mut().zip(raw.iter()) {
+        let length = (source[0] * source[0] + source[1] * source[1] + source[2] * source[2]).sqrt();
+        if !length.is_finite() || length < 1e-9 {
+            return Err("the active viewport produced a degenerate frustum".to_string());
+        }
+        *plane = [
+            source[0] / length,
+            source[1] / length,
+            source[2] / length,
+            source[3] / length,
+        ];
+    }
+    let origin = view
+        .view_matrix
+        .inverse()
+        .ok_or_else(|| "the viewport view matrix is not invertible".to_string())?
+        .origin();
+    Ok((
+        planes,
+        Vector3 {
+            x: origin[0] as f32,
+            y: origin[1] as f32,
+            z: origin[2] as f32,
+        },
+    ))
+}
+
+fn world_trace_json(ray: &Result<CameraRay, String>) -> Result<String, String> {
+    let Ok(ray) = ray else {
+        return Ok(r#"{"available":false,"reason":"no viewport ray is available"}"#.to_string());
+    };
+    let approximate = ray.source.approximate();
+    let end = Vector3 {
+        x: ray.origin.x + ray.direction.x * ray.trace_distance,
+        y: ray.origin.y + ray.direction.y * ray.trace_distance,
+        z: ray.origin.z + ray.direction.z * ray.trace_distance,
+    };
+    let hit = match line_check(ray.origin, end, TRACE_WORLD_AND_ACTORS_COMPLEX_MATERIAL) {
+        Ok(hit) => hit,
+        Err(reason) => {
+            return Ok(format!(
+                r#"{{"available":false,"reason":"{}"}}"#,
+                json_escape(&reason)
+            ))
+        }
+    };
+    let Some(hit) = hit else {
         return Ok(format!(
             r#"{{"available":true,"hit":false,"start":{{"x":{},"y":{},"z":{}}},"end":{{"x":{},"y":{},"z":{}}},"distance":{},"rayApproximate":{approximate}}}"#,
             ray.origin.x,
@@ -1214,7 +1303,7 @@ fn world_trace_json(ray: &Result<CameraRay, String>) -> Result<String, String> {
             end.z,
             ray.trace_distance,
         ));
-    }
+    };
     let dx = hit.location.x - ray.origin.x;
     let dy = hit.location.y - ray.origin.y;
     let dz = hit.location.z - ray.origin.z;
