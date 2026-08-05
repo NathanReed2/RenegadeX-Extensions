@@ -37,7 +37,10 @@ pub extern "system" fn DllMain(
                 )
             }
         }
-        DLL_PROCESS_DETACH => {}
+        DLL_PROCESS_DETACH => {
+            #[cfg(target_arch = "x86_64")]
+            crate::udk_mcp::exceptions::mark_clean_shutdown();
+        }
 
         DLL_THREAD_ATTACH => {}
         DLL_THREAD_DETACH => {}

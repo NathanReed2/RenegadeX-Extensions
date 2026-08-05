@@ -22,6 +22,13 @@ pub mod audit;
 pub mod guard;
 pub mod panel;
 pub mod policy;
+mod assets;
+mod changes;
+pub(crate) mod exceptions;
+mod health;
+mod object;
+mod scene;
+mod state;
 mod viewport;
 
 const DEFAULT_PORT: u16 = 8765;
@@ -32,6 +39,9 @@ const MAX_COMMAND_UNITS: usize = 4096;
 const MAX_CAPTURE_UNITS: usize = 1024 * 1024;
 const MAX_SELECTED_ACTORS: i32 = 16_384;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+const MAP_HEALTH_TIMEOUT: Duration = Duration::from_secs(60);
+const MAP_HEALTH_SLOW_TIMEOUT: Duration = Duration::from_secs(120);
+const ASSET_USAGE_TIMEOUT: Duration = Duration::from_secs(60);
 
 const EDITOR_TICK_RVA: usize = 0x013C_6960;
 const EDITOR_EXEC_RVA: usize = 0x013C_EA70;
@@ -42,6 +52,7 @@ const GET_SELECTED_ACTORS_RVA: usize = 0x0126_6530;
 const GET_SELECTED_OBJECTS_RVA: usize = 0x0126_6540;
 const SELECTION_NUM_RVA: usize = 0x0017_C3A0;
 const UOBJECT_STATIC_EXEC_RVA: usize = 0x0027_BBA0;
+const UOBJECT_STATIC_FIND_OBJECT_RVA: usize = 0x0027_0520;
 const UOBJECT_GET_NAME_RVA: usize = 0x0005_7AA0;
 const UOBJECT_GET_FULL_NAME_RVA: usize = 0x0026_8A30;
 const APP_FREE_RVA: usize = 0x001C_AFE0;
@@ -50,6 +61,7 @@ const END_TRANSACTION_RVA: usize = 0x0128_8AB0;
 
 const UOBJECT_OUTER_OFFSET: usize = 0x40;
 const UOBJECT_CLASS_OFFSET: usize = 0x50;
+const USTRUCT_SUPER_STRUCT_OFFSET: usize = 0x78;
 const USELECTION_OBJECTS_OFFSET: usize = 0x60;
 const USELECTION_COUNT_OFFSET: usize = 0x68;
 const ACTOR_LOCATION_OFFSET: usize = 0x80;
@@ -59,6 +71,10 @@ const ACTOR_DRAW_SCALE3D_OFFSET: usize = 0x9C;
 
 const EDITOR_TICK_PROLOGUE: &[u8] = &[
     0x48, 0x89, 0x5C, 0x24, 0x08, 0x57, 0x48, 0x83, 0xEC, 0x30, 0x0F, 0x29, 0x74, 0x24, 0x20, 0x48,
+];
+const UOBJECT_STATIC_FIND_OBJECT_PROLOGUE: &[u8] = &[
+    0x44, 0x89, 0x4C, 0x24, 0x20, 0x55, 0x56, 0x57, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56,
+    0x41, 0x57,
 ];
 
 type EditorTickFn = extern "C" fn(*mut c_void, f32);
@@ -70,6 +86,8 @@ type UObjectGetFullNameFn =
     unsafe extern "C" fn(*mut c_void, *mut UnrealString, *mut c_void) -> *mut UnrealString;
 type AppFreeFn = unsafe extern "C" fn(*mut c_void);
 type UObjectStaticExecFn = unsafe extern "C" fn(*const u16, *mut c_void) -> u32;
+type UObjectStaticFindObjectFn =
+    unsafe extern "C" fn(*mut c_void, *mut c_void, *const u16, u32) -> *mut c_void;
 type BeginTransactionFn = unsafe extern "C" fn(*mut c_void, *const u16) -> i32;
 type EndTransactionFn = unsafe extern "C" fn(*mut c_void) -> i32;
 
@@ -119,6 +137,10 @@ enum EditorOperation {
         actor_index: usize,
         property: String,
     },
+    GetObjectProperty {
+        object_path: String,
+        property: String,
+    },
     SetActorProperty {
         actor_index: usize,
         property: String,
@@ -133,10 +155,21 @@ enum EditorOperation {
         action: ActorAction,
     },
     MapInfo,
+    MapHealth {
+        include_slow_reference_checks: bool,
+        categories: Vec<String>,
+        limit: usize,
+    },
     ViewportContext {
         grid_width: usize,
         grid_height: usize,
         max_actors: usize,
+        adaptive: bool,
+        max_samples: usize,
+    },
+    InspectViewportPoint {
+        x: i32,
+        y: i32,
     },
     FocusViewportActor {
         source: ViewportActorSource,
@@ -144,12 +177,36 @@ enum EditorOperation {
     ViewportScreenshot {
         max_width: usize,
     },
+    FindActors {
+        class_name: String,
+        query: String,
+        level: String,
+        offset: usize,
+        limit: usize,
+    },
+    ChangeState {
+        include_clean_packages: bool,
+        package_query: String,
+        history_limit: usize,
+        package_limit: usize,
+    },
+    AssetUsage {
+        object_path: String,
+        scope: String,
+        limit: usize,
+    },
+    CaptureEditorState,
+    DiffEditorState {
+        from_snapshot: String,
+        to_snapshot: Option<String>,
+    },
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 enum ViewportActorSource {
     Selected(usize),
     ScreenPoint { x: i32, y: i32 },
+    ObjectPath(String),
 }
 
 #[derive(Clone, Copy)]
@@ -298,7 +355,7 @@ fn editor_launch() -> bool {
         .any(|arg| arg.to_string_lossy().eq_ignore_ascii_case("editor"))
 }
 
-fn image_address(rva: usize, length: usize, name: &str) -> anyhow::Result<usize> {
+pub(super) fn image_address(rva: usize, length: usize, name: &str) -> anyhow::Result<usize> {
     let range = UDK_RANGE.get().context("UDK_RANGE not set")?;
     let address = range
         .start
@@ -456,13 +513,13 @@ fn unreal_object_string(object: *mut c_void, full: bool) -> Result<String, Strin
     Ok(result)
 }
 
-fn object_path_from_full_name(full_name: &str) -> &str {
+pub(super) fn object_path_from_full_name(full_name: &str) -> &str {
     full_name
         .split_once(' ')
         .map_or(full_name, |(_, path)| path)
 }
 
-fn validate_identifier(value: &str, pattern: bool) -> Result<(), String> {
+pub(super) fn validate_identifier(value: &str, pattern: bool) -> Result<(), String> {
     let valid = !value.is_empty()
         && value.len() <= 256
         && value.chars().all(|character| {
@@ -477,7 +534,10 @@ fn validate_identifier(value: &str, pattern: bool) -> Result<(), String> {
     }
 }
 
-fn run_editor_exec(editor: *mut c_void, command: &str) -> Result<(bool, String), String> {
+pub(super) fn run_editor_exec(
+    editor: *mut c_void,
+    command: &str,
+) -> Result<(bool, String), String> {
     let wide = widestring::U16CString::from_str(command)
         .map_err(|_| "command contains an embedded NUL".to_string())?;
     if wide.len() > MAX_COMMAND_UNITS {
@@ -495,7 +555,7 @@ fn run_editor_exec(editor: *mut c_void, command: &str) -> Result<(bool, String),
     Ok((handled, capture.output))
 }
 
-fn run_static_exec(command: &str) -> Result<(bool, String), String> {
+pub(super) fn run_static_exec(command: &str) -> Result<(bool, String), String> {
     let wide = widestring::U16CString::from_str(command)
         .map_err(|_| "command contains an embedded NUL".to_string())?;
     if wide.len() > MAX_COMMAND_UNITS {
@@ -512,7 +572,7 @@ fn run_static_exec(command: &str) -> Result<(bool, String), String> {
     Ok((handled, capture.output))
 }
 
-fn actor_identity(actor: *mut c_void) -> Result<(String, String, String), String> {
+pub(super) fn actor_identity(actor: *mut c_void) -> Result<(String, String, String), String> {
     let name = unreal_object_string(actor, false)?;
     let full_name = unreal_object_string(actor, true)?;
     let class = unsafe { read_pointer(actor, UOBJECT_CLASS_OFFSET) };
@@ -520,7 +580,7 @@ fn actor_identity(actor: *mut c_void) -> Result<(String, String, String), String
     Ok((name, full_name, class_name))
 }
 
-fn actor_json(index: usize, actor: *mut c_void) -> Result<String, String> {
+fn actor_data_json(actor: *mut c_void) -> Result<String, String> {
     let (name, full_name, class_name) = actor_identity(actor)?;
     let outer = unsafe { read_pointer(actor, UOBJECT_OUTER_OFFSET) };
     let level = unreal_object_string(outer, true)?;
@@ -530,7 +590,7 @@ fn actor_json(index: usize, actor: *mut c_void) -> Result<String, String> {
     let draw_scale3d =
         unsafe { *((actor as *const u8).add(ACTOR_DRAW_SCALE3D_OFFSET) as *const Vector3) };
     Ok(format!(
-        "{{\"index\":{index},\"name\":\"{}\",\"path\":\"{}\",\"fullName\":\"{}\",\"class\":\"{}\",\"level\":\"{}\",\"location\":{{\"x\":{},\"y\":{},\"z\":{}}},\"rotation\":{{\"pitch\":{},\"yaw\":{},\"roll\":{}}},\"scale\":{{\"uniform\":{},\"x\":{},\"y\":{},\"z\":{}}}}}",
+        "{{\"name\":\"{}\",\"path\":\"{}\",\"fullName\":\"{}\",\"class\":\"{}\",\"level\":\"{}\",\"location\":{{\"x\":{},\"y\":{},\"z\":{}}},\"rotation\":{{\"pitch\":{},\"yaw\":{},\"roll\":{}}},\"scale\":{{\"uniform\":{},\"x\":{},\"y\":{},\"z\":{}}}}}",
         json_escape(&name),
         json_escape(object_path_from_full_name(&full_name)),
         json_escape(&full_name),
@@ -546,6 +606,95 @@ fn actor_json(index: usize, actor: *mut c_void) -> Result<String, String> {
         draw_scale3d.x,
         draw_scale3d.y,
         draw_scale3d.z
+    ))
+}
+
+/// Resolves and verifies one exact loaded UObject path. StaticFindObject's
+/// prologue is checked against the target build so an updated executable is
+/// refused rather than called at a stale RVA.
+pub(super) fn find_object_by_path(path: &str) -> Result<*mut c_void, String> {
+    find_object_by_path_of_class(path, std::ptr::null_mut())
+}
+
+/// The class-constrained form is needed for top-level package names: UE3 can
+/// legally have another object with the same short name, while `StaticFindObject`
+/// with a null class returns the first match. The exact resolved path is still
+/// verified after lookup.
+pub(super) fn find_object_by_path_of_class(
+    path: &str,
+    required_class: *mut c_void,
+) -> Result<*mut c_void, String> {
+    if path.is_empty()
+        || path.len() > MAX_COMMAND_UNITS
+        || path
+            .chars()
+            .any(|character| character.is_whitespace() || character.is_control())
+    {
+        return Err("objectPath is invalid or too long".to_string());
+    }
+    let address = image_address(
+        UOBJECT_STATIC_FIND_OBJECT_RVA,
+        UOBJECT_STATIC_FIND_OBJECT_PROLOGUE.len(),
+        "UObject::StaticFindObject",
+    )
+    .map_err(|error| error.to_string())?;
+    let actual = unsafe {
+        std::slice::from_raw_parts(
+            address as *const u8,
+            UOBJECT_STATIC_FIND_OBJECT_PROLOGUE.len(),
+        )
+    };
+    if actual != UOBJECT_STATIC_FIND_OBJECT_PROLOGUE {
+        return Err(format!(
+            "UObject::StaticFindObject does not match the verified RenXSDK build at RVA 0x{UOBJECT_STATIC_FIND_OBJECT_RVA:X}; object-path lookup was refused"
+        ));
+    }
+    let name = widestring::U16CString::from_str(path)
+        .map_err(|_| "objectPath contains an embedded null".to_string())?;
+    let find: UObjectStaticFindObjectFn = unsafe { std::mem::transmute(address) };
+    let object = unsafe {
+        find(
+            required_class,
+            usize::MAX as *mut c_void,
+            name.as_ptr(),
+            0,
+        )
+    };
+    if object.is_null() {
+        return Err(format!("no loaded object has path '{path}'"));
+    }
+    let (_, full_name, _) = actor_identity(object)?;
+    let resolved_path = object_path_from_full_name(&full_name);
+    if !resolved_path.eq_ignore_ascii_case(path) {
+        return Err(format!(
+            "object lookup was ambiguous: requested '{path}', resolved '{resolved_path}'"
+        ));
+    }
+    Ok(object)
+}
+
+fn find_actor_by_path(path: &str) -> Result<*mut c_void, String> {
+    let object = find_object_by_path(path)?;
+    // These are the UObject/UStruct class-chain fields verified against the
+    // symbolized source build. Only this actor-only wrapper performs the walk.
+    let mut class = unsafe { read_pointer(object, UOBJECT_CLASS_OFFSET) };
+    for _ in 0..128 {
+        if class.is_null() {
+            break;
+        }
+        if unreal_object_string(class, false)?.eq_ignore_ascii_case("Actor") {
+            return Ok(object);
+        }
+        class = unsafe { read_pointer(class, USTRUCT_SUPER_STRUCT_OFFSET) };
+    }
+    Err(format!("'{path}' is loaded, but it is not an Actor"))
+}
+
+fn actor_json(index: usize, actor: *mut c_void) -> Result<String, String> {
+    let data = actor_data_json(actor)?;
+    Ok(format!(
+        "{{\"index\":{index},{}",
+        data.strip_prefix('{').unwrap_or(&data)
     ))
 }
 
@@ -694,15 +843,26 @@ fn operation_touches_selection(operation: &EditorOperation) -> bool {
         | EditorOperation::SetActorProperty { .. }
         | EditorOperation::ActorAction { .. }
         | EditorOperation::ViewportContext { .. }
+        | EditorOperation::InspectViewportPoint { .. }
+        | EditorOperation::CaptureEditorState
+        | EditorOperation::DiffEditorState { .. }
         | EditorOperation::FocusViewportActor {
             source: ViewportActorSource::Selected(_),
         } => true,
         EditorOperation::Exec(_)
+        | EditorOperation::GetObjectProperty { .. }
         | EditorOperation::SetObjectProperty { .. }
         | EditorOperation::MapInfo
+        | EditorOperation::MapHealth { .. }
+        | EditorOperation::FindActors { .. }
+        | EditorOperation::ChangeState { .. }
+        | EditorOperation::AssetUsage { .. }
         | EditorOperation::ViewportScreenshot { .. }
         | EditorOperation::FocusViewportActor {
             source: ViewportActorSource::ScreenPoint { .. },
+        }
+        | EditorOperation::FocusViewportActor {
+            source: ViewportActorSource::ObjectPath(_),
         } => false,
     }
 }
@@ -720,6 +880,10 @@ fn operation_description(operation: &EditorOperation) -> String {
             actor_index,
             property,
         } => format!("read {property} of actor {actor_index}"),
+        EditorOperation::GetObjectProperty {
+            object_path,
+            property,
+        } => format!("read {property} from exact object {object_path}"),
         EditorOperation::SetActorProperty {
             actor_index,
             property,
@@ -741,8 +905,14 @@ fn operation_description(operation: &EditorOperation) -> String {
             ActorAction::MoveToGrid => "ACTOR ALIGN MOVETOGRID",
         }),
         EditorOperation::MapInfo => "read map info".to_string(),
+        EditorOperation::MapHealth { .. } => {
+            "run UE3's bounded, read-only map validation".to_string()
+        }
         EditorOperation::ViewportContext { .. } => {
             "inspect the active viewport camera and visible actors".to_string()
+        }
+        EditorOperation::InspectViewportPoint { x, y } => {
+            format!("inspect viewport point ({x},{y})")
         }
         EditorOperation::FocusViewportActor { source } => match source {
             ViewportActorSource::Selected(index) => {
@@ -751,10 +921,35 @@ fn operation_description(operation: &EditorOperation) -> String {
             ViewportActorSource::ScreenPoint { x, y } => {
                 format!("frame the actor at viewport point ({x},{y})")
             }
+            ViewportActorSource::ObjectPath(path) => {
+                format!("frame actor '{path}' in the active viewport")
+            }
         },
         EditorOperation::ViewportScreenshot { .. } => {
             "capture the active viewport as a downscaled screenshot".to_string()
         }
+        EditorOperation::FindActors {
+            class_name,
+            query,
+            level,
+            ..
+        } => format!(
+            "search loaded {class_name} actors for query '{query}' in level '{level}'"
+        ),
+        EditorOperation::ChangeState { .. } => {
+            "inspect native undo/redo history and loaded package dirtiness".to_string()
+        }
+        EditorOperation::AssetUsage { object_path, .. } => {
+            format!("find loaded objects that reference exact object '{object_path}'")
+        }
+        EditorOperation::CaptureEditorState => "capture a bounded editor state snapshot".to_string(),
+        EditorOperation::DiffEditorState {
+            from_snapshot,
+            to_snapshot,
+        } => format!(
+            "compare editor snapshots {from_snapshot} and {}",
+            to_snapshot.as_deref().unwrap_or("the current state")
+        ),
     }
 }
 
@@ -848,6 +1043,13 @@ fn execute_editor_operation(
                 json_escape(&output)
             )))
         }
+        EditorOperation::GetObjectProperty {
+            object_path,
+            property,
+        } => Ok(EditorValue::Json(object::read_property(
+            &object_path,
+            &property,
+        )?)),
         EditorOperation::SetActorProperty {
             actor_index,
             property,
@@ -991,10 +1193,22 @@ fn execute_editor_operation(
                 json_escape(&output)
             )))
         }
+        EditorOperation::MapHealth {
+            include_slow_reference_checks,
+            categories,
+            limit,
+        } => Ok(EditorValue::Json(health::report(
+            editor,
+            include_slow_reference_checks,
+            &categories,
+            limit,
+        )?)),
         EditorOperation::ViewportContext {
             grid_width,
             grid_height,
             max_actors,
+            adaptive,
+            max_samples,
         } => {
             let selected = selected_actor_pointers(editor)?;
             Ok(EditorValue::Json(viewport::semantic_context(
@@ -1003,12 +1217,21 @@ fn execute_editor_operation(
                 grid_width,
                 grid_height,
                 max_actors,
+                adaptive,
+                max_samples,
+            )?))
+        }
+        EditorOperation::InspectViewportPoint { x, y } => {
+            let selected = selected_actor_pointers(editor)?;
+            Ok(EditorValue::Json(viewport::inspect_point(
+                editor, &selected, x, y,
             )?))
         }
         EditorOperation::FocusViewportActor { source } => {
             let selected = match source {
                 ViewportActorSource::Selected(_) => selected_actor_pointers(editor)?,
-                ViewportActorSource::ScreenPoint { .. } => Vec::new(),
+                ViewportActorSource::ScreenPoint { .. }
+                | ViewportActorSource::ObjectPath(_) => Vec::new(),
             };
             Ok(EditorValue::Json(viewport::focus_actor(
                 editor, &selected, source,
@@ -1021,6 +1244,56 @@ fn execute_editor_operation(
                 data,
                 metadata,
             })
+        }
+        EditorOperation::FindActors {
+            class_name,
+            query,
+            level,
+            offset,
+            limit,
+        } => Ok(EditorValue::Json(scene::find_actors(
+            &class_name,
+            &query,
+            &level,
+            offset,
+            limit,
+        )?)),
+        EditorOperation::ChangeState {
+            include_clean_packages,
+            package_query,
+            history_limit,
+            package_limit,
+        } => Ok(EditorValue::Json(changes::inspect(
+            editor,
+            include_clean_packages,
+            &package_query,
+            history_limit,
+            package_limit,
+        )?)),
+        EditorOperation::AssetUsage {
+            object_path,
+            scope,
+            limit,
+        } => Ok(EditorValue::Json(assets::usage(
+            &object_path,
+            &scope,
+            limit,
+        )?)),
+        EditorOperation::CaptureEditorState => {
+            let selected = selected_actor_pointers(editor)?;
+            Ok(EditorValue::Json(state::capture(editor, &selected)?))
+        }
+        EditorOperation::DiffEditorState {
+            from_snapshot,
+            to_snapshot,
+        } => {
+            let selected = selected_actor_pointers(editor)?;
+            Ok(EditorValue::Json(state::diff(
+                editor,
+                &selected,
+                &from_snapshot,
+                to_snapshot.as_deref(),
+            )?))
         }
     }
 }
@@ -1048,15 +1321,23 @@ fn required_capability(operation: &EditorOperation) -> policy::Capability {
         EditorOperation::SelectionCounts | EditorOperation::SelectedActors => {
             policy::Capability::ReadSelection
         }
-        EditorOperation::ListActorProperties { .. } | EditorOperation::GetActorProperty { .. } => {
-            policy::Capability::ReadProperties
-        }
+        EditorOperation::ListActorProperties { .. }
+        | EditorOperation::GetActorProperty { .. }
+        | EditorOperation::GetObjectProperty { .. } => policy::Capability::ReadProperties,
         EditorOperation::SetActorProperty { .. } => policy::Capability::WriteActorProperty,
         EditorOperation::SetObjectProperty { .. } => policy::Capability::WriteObjectProperty,
-        EditorOperation::MapInfo => policy::Capability::ReadMap,
+        EditorOperation::MapInfo | EditorOperation::MapHealth { .. } => policy::Capability::ReadMap,
         EditorOperation::ViewportContext { .. }
+        | EditorOperation::InspectViewportPoint { .. }
         | EditorOperation::ViewportScreenshot { .. } => policy::Capability::ReadViewport,
         EditorOperation::FocusViewportActor { .. } => policy::Capability::ControlViewport,
+        EditorOperation::FindActors { .. } => policy::Capability::ReadScene,
+        EditorOperation::AssetUsage { .. } => policy::Capability::ReadScene,
+        EditorOperation::ChangeState { .. }
+        | EditorOperation::CaptureEditorState
+        | EditorOperation::DiffEditorState { .. } => {
+            policy::Capability::ReadState
+        }
         EditorOperation::ActorAction { action } => match action {
             ActorAction::Delete => policy::Capability::WriteDelete,
             ActorAction::Duplicate => policy::Capability::WriteDuplicate,
@@ -1134,6 +1415,15 @@ fn submit_guarded(operation: EditorOperation, guards: Guards) -> Result<EditorVa
                     policy refusal - retry in a few seconds."
             .to_string());
     }
+    let timeout = match &operation {
+        EditorOperation::MapHealth {
+            include_slow_reference_checks: true,
+            ..
+        } => MAP_HEALTH_SLOW_TIMEOUT,
+        EditorOperation::MapHealth { .. } => MAP_HEALTH_TIMEOUT,
+        EditorOperation::AssetUsage { .. } => ASSET_USAGE_TIMEOUT,
+        _ => REQUEST_TIMEOUT,
+    };
     let (sender, receiver) = mpsc::sync_channel(1);
     {
         let mut queue = request_queue()
@@ -1153,7 +1443,7 @@ fn submit_guarded(operation: EditorOperation, guards: Guards) -> Result<EditorVa
     // dialog, a long import or build - stops that thread from getting here, and
     // the symptom is this timeout. Saying so matters because the alternative
     // reading is "the bridge is broken", which it is not.
-    receiver.recv_timeout(REQUEST_TIMEOUT).map_err(|_| {
+    receiver.recv_timeout(timeout).map_err(|_| {
         "The editor did not process this within the timeout. This is not a policy refusal and not \
          a bridge fault: the editor runs bridge work between frames, so anything holding its main \
          loop - an open menu, a modal dialog, or a long operation such as a build or import - \
@@ -1822,7 +2112,7 @@ fn handle_json_rpc(body: &str) -> Option<String> {
 fn initialize_result() -> String {
     let mode = policy::current_mode();
     format!(
-        "{{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{{\"tools\":{{\"listChanged\":false}}}},\"serverInfo\":{{\"name\":\"renx-udk-editor\",\"version\":\"0.3.0\"}},\"instructions\":\"Controls the local Renegade X Win64 UDK editor. Actor indices refer to the current selection and can change whenever selection changes. Mutation tools participate in UE3 undo transactions.\\n\\nEditor policy mode is '{}': {} Only the tools this mode permits are listed; the operator sets this in the RenX MCP control panel and it cannot be changed through this connection. If a task needs something the mode forbids, say so rather than looking for another route to the same effect.\"}}",
+        "{{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{{\"tools\":{{\"listChanged\":false}}}},\"serverInfo\":{{\"name\":\"renx-udk-editor\",\"version\":\"0.7.0\"}},\"instructions\":\"Controls the local Renegade X Win64 UDK editor. Actor indices refer to the current selection and can change whenever selection changes. Object paths returned by scene search are stable for the current loaded map. Mutation tools participate in UE3 undo transactions.\\n\\nEditor policy mode is '{}': {} Only the tools this mode permits are listed; the operator sets this in the RenX MCP control panel and it cannot be changed through this connection. If a task needs something the mode forbids, say so rather than looking for another route to the same effect.\"}}",
         mode.id(),
         json_escape(mode.describe())
     )
@@ -1835,18 +2125,30 @@ fn initialize_result() -> String {
 /// permitted.
 fn tool_capability(tool: &str) -> Option<policy::Capability> {
     Some(match tool {
-        "renx_editor_status" => policy::Capability::ReadStatus,
+        "renx_editor_status" | "renx_get_recent_events" | "renx_get_exception_context" => {
+            policy::Capability::ReadStatus
+        }
         "renx_get_selection_counts" | "renx_get_selected_actors" => {
             policy::Capability::ReadSelection
         }
-        "renx_list_actor_properties" | "renx_get_actor_property" => {
+        "renx_list_actor_properties"
+        | "renx_get_actor_property"
+        | "renx_get_object_property" => {
             policy::Capability::ReadProperties
         }
-        "renx_get_map_info" => policy::Capability::ReadMap,
-        "renx_get_viewport_context" | "renx_capture_viewport" => {
+        "renx_get_map_info" | "renx_get_map_health" => policy::Capability::ReadMap,
+        "renx_get_viewport_context"
+        | "renx_inspect_viewport_point"
+        | "renx_capture_viewport" => {
             policy::Capability::ReadViewport
         }
         "renx_focus_viewport_actor" => policy::Capability::ControlViewport,
+        "renx_find_actors" | "renx_get_asset_usage" | "renx_get_missing_asset_diagnostics" => {
+            policy::Capability::ReadScene
+        }
+        "renx_get_change_state" | "renx_capture_editor_state" | "renx_diff_editor_state" => {
+            policy::Capability::ReadState
+        }
         "renx_set_actor_property" => policy::Capability::WriteActorProperty,
         "renx_set_object_property" => policy::Capability::WriteObjectProperty,
         "renx_exec" => policy::Capability::Exec,
@@ -1901,18 +2203,29 @@ fn tools_list_with(permitted: impl Fn(&str) -> bool) -> String {
 
 /// Paired with their names so the list can be filtered without parsing it back.
 const TOOL_DEFINITIONS: &[(&str, &str)] = &[
-    ("renx_focus_viewport_actor", r#"{"name":"renx_focus_viewport_actor","description":"Move only the active camera to frame a selected actor or an actor at a focusPoint from renx_get_viewport_context. Does not change selection or the map.","inputSchema":{"type":"object","properties":{"actorIndex":{"type":"integer","minimum":0},"x":{"type":"integer","minimum":0},"y":{"type":"integer","minimum":0},"selectionToken":{"type":"string"}},"anyOf":[{"required":["actorIndex"]},{"required":["x","y"]}],"additionalProperties":false}}"#),
+    ("renx_focus_viewport_actor", r#"{"name":"renx_focus_viewport_actor","description":"Move only the active camera to frame a selected actor, an actor at a viewport point, or an exact stable objectPath returned by scene inspection. Does not change selection or the map.","inputSchema":{"type":"object","properties":{"actorIndex":{"type":"integer","minimum":0},"x":{"type":"integer","minimum":0},"y":{"type":"integer","minimum":0},"objectPath":{"type":"string","description":"Exact loaded actor path, such as Map.TheWorld:PersistentLevel.Actor_0."},"selectionToken":{"type":"string"}},"anyOf":[{"required":["actorIndex"]},{"required":["x","y"]},{"required":["objectPath"]}],"additionalProperties":false}}"#),
     ("renx_capture_viewport", r#"{"name":"renx_capture_viewport","description":"Capture the active viewport as a downscaled image. Use only when pixels matter; semantic viewport context is much lighter.","inputSchema":{"type":"object","properties":{"maxWidth":{"type":"integer","minimum":160,"maximum":1280,"default":640}},"additionalProperties":false}}"#),
-    ("renx_get_viewport_context", r#"{"name":"renx_get_viewport_context","description":"Read camera pose, center hit, and occlusion-aware visible actors from UE3 hit proxies. Use this before the heavier screenshot tool.","inputSchema":{"type":"object","properties":{"gridWidth":{"type":"integer","minimum":3,"maximum":31,"default":17},"gridHeight":{"type":"integer","minimum":3,"maximum":21,"default":11},"maxActors":{"type":"integer","minimum":1,"maximum":100,"default":32}},"additionalProperties":false}}"#),
+    ("renx_get_viewport_context", r#"{"name":"renx_get_viewport_context","description":"Read camera pose, center hit, and occlusion-aware visible actors from a bounded adaptive UE3 hit-proxy scan. Use this before the heavier screenshot tool.","inputSchema":{"type":"object","properties":{"gridWidth":{"type":"integer","minimum":3,"maximum":31,"default":17},"gridHeight":{"type":"integer","minimum":3,"maximum":21,"default":11},"maxActors":{"type":"integer","minimum":1,"maximum":100,"default":32},"adaptive":{"type":"boolean","default":true,"description":"Refine cells where actor or proxy identity changes."},"maxSamples":{"type":"integer","minimum":9,"maximum":2048,"default":512,"description":"Hard cap including the initial grid."}},"additionalProperties":false}}"#),
+    ("renx_inspect_viewport_point", r#"{"name":"renx_inspect_viewport_point","description":"Inspect one exact viewport pixel through UE3 hit proxies and a native world collision trace. Returns proxy hierarchy, stable actor path and transform, selected index, camera ray, hit location/normal/component/material/level, and proxy details without changing selection.","inputSchema":{"type":"object","properties":{"x":{"type":"integer","minimum":0},"y":{"type":"integer","minimum":0}},"required":["x","y"],"additionalProperties":false}}"#),
+    ("renx_find_actors", r#"{"name":"renx_find_actors","description":"Search loaded actors without changing selection. Returns paginated stable object paths, actual classes, levels, maps, and UE3 memory figures. Use a narrow class filter when possible.","inputSchema":{"type":"object","properties":{"class":{"type":"string","default":"Actor","description":"UE3 class; subclasses are included."},"query":{"type":"string","default":"","description":"Case-insensitive substring matched against name, path, or actual class."},"level":{"type":"string","default":"","description":"Optional case-insensitive level-path substring."},"offset":{"type":"integer","minimum":0,"maximum":50000,"default":0},"limit":{"type":"integer","minimum":1,"maximum":200,"default":50}},"additionalProperties":false}}"#),
+    ("renx_capture_editor_state", r#"{"name":"renx_capture_editor_state","description":"Store a bounded semantic snapshot of the map, loaded actor identities, selection and selected transforms, plus active camera. Returns a stable snapshotId; no map or selection changes are made.","inputSchema":{"type":"object","properties":{},"additionalProperties":false}}"#),
+    ("renx_diff_editor_state", r#"{"name":"renx_diff_editor_state","description":"Compare two retained semantic editor snapshots, or compare one snapshot with a newly captured current state. Reports map, actor, selection, selected-transform, and camera changes without returning bulky unchanged state.","inputSchema":{"type":"object","properties":{"fromSnapshot":{"type":"string","description":"snapshotId returned by renx_capture_editor_state."},"toSnapshot":{"type":"string","description":"Optional retained snapshotId; omit to capture and compare current state."}},"required":["fromSnapshot"],"additionalProperties":false}}"#),
+    ("renx_get_recent_events", r#"{"name":"renx_get_recent_events","description":"Read a bounded structured tail of MCP calls, policy refusals, failures, and timings from this editor session. Use sinceSequence to poll incrementally; the durable JSONL audit remains on disk.","inputSchema":{"type":"object","properties":{"sinceSequence":{"type":"integer","minimum":0,"default":0},"limit":{"type":"integer","minimum":1,"maximum":200,"default":50}},"additionalProperties":false}}"#),
+    ("renx_get_exception_context", r#"{"name":"renx_get_exception_context","description":"Read persistent first-chance Windows exception context, register state, possible previous-session crash candidates, and nearby dump artifacts. First-chance records may have been handled and never imply a confirmed crash by themselves.","inputSchema":{"type":"object","properties":{"sinceSequence":{"type":"integer","minimum":0,"default":0},"limit":{"type":"integer","minimum":1,"maximum":64,"default":32},"includePreviousSessions":{"type":"boolean","default":true}},"additionalProperties":false}}"#),
+    ("renx_get_change_state", r#"{"name":"renx_get_change_state","description":"Inspect UE3's native undo/redo history and loaded dirty packages without changing either. Undo and redo entries are ordered with the next action first.","inputSchema":{"type":"object","properties":{"historyLimit":{"type":"integer","minimum":1,"maximum":128,"default":32},"includeCleanPackages":{"type":"boolean","default":false},"packageQuery":{"type":"string","default":"","description":"Optional case-insensitive loaded-package path substring."},"packageLimit":{"type":"integer","minimum":1,"maximum":500,"default":100}},"additionalProperties":false}}"#),
+    ("renx_get_asset_usage", r#"{"name":"renx_get_asset_usage","description":"Find loaded objects that reference one exact loaded asset/object path using UE3's native reference serializer. Returns external/internal referencers and referencing properties without changing selection.","inputSchema":{"type":"object","properties":{"objectPath":{"type":"string","description":"Exact loaded object path without a class prefix."},"scope":{"type":"string","enum":["all","external","internal"],"default":"all"},"limit":{"type":"integer","minimum":1,"maximum":200,"default":50}},"required":["objectPath"],"additionalProperties":false}}"#),
+    ("renx_get_missing_asset_diagnostics", r#"{"name":"renx_get_missing_asset_diagnostics","description":"Scan bounded tails of recent UE3 editor logs for failed asset/package loads and unresolved imports, including referring object/property when UE3 logged them.","inputSchema":{"type":"object","properties":{"query":{"type":"string","default":"","description":"Optional case-insensitive missing path or message substring."},"limit":{"type":"integer","minimum":1,"maximum":200,"default":50},"maxLogFiles":{"type":"integer","minimum":1,"maximum":8,"default":3}},"additionalProperties":false}}"#),
     ("renx_editor_status", "{\"name\":\"renx_editor_status\",\"description\":\"Report whether the Renegade X editor-thread bridge is ready.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}}"),
     ("renx_get_selection_counts", "{\"name\":\"renx_get_selection_counts\",\"description\":\"Return selected actor and selected object counts from the editor.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}}"),
     ("renx_get_selected_actors", "{\"name\":\"renx_get_selected_actors\",\"description\":\"Return selected actor names, paths, classes, levels, locations, rotations, and scales. Also returns selectionToken: pass it to a later mutation and that mutation is refused if the user changed the selection in between.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}}"),
     ("renx_list_actor_properties", "{\"name\":\"renx_list_actor_properties\",\"description\":\"List reflected properties on a selected actor class using UE3 UProperty metadata.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"actorIndex\":{\"type\":\"integer\",\"minimum\":0},\"pattern\":{\"type\":\"string\",\"default\":\"*\",\"description\":\"Property wildcard using * and ?\"}},\"required\":[\"actorIndex\"],\"additionalProperties\":false}}"),
     ("renx_get_actor_property", "{\"name\":\"renx_get_actor_property\",\"description\":\"Export one reflected property from a selected actor through UProperty::ExportText.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"actorIndex\":{\"type\":\"integer\",\"minimum\":0},\"property\":{\"type\":\"string\"}},\"required\":[\"actorIndex\",\"property\"],\"additionalProperties\":false}}"),
+    ("renx_get_object_property", r#"{"name":"renx_get_object_property","description":"Read one reflected property from an exact loaded UObject path without changing selection. Paths returned by scene and viewport tools can be passed directly.","inputSchema":{"type":"object","properties":{"objectPath":{"type":"string","description":"Exact loaded object path without a class prefix."},"property":{"type":"string","description":"Reflected UE3 property identifier."}},"required":["objectPath","property"],"additionalProperties":false}}"#),
     ("renx_set_actor_property", "{\"name\":\"renx_set_actor_property\",\"description\":\"Import one reflected property on a selected actor inside an undo transaction.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"actorIndex\":{\"type\":\"integer\",\"minimum\":0},\"property\":{\"type\":\"string\"},\"value\":{\"type\":\"string\"},\"dryRun\":{\"type\":\"boolean\",\"default\":false,\"description\":\"Report what would change without changing it.\"},\"selectionToken\":{\"type\":\"string\",\"description\":\"Token from renx_get_selected_actors; refuses the call if the selection changed since.\"},\"confirmLargeChange\":{\"type\":\"boolean\",\"default\":false,\"description\":\"Required when more than 50 actors are selected. Only pass this after telling the user the count and being told to proceed.\"}},\"required\":[\"actorIndex\",\"property\",\"value\"],\"additionalProperties\":false}}"),
     ("renx_set_object_property", "{\"name\":\"renx_set_object_property\",\"description\":\"Import one reflected property on a UObject path inside an undo transaction.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"objectPath\":{\"type\":\"string\",\"description\":\"UE3 object path without the class prefix\"},\"property\":{\"type\":\"string\"},\"value\":{\"type\":\"string\"},\"dryRun\":{\"type\":\"boolean\",\"default\":false,\"description\":\"Report what would change without changing it.\"}},\"required\":[\"objectPath\",\"property\",\"value\"],\"additionalProperties\":false}}"),
     ("renx_actor_action", "{\"name\":\"renx_actor_action\",\"description\":\"Run an undo-aware native editor action on selected actors. Delete requires confirm=true. Individual actions may be disabled by editor policy.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"action\":{\"type\":\"string\",\"enum\":[\"duplicate\",\"delete\",\"reset_location\",\"reset_rotation\",\"reset_scale\",\"snap_to_floor\",\"move_to_grid\"]},\"confirm\":{\"type\":\"boolean\",\"default\":false},\"dryRun\":{\"type\":\"boolean\",\"default\":false,\"description\":\"Report what would change without changing it.\"},\"selectionToken\":{\"type\":\"string\",\"description\":\"Token from renx_get_selected_actors; refuses the call if the selection changed since.\"},\"confirmLargeChange\":{\"type\":\"boolean\",\"default\":false,\"description\":\"Required when more than 50 actors are selected. Only pass this after telling the user the count and being told to proceed.\"}},\"required\":[\"action\"],\"additionalProperties\":false}}"),
     ("renx_get_map_info", "{\"name\":\"renx_get_map_info\",\"description\":\"Report the current map inferred from selected actors, selected levels, and UE3 WorldInfo listing.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}}"),
+    ("renx_get_map_health", r#"{"name":"renx_get_map_health","description":"Run UE3's native Map Check without opening a dialog or clearing existing results, then return bounded structured findings. Does not change selection or map/package contents.","inputSchema":{"type":"object","properties":{"includeSlowReferenceChecks":{"type":"boolean","default":false,"description":"Enable UE3's slower reference checks."},"categories":{"type":"array","items":{"type":"string"},"maxItems":32,"default":[],"description":"Optional exact MapCheck category identifiers such as MatchingLightGUID."},"limit":{"type":"integer","minimum":1,"maximum":500,"default":200}},"additionalProperties":false}}"#),
     ("renx_exec", "{\"name\":\"renx_exec\",\"description\":\"Execute a UE3 editor command on the editor thread and return captured FOutputDevice text. Commands may modify maps and packages. Read-only commands (OBJ LIST, LISTPROPS, GETALL, SHOW, STAT, SELECT, CAMERA, MODE) run directly; anything else raises a prompt in the editor that the user must accept, so expect a delay and a possible refusal.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"command\":{\"type\":\"string\",\"description\":\"UE3 editor Exec command\"},\"dryRun\":{\"type\":\"boolean\",\"default\":false,\"description\":\"Report what would run without running it, and without prompting the user.\"}},\"required\":[\"command\"],\"additionalProperties\":false}}"),
 ];
 
@@ -2038,6 +2351,37 @@ fn dispatch_tool_call(body: &str) -> Result<String, (i32, String)> {
             );
             Ok(tool_success(&structured))
         }
+        "renx_get_recent_events" => {
+            let arguments = json_field_raw(params, "arguments").unwrap_or("{}");
+            let since_sequence = optional_usize(arguments, "sinceSequence")?.unwrap_or(0) as u64;
+            let limit = optional_usize(arguments, "limit")?.unwrap_or(audit::DEFAULT_RECENT_LIMIT);
+            match audit::recent_json(since_sequence, limit) {
+                Ok(structured) => Ok(tool_success(&structured)),
+                Err(error) => Err((-32602, error)),
+            }
+        }
+        "renx_get_exception_context" => {
+            let arguments = json_field_raw(params, "arguments").unwrap_or("{}");
+            let since_sequence = optional_usize(arguments, "sinceSequence")?.unwrap_or(0) as u64;
+            let limit = optional_usize(arguments, "limit")?.unwrap_or(exceptions::DEFAULT_LIMIT);
+            let include_previous_sessions =
+                optional_bool(arguments, "includePreviousSessions")?.unwrap_or(true);
+            match exceptions::query(since_sequence, limit, include_previous_sessions) {
+                Ok(structured) => Ok(tool_success(&structured)),
+                Err(error) => Err((-32602, error)),
+            }
+        }
+        "renx_get_missing_asset_diagnostics" => {
+            let arguments = json_field_raw(params, "arguments").unwrap_or("{}");
+            let query = json_field_string(arguments, "query").unwrap_or_default();
+            let limit = optional_usize(arguments, "limit")?.unwrap_or(assets::DEFAULT_MISSING_LIMIT);
+            let max_log_files = optional_usize(arguments, "maxLogFiles")?
+                .unwrap_or(assets::DEFAULT_LOG_FILES);
+            match assets::missing_diagnostics(&query, limit, max_log_files) {
+                Ok(structured) => Ok(tool_success(&structured)),
+                Err(error) => Err((-32602, error)),
+            }
+        }
         "renx_get_selection_counts" => {
             match submit_editor_operation(EditorOperation::SelectionCounts) {
                 Ok(EditorValue::SelectionCounts { actors, objects }) => Ok(tool_success(&format!(
@@ -2075,6 +2419,19 @@ fn dispatch_tool_call(body: &str) -> Result<String, (i32, String)> {
             let property = required_string(arguments, "property")?;
             match submit_editor_operation(EditorOperation::GetActorProperty {
                 actor_index,
+                property,
+            }) {
+                Ok(EditorValue::Json(structured)) => Ok(tool_success(&structured)),
+                Ok(_) => unreachable!(),
+                Err(error) => Ok(tool_error(&error)),
+            }
+        }
+        "renx_get_object_property" => {
+            let arguments = tool_arguments(params, &name)?;
+            let object_path = required_string(arguments, "objectPath")?;
+            let property = required_string(arguments, "property")?;
+            match submit_editor_operation(EditorOperation::GetObjectProperty {
+                object_path,
                 property,
             }) {
                 Ok(EditorValue::Json(structured)) => Ok(tool_success(&structured)),
@@ -2152,6 +2509,28 @@ fn dispatch_tool_call(body: &str) -> Result<String, (i32, String)> {
             Ok(_) => unreachable!(),
             Err(error) => Ok(tool_error(&error)),
         },
+        "renx_get_map_health" => {
+            let arguments = json_field_raw(params, "arguments").unwrap_or("{}");
+            let include_slow_reference_checks =
+                optional_bool(arguments, "includeSlowReferenceChecks")?.unwrap_or(false);
+            let categories = optional_string_array(arguments, "categories")?;
+            let limit = optional_usize(arguments, "limit")?.unwrap_or(health::DEFAULT_LIMIT);
+            if !(1..=health::MAX_LIMIT).contains(&limit) {
+                return Err((
+                    -32602,
+                    format!("limit must be between 1 and {}", health::MAX_LIMIT),
+                ));
+            }
+            match submit_editor_operation(EditorOperation::MapHealth {
+                include_slow_reference_checks,
+                categories,
+                limit,
+            }) {
+                Ok(EditorValue::Json(structured)) => Ok(tool_success(&structured)),
+                Ok(_) => unreachable!(),
+                Err(error) => Ok(tool_error(&error)),
+            }
+        }
         "renx_get_viewport_context" => {
             let arguments = json_field_raw(params, "arguments").unwrap_or("{}");
             let grid_width = optional_usize(arguments, "gridWidth")?
@@ -2160,14 +2539,37 @@ fn dispatch_tool_call(body: &str) -> Result<String, (i32, String)> {
                 .unwrap_or(viewport::DEFAULT_GRID_HEIGHT);
             let max_actors = optional_usize(arguments, "maxActors")?
                 .unwrap_or(viewport::DEFAULT_MAX_ACTORS);
-            if let Err(error) = viewport::validate_scan(grid_width, grid_height, max_actors) {
+            let adaptive = optional_bool(arguments, "adaptive")?.unwrap_or(true);
+            let initial_samples = grid_width.saturating_mul(grid_height);
+            let max_samples = optional_usize(arguments, "maxSamples")?
+                .unwrap_or(viewport::DEFAULT_MAX_SAMPLES.max(initial_samples));
+            if let Err(error) = viewport::validate_scan(
+                grid_width,
+                grid_height,
+                max_actors,
+                max_samples,
+            ) {
                 return Err((-32602, error));
             }
             match submit_editor_operation(EditorOperation::ViewportContext {
                 grid_width,
                 grid_height,
                 max_actors,
+                adaptive,
+                max_samples,
             }) {
+                Ok(EditorValue::Json(structured)) => Ok(tool_success(&structured)),
+                Ok(_) => unreachable!(),
+                Err(error) => Ok(tool_error(&error)),
+            }
+        }
+        "renx_inspect_viewport_point" => {
+            let arguments = tool_arguments(params, &name)?;
+            let x = i32::try_from(required_usize(arguments, "x")?)
+                .map_err(|_| (-32602, "x is too large".to_string()))?;
+            let y = i32::try_from(required_usize(arguments, "y")?)
+                .map_err(|_| (-32602, "y is too large".to_string()))?;
+            match submit_editor_operation(EditorOperation::InspectViewportPoint { x, y }) {
                 Ok(EditorValue::Json(structured)) => Ok(tool_success(&structured)),
                 Ok(_) => unreachable!(),
                 Err(error) => Ok(tool_error(&error)),
@@ -2195,24 +2597,26 @@ fn dispatch_tool_call(body: &str) -> Result<String, (i32, String)> {
             let actor_index = optional_usize(arguments, "actorIndex")?;
             let x = optional_usize(arguments, "x")?;
             let y = optional_usize(arguments, "y")?;
-            let source = match (actor_index, x, y) {
-                (Some(index), None, None) => ViewportActorSource::Selected(index),
-                (None, Some(x), Some(y)) => ViewportActorSource::ScreenPoint {
+            let object_path = json_field_string(arguments, "objectPath");
+            let source = match (actor_index, x, y, object_path) {
+                (Some(index), None, None, None) => ViewportActorSource::Selected(index),
+                (None, Some(x), Some(y), None) => ViewportActorSource::ScreenPoint {
                     x: i32::try_from(x)
                         .map_err(|_| (-32602, "x is too large".to_string()))?,
                     y: i32::try_from(y)
                         .map_err(|_| (-32602, "y is too large".to_string()))?,
                 },
-                (Some(_), _, _) => {
+                (None, None, None, Some(path)) => ViewportActorSource::ObjectPath(path),
+                (Some(_), _, _, _) => {
                     return Err((
                         -32602,
-                        "use actorIndex or x/y, not both".to_string(),
+                        "use exactly one of actorIndex, x/y, or objectPath".to_string(),
                     ))
                 }
                 _ => {
                     return Err((
                         -32602,
-                        "renx_focus_viewport_actor requires actorIndex or both x and y"
+                        "renx_focus_viewport_actor requires actorIndex, both x and y, or objectPath"
                             .to_string(),
                     ))
                 }
@@ -2221,6 +2625,98 @@ fn dispatch_tool_call(body: &str) -> Result<String, (i32, String)> {
                 EditorOperation::FocusViewportActor { source },
                 Guards::from_arguments(arguments),
             ) {
+                Ok(EditorValue::Json(structured)) => Ok(tool_success(&structured)),
+                Ok(_) => unreachable!(),
+                Err(error) => Ok(tool_error(&error)),
+            }
+        }
+        "renx_find_actors" => {
+            let arguments = json_field_raw(params, "arguments").unwrap_or("{}");
+            let class_name =
+                json_field_string(arguments, "class").unwrap_or_else(|| "Actor".to_string());
+            let query = json_field_string(arguments, "query").unwrap_or_default();
+            let level = json_field_string(arguments, "level").unwrap_or_default();
+            let offset = optional_usize(arguments, "offset")?.unwrap_or(0);
+            let limit =
+                optional_usize(arguments, "limit")?.unwrap_or(scene::DEFAULT_LIMIT);
+            if let Err(error) =
+                scene::validate_find(&class_name, &query, &level, offset, limit)
+            {
+                return Err((-32602, error));
+            }
+            match submit_editor_operation(EditorOperation::FindActors {
+                class_name,
+                query,
+                level,
+                offset,
+                limit,
+            }) {
+                Ok(EditorValue::Json(structured)) => Ok(tool_success(&structured)),
+                Ok(_) => unreachable!(),
+                Err(error) => Ok(tool_error(&error)),
+            }
+        }
+        "renx_get_change_state" => {
+            let arguments = json_field_raw(params, "arguments").unwrap_or("{}");
+            let history_limit = optional_usize(arguments, "historyLimit")?
+                .unwrap_or(changes::DEFAULT_HISTORY_LIMIT);
+            let include_clean_packages =
+                optional_bool(arguments, "includeCleanPackages")?.unwrap_or(false);
+            let package_query =
+                json_field_string(arguments, "packageQuery").unwrap_or_default();
+            let package_limit = optional_usize(arguments, "packageLimit")?
+                .unwrap_or(changes::DEFAULT_PACKAGE_LIMIT);
+            if let Err(error) =
+                changes::validate_query(&package_query, history_limit, package_limit)
+            {
+                return Err((-32602, error));
+            }
+            match submit_editor_operation(EditorOperation::ChangeState {
+                include_clean_packages,
+                package_query,
+                history_limit,
+                package_limit,
+            }) {
+                Ok(EditorValue::Json(structured)) => Ok(tool_success(&structured)),
+                Ok(_) => unreachable!(),
+                Err(error) => Ok(tool_error(&error)),
+            }
+        }
+        "renx_get_asset_usage" => {
+            let arguments = tool_arguments(params, &name)?;
+            let object_path = required_string(arguments, "objectPath")?;
+            let scope =
+                json_field_string(arguments, "scope").unwrap_or_else(|| "all".to_string());
+            let limit =
+                optional_usize(arguments, "limit")?.unwrap_or(assets::DEFAULT_USAGE_LIMIT);
+            if let Err(error) = assets::validate_usage(&scope, limit) {
+                return Err((-32602, error));
+            }
+            match submit_editor_operation(EditorOperation::AssetUsage {
+                object_path,
+                scope,
+                limit,
+            }) {
+                Ok(EditorValue::Json(structured)) => Ok(tool_success(&structured)),
+                Ok(_) => unreachable!(),
+                Err(error) => Ok(tool_error(&error)),
+            }
+        }
+        "renx_capture_editor_state" => {
+            match submit_editor_operation(EditorOperation::CaptureEditorState) {
+                Ok(EditorValue::Json(structured)) => Ok(tool_success(&structured)),
+                Ok(_) => unreachable!(),
+                Err(error) => Ok(tool_error(&error)),
+            }
+        }
+        "renx_diff_editor_state" => {
+            let arguments = tool_arguments(params, &name)?;
+            let from_snapshot = required_string(arguments, "fromSnapshot")?;
+            let to_snapshot = json_field_string(arguments, "toSnapshot");
+            match submit_editor_operation(EditorOperation::DiffEditorState {
+                from_snapshot,
+                to_snapshot,
+            }) {
                 Ok(EditorValue::Json(structured)) => Ok(tool_success(&structured)),
                 Ok(_) => unreachable!(),
                 Err(error) => Ok(tool_error(&error)),
@@ -2284,6 +2780,63 @@ fn optional_usize(arguments: &str, key: &str) -> Result<Option<usize>, (i32, Str
             format!("argument '{key}' must be a non-negative integer"),
         )
     })
+}
+
+fn optional_bool(arguments: &str, key: &str) -> Result<Option<bool>, (i32, String)> {
+    let Some(raw) = json_field_raw(arguments, key) else {
+        return Ok(None);
+    };
+    match raw {
+        "true" => Ok(Some(true)),
+        "false" => Ok(Some(false)),
+        _ => Err((-32602, format!("argument '{key}' must be a boolean"))),
+    }
+}
+
+fn optional_string_array(arguments: &str, key: &str) -> Result<Vec<String>, (i32, String)> {
+    let Some(raw) = json_field_raw(arguments, key) else {
+        return Ok(Vec::new());
+    };
+    let bytes = raw.as_bytes();
+    let mut cursor = skip_ws(bytes, 0);
+    if bytes.get(cursor) != Some(&b'[') {
+        return Err((-32602, format!("argument '{key}' must be an array of strings")));
+    }
+    cursor += 1;
+    let mut values = Vec::new();
+    loop {
+        cursor = skip_ws(bytes, cursor);
+        if bytes.get(cursor) == Some(&b']') {
+            cursor = skip_ws(bytes, cursor + 1);
+            if cursor == bytes.len() {
+                return Ok(values);
+            }
+            break;
+        }
+        let Some((value, end)) = parse_json_string(raw, cursor) else {
+            break;
+        };
+        values.push(value);
+        if values.len() > 32 {
+            return Err((-32602, format!("argument '{key}' has more than 32 entries")));
+        }
+        cursor = skip_ws(bytes, end);
+        match bytes.get(cursor) {
+            Some(b',') => cursor += 1,
+            Some(b']') => {
+                cursor = skip_ws(bytes, cursor + 1);
+                if cursor == bytes.len() {
+                    return Ok(values);
+                }
+                break;
+            }
+            _ => break,
+        }
+    }
+    Err((
+        -32602,
+        format!("argument '{key}' must be a valid array of strings"),
+    ))
 }
 
 fn json_field_bool(object: &str, key: &str) -> Option<bool> {
@@ -2496,17 +3049,19 @@ pub fn init() -> anyhow::Result<()> {
         return Ok(());
     }
     let tick = validate_tick_hook()?;
+    exceptions::init().context("failed to initialize persistent exception context capture")?;
     unsafe {
         EditorTickHook
             .initialize(tick, |editor, delta_seconds| {
                 editor_tick_hook(editor, delta_seconds)
             })
             .context("failed to set up UUnrealEdEngine::Tick MCP hook")?;
+        health::init().context("failed to initialize native Map Check capture")?;
         EditorTickHook
             .enable()
             .context("failed to enable UUnrealEdEngine::Tick MCP hook")?;
     }
-    debug_log!("RenX MCP editor-thread hook enabled");
+    debug_log!("RenX MCP editor-thread, Map Check, and exception context capture enabled");
     Ok(())
 }
 
@@ -2514,8 +3069,8 @@ pub fn init() -> anyhow::Result<()> {
 mod tests {
     use super::{
         editor_exec_this, handle_json_rpc, json_escape, json_field_raw, json_field_string,
-        origin_allowed, policy, required_capability, tool_capability, tools_list_with, ActorAction,
-        EditorOperation, ViewportActorSource,
+        optional_string_array, origin_allowed, policy, required_capability, tool_capability,
+        tools_list_with, ActorAction, EditorOperation, ViewportActorSource,
     };
     use std::ffi::c_void;
 
@@ -2537,6 +3092,11 @@ mod tests {
             "MAP SAVE FILE=x.udk".to_string()
         )));
         assert!(!super::is_mutation(&EditorOperation::MapInfo));
+        assert!(!super::is_mutation(&EditorOperation::MapHealth {
+            include_slow_reference_checks: false,
+            categories: Vec::new(),
+            limit: 200,
+        }));
         assert!(!super::is_mutation(&EditorOperation::FocusViewportActor {
             source: ViewportActorSource::ScreenPoint { x: 10, y: 20 },
         }));
@@ -2592,6 +3152,20 @@ mod tests {
     }
 
     #[test]
+    fn parses_bounded_string_arrays() {
+        assert_eq!(
+            optional_string_array(
+                r#"{"categories":["MatchingLightGUID", "PathNodeInvalidGUID"]}"#,
+                "categories"
+            )
+            .unwrap(),
+            vec!["MatchingLightGUID", "PathNodeInvalidGUID"]
+        );
+        assert!(optional_string_array(r#"{"categories":[1]}"#, "categories").is_err());
+        assert!(optional_string_array(r#"{"categories":"warning"}"#, "categories").is_err());
+    }
+
+    #[test]
     fn handles_initialize_and_notifications() {
         let response =
             handle_json_rpc(r#"{"jsonrpc":"2.0","id":"abc","method":"initialize","params":{}}"#)
@@ -2603,16 +3177,27 @@ mod tests {
         );
     }
 
-    const READ_TOOLS: [&str; 9] = [
+    const READ_TOOLS: [&str; 20] = [
         "renx_get_viewport_context",
+        "renx_inspect_viewport_point",
         "renx_focus_viewport_actor",
         "renx_capture_viewport",
+        "renx_find_actors",
+        "renx_capture_editor_state",
+        "renx_diff_editor_state",
+        "renx_get_recent_events",
+        "renx_get_exception_context",
+        "renx_get_change_state",
+        "renx_get_asset_usage",
+        "renx_get_missing_asset_diagnostics",
         "renx_editor_status",
         "renx_get_selection_counts",
         "renx_get_selected_actors",
         "renx_list_actor_properties",
         "renx_get_actor_property",
+        "renx_get_object_property",
         "renx_get_map_info",
+        "renx_get_map_health",
     ];
     const WRITE_TOOLS: [&str; 4] = [
         "renx_set_actor_property",
@@ -2651,15 +3236,29 @@ mod tests {
     #[test]
     fn operations_are_classified_consistently() {
         use policy::Capability;
-        let cases: [(EditorOperation, Capability); 9] = [
+        let cases: [(EditorOperation, Capability); 17] = [
             (EditorOperation::SelectionCounts, Capability::ReadSelection),
             (EditorOperation::MapInfo, Capability::ReadMap),
+            (
+                EditorOperation::MapHealth {
+                    include_slow_reference_checks: false,
+                    categories: Vec::new(),
+                    limit: 200,
+                },
+                Capability::ReadMap,
+            ),
             (
                 EditorOperation::ViewportContext {
                     grid_width: 17,
                     grid_height: 11,
                     max_actors: 32,
+                    adaptive: true,
+                    max_samples: 512,
                 },
+                Capability::ReadViewport,
+            ),
+            (
+                EditorOperation::InspectViewportPoint { x: 10, y: 20 },
                 Capability::ReadViewport,
             ),
             (
@@ -2695,6 +3294,48 @@ mod tests {
                     value: "c".to_string(),
                 },
                 Capability::WriteObjectProperty,
+            ),
+            (
+                EditorOperation::GetObjectProperty {
+                    object_path: "a".to_string(),
+                    property: "b".to_string(),
+                },
+                Capability::ReadProperties,
+            ),
+            (
+                EditorOperation::FindActors {
+                    class_name: "Actor".to_string(),
+                    query: String::new(),
+                    level: String::new(),
+                    offset: 0,
+                    limit: 50,
+                },
+                Capability::ReadScene,
+            ),
+            (
+                EditorOperation::AssetUsage {
+                    object_path: "Pkg.Asset".to_string(),
+                    scope: "all".to_string(),
+                    limit: 50,
+                },
+                Capability::ReadScene,
+            ),
+            (
+                EditorOperation::ChangeState {
+                    include_clean_packages: false,
+                    package_query: String::new(),
+                    history_limit: 32,
+                    package_limit: 100,
+                },
+                Capability::ReadState,
+            ),
+            (EditorOperation::CaptureEditorState, Capability::ReadState),
+            (
+                EditorOperation::DiffEditorState {
+                    from_snapshot: "state-1".to_string(),
+                    to_snapshot: None,
+                },
+                Capability::ReadState,
             ),
         ];
         for (operation, expected) in cases {
