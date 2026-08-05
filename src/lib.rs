@@ -260,7 +260,10 @@ patch_group!(fn init_client_patches {
 //   added after this line would be misreported as a foreign hook.
 //
 // - `udk_mcp`: loopback MCP bridge for the Win64 editor, draining its Unreal
-//   calls from `UUnrealEdEngine::Tick` so they run on the editor thread.
+//   calls from `UUnrealEdEngine::Tick` so they run on the editor thread. Gated
+//   by an operator-set capability policy (`udk_mcp::policy`) that defaults to
+//   read-only, driven either from an in-editor panel on the editor's own menu
+//   bar (`udk_mcp::panel`, "MCP Policy") or over `GET/POST /control/policy`.
 // - `udk_script_profiler`: reports the `udk_script_func_cache` hit rate,
 //   written to `scriptprof.csv` next to `UDK.exe` every 30 seconds. Installs
 //   nothing at all without `-SCRIPTPROF`, so it costs nothing to leave listed

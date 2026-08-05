@@ -40,6 +40,7 @@ features = [
     "Win32_System_Threading",
 	"Win32_Graphics_Gdi",
 	"Win32_UI_WindowsAndMessaging",
+	"Win32_UI_Controls",
 	"Win32_Media_Audio",
 	"Win32_Media_Audio_XAudio2",
 	"Win32_Media_Multimedia",

@@ -349,6 +349,45 @@ pub fn policy_json() -> String {
     )
 }
 
+/// Selects a preset. Used by the in-editor panel, which has typed controls and
+/// no reason to round-trip through JSON to reach the same place.
+pub fn apply_mode(mode: Mode) {
+    let Ok(_guard) = WRITE_LOCK.lock() else {
+        return;
+    };
+    init();
+    let mask = mode.mask().unwrap_or_else(|| MASK.load(Ordering::Acquire));
+    store(mode, mask);
+    save(mode, mask);
+}
+
+/// Toggles one capability, moving the policy to `custom` if the result no longer
+/// matches the preset it came from.
+pub fn apply_capability(capability: Capability, enabled: bool) {
+    let Ok(_guard) = WRITE_LOCK.lock() else {
+        return;
+    };
+    init();
+    let mask = if enabled {
+        MASK.load(Ordering::Acquire) | capability.bit()
+    } else {
+        MASK.load(Ordering::Acquire) & !capability.bit()
+    };
+    store(mode_for_mask(mask), mask);
+    save(mode_for_mask(mask), mask);
+}
+
+/// Names a mask: a preset if it matches one exactly, `custom` otherwise. This is
+/// what keeps the mode label in the GUI honest after an advanced-menu edit.
+fn mode_for_mask(mask: u32) -> Mode {
+    for candidate in ALL_MODES {
+        if candidate.mask() == Some(mask) {
+            return candidate;
+        }
+    }
+    Mode::Custom
+}
+
 /// Applies a control request and returns the new policy.
 ///
 /// `{"mode":"context"}` selects a preset. `{"capabilities":{"exec.command":false}}`
@@ -375,12 +414,12 @@ pub fn apply(request: &str) -> Result<String, String> {
     };
     let mask = mask_from_json(request, base);
 
-    // A preset whose bits were then edited is no longer that preset.
+    // A preset whose bits were then edited is no longer that preset. Naming the
+    // mask is the same rule the panel uses, so both surfaces agree on what to
+    // call the result.
     let mode = match requested_mode {
-        Some(mode) if mode.mask() == Some(mask) => mode,
-        Some(Mode::Custom) | None if has_capabilities => Mode::Custom,
-        Some(mode) => mode,
-        None => current_mode(),
+        Some(Mode::Custom) => Mode::Custom,
+        _ => mode_for_mask(mask),
     };
 
     store(mode, mask);

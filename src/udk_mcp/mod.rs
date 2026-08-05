@@ -18,6 +18,7 @@ use std::time::Duration;
 use crate::dll::UDK_RANGE;
 use crate::patch_utils::debug_log;
 
+pub mod panel;
 pub mod policy;
 
 const DEFAULT_PORT: u16 = 8765;
@@ -259,10 +260,21 @@ extern "C" fn editor_tick_hook(editor: *mut c_void, delta_seconds: f32) {
     EditorTickHook.call(editor, delta_seconds);
 
     EDITOR_THIS.store(editor as usize, Ordering::Release);
-    TICK_COUNT.fetch_add(1, Ordering::Relaxed);
+    let ticks = TICK_COUNT.fetch_add(1, Ordering::Relaxed);
     start_server_once();
     drain_editor_requests(editor);
+
+    // The panel and its menu item have to be created and repaired on the thread
+    // that pumps them, which is this one. Throttled because the check walks the
+    // thread's windows and queries the menu, and the menu bar only ever changes
+    // at human speed - this is a repair path, not a render path.
+    if ticks % MENU_REPAIR_TICK_INTERVAL == 0 {
+        panel::tick();
+    }
 }
+
+/// Roughly two seconds at editor frame rates.
+const MENU_REPAIR_TICK_INTERVAL: u64 = 120;
 
 fn drain_editor_requests(editor: *mut c_void) {
     for _ in 0..MAX_QUEUED_REQUESTS {
