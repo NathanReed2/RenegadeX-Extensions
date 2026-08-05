@@ -22,6 +22,7 @@ pub mod audit;
 pub mod guard;
 pub mod panel;
 pub mod policy;
+mod viewport;
 
 const DEFAULT_PORT: u16 = 8765;
 const MAX_HTTP_BODY: usize = 1024 * 1024;
@@ -132,6 +133,23 @@ enum EditorOperation {
         action: ActorAction,
     },
     MapInfo,
+    ViewportContext {
+        grid_width: usize,
+        grid_height: usize,
+        max_actors: usize,
+    },
+    FocusViewportActor {
+        source: ViewportActorSource,
+    },
+    ViewportScreenshot {
+        max_width: usize,
+    },
+}
+
+#[derive(Clone, Copy)]
+enum ViewportActorSource {
+    Selected(usize),
+    ScreenPoint { x: i32, y: i32 },
 }
 
 #[derive(Clone, Copy)]
@@ -181,6 +199,11 @@ enum EditorValue {
     ExecResult { handled: bool, output: String },
     SelectionCounts { actors: i32, objects: i32 },
     Json(String),
+    Image {
+        mime_type: &'static str,
+        data: String,
+        metadata: String,
+    },
 }
 
 #[repr(C)]
@@ -669,10 +692,18 @@ fn operation_touches_selection(operation: &EditorOperation) -> bool {
         | EditorOperation::ListActorProperties { .. }
         | EditorOperation::GetActorProperty { .. }
         | EditorOperation::SetActorProperty { .. }
-        | EditorOperation::ActorAction { .. } => true,
+        | EditorOperation::ActorAction { .. }
+        | EditorOperation::ViewportContext { .. }
+        | EditorOperation::FocusViewportActor {
+            source: ViewportActorSource::Selected(_),
+        } => true,
         EditorOperation::Exec(_)
         | EditorOperation::SetObjectProperty { .. }
-        | EditorOperation::MapInfo => false,
+        | EditorOperation::MapInfo
+        | EditorOperation::ViewportScreenshot { .. }
+        | EditorOperation::FocusViewportActor {
+            source: ViewportActorSource::ScreenPoint { .. },
+        } => false,
     }
 }
 
@@ -710,6 +741,20 @@ fn operation_description(operation: &EditorOperation) -> String {
             ActorAction::MoveToGrid => "ACTOR ALIGN MOVETOGRID",
         }),
         EditorOperation::MapInfo => "read map info".to_string(),
+        EditorOperation::ViewportContext { .. } => {
+            "inspect the active viewport camera and visible actors".to_string()
+        }
+        EditorOperation::FocusViewportActor { source } => match source {
+            ViewportActorSource::Selected(index) => {
+                format!("frame selected actor {index} in the active viewport")
+            }
+            ViewportActorSource::ScreenPoint { x, y } => {
+                format!("frame the actor at viewport point ({x},{y})")
+            }
+        },
+        EditorOperation::ViewportScreenshot { .. } => {
+            "capture the active viewport as a downscaled screenshot".to_string()
+        }
     }
 }
 
@@ -946,6 +991,37 @@ fn execute_editor_operation(
                 json_escape(&output)
             )))
         }
+        EditorOperation::ViewportContext {
+            grid_width,
+            grid_height,
+            max_actors,
+        } => {
+            let selected = selected_actor_pointers(editor)?;
+            Ok(EditorValue::Json(viewport::semantic_context(
+                editor,
+                &selected,
+                grid_width,
+                grid_height,
+                max_actors,
+            )?))
+        }
+        EditorOperation::FocusViewportActor { source } => {
+            let selected = match source {
+                ViewportActorSource::Selected(_) => selected_actor_pointers(editor)?,
+                ViewportActorSource::ScreenPoint { .. } => Vec::new(),
+            };
+            Ok(EditorValue::Json(viewport::focus_actor(
+                editor, &selected, source,
+            )?))
+        }
+        EditorOperation::ViewportScreenshot { max_width } => {
+            let (data, metadata) = viewport::screenshot(editor, max_width)?;
+            Ok(EditorValue::Image {
+                mime_type: "image/bmp",
+                data,
+                metadata,
+            })
+        }
     }
 }
 
@@ -978,6 +1054,9 @@ fn required_capability(operation: &EditorOperation) -> policy::Capability {
         EditorOperation::SetActorProperty { .. } => policy::Capability::WriteActorProperty,
         EditorOperation::SetObjectProperty { .. } => policy::Capability::WriteObjectProperty,
         EditorOperation::MapInfo => policy::Capability::ReadMap,
+        EditorOperation::ViewportContext { .. }
+        | EditorOperation::ViewportScreenshot { .. } => policy::Capability::ReadViewport,
+        EditorOperation::FocusViewportActor { .. } => policy::Capability::ControlViewport,
         EditorOperation::ActorAction { action } => match action {
             ActorAction::Delete => policy::Capability::WriteDelete,
             ActorAction::Duplicate => policy::Capability::WriteDuplicate,
@@ -1764,6 +1843,10 @@ fn tool_capability(tool: &str) -> Option<policy::Capability> {
             policy::Capability::ReadProperties
         }
         "renx_get_map_info" => policy::Capability::ReadMap,
+        "renx_get_viewport_context" | "renx_capture_viewport" => {
+            policy::Capability::ReadViewport
+        }
+        "renx_focus_viewport_actor" => policy::Capability::ControlViewport,
         "renx_set_actor_property" => policy::Capability::WriteActorProperty,
         "renx_set_object_property" => policy::Capability::WriteObjectProperty,
         "renx_exec" => policy::Capability::Exec,
@@ -1818,6 +1901,9 @@ fn tools_list_with(permitted: impl Fn(&str) -> bool) -> String {
 
 /// Paired with their names so the list can be filtered without parsing it back.
 const TOOL_DEFINITIONS: &[(&str, &str)] = &[
+    ("renx_focus_viewport_actor", r#"{"name":"renx_focus_viewport_actor","description":"Move only the active camera to frame a selected actor or an actor at a focusPoint from renx_get_viewport_context. Does not change selection or the map.","inputSchema":{"type":"object","properties":{"actorIndex":{"type":"integer","minimum":0},"x":{"type":"integer","minimum":0},"y":{"type":"integer","minimum":0},"selectionToken":{"type":"string"}},"anyOf":[{"required":["actorIndex"]},{"required":["x","y"]}],"additionalProperties":false}}"#),
+    ("renx_capture_viewport", r#"{"name":"renx_capture_viewport","description":"Capture the active viewport as a downscaled image. Use only when pixels matter; semantic viewport context is much lighter.","inputSchema":{"type":"object","properties":{"maxWidth":{"type":"integer","minimum":160,"maximum":1280,"default":640}},"additionalProperties":false}}"#),
+    ("renx_get_viewport_context", r#"{"name":"renx_get_viewport_context","description":"Read camera pose, center hit, and occlusion-aware visible actors from UE3 hit proxies. Use this before the heavier screenshot tool.","inputSchema":{"type":"object","properties":{"gridWidth":{"type":"integer","minimum":3,"maximum":31,"default":17},"gridHeight":{"type":"integer","minimum":3,"maximum":21,"default":11},"maxActors":{"type":"integer","minimum":1,"maximum":100,"default":32}},"additionalProperties":false}}"#),
     ("renx_editor_status", "{\"name\":\"renx_editor_status\",\"description\":\"Report whether the Renegade X editor-thread bridge is ready.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}}"),
     ("renx_get_selection_counts", "{\"name\":\"renx_get_selection_counts\",\"description\":\"Return selected actor and selected object counts from the editor.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}}"),
     ("renx_get_selected_actors", "{\"name\":\"renx_get_selected_actors\",\"description\":\"Return selected actor names, paths, classes, levels, locations, rotations, and scales. Also returns selectionToken: pass it to a later mutation and that mutation is refused if the user changed the selection in between.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}}"),
@@ -2066,6 +2152,80 @@ fn dispatch_tool_call(body: &str) -> Result<String, (i32, String)> {
             Ok(_) => unreachable!(),
             Err(error) => Ok(tool_error(&error)),
         },
+        "renx_get_viewport_context" => {
+            let arguments = json_field_raw(params, "arguments").unwrap_or("{}");
+            let grid_width = optional_usize(arguments, "gridWidth")?
+                .unwrap_or(viewport::DEFAULT_GRID_WIDTH);
+            let grid_height = optional_usize(arguments, "gridHeight")?
+                .unwrap_or(viewport::DEFAULT_GRID_HEIGHT);
+            let max_actors = optional_usize(arguments, "maxActors")?
+                .unwrap_or(viewport::DEFAULT_MAX_ACTORS);
+            if let Err(error) = viewport::validate_scan(grid_width, grid_height, max_actors) {
+                return Err((-32602, error));
+            }
+            match submit_editor_operation(EditorOperation::ViewportContext {
+                grid_width,
+                grid_height,
+                max_actors,
+            }) {
+                Ok(EditorValue::Json(structured)) => Ok(tool_success(&structured)),
+                Ok(_) => unreachable!(),
+                Err(error) => Ok(tool_error(&error)),
+            }
+        }
+        "renx_capture_viewport" => {
+            let arguments = json_field_raw(params, "arguments").unwrap_or("{}");
+            let max_width = optional_usize(arguments, "maxWidth")?
+                .unwrap_or(viewport::DEFAULT_SCREENSHOT_WIDTH);
+            if let Err(error) = viewport::validate_screenshot_width(max_width) {
+                return Err((-32602, error));
+            }
+            match submit_editor_operation(EditorOperation::ViewportScreenshot { max_width }) {
+                Ok(EditorValue::Image {
+                    mime_type,
+                    data,
+                    metadata,
+                }) => Ok(tool_image(mime_type, &data, &metadata)),
+                Ok(_) => unreachable!(),
+                Err(error) => Ok(tool_error(&error)),
+            }
+        }
+        "renx_focus_viewport_actor" => {
+            let arguments = tool_arguments(params, &name)?;
+            let actor_index = optional_usize(arguments, "actorIndex")?;
+            let x = optional_usize(arguments, "x")?;
+            let y = optional_usize(arguments, "y")?;
+            let source = match (actor_index, x, y) {
+                (Some(index), None, None) => ViewportActorSource::Selected(index),
+                (None, Some(x), Some(y)) => ViewportActorSource::ScreenPoint {
+                    x: i32::try_from(x)
+                        .map_err(|_| (-32602, "x is too large".to_string()))?,
+                    y: i32::try_from(y)
+                        .map_err(|_| (-32602, "y is too large".to_string()))?,
+                },
+                (Some(_), _, _) => {
+                    return Err((
+                        -32602,
+                        "use actorIndex or x/y, not both".to_string(),
+                    ))
+                }
+                _ => {
+                    return Err((
+                        -32602,
+                        "renx_focus_viewport_actor requires actorIndex or both x and y"
+                            .to_string(),
+                    ))
+                }
+            };
+            match submit_guarded(
+                EditorOperation::FocusViewportActor { source },
+                Guards::from_arguments(arguments),
+            ) {
+                Ok(EditorValue::Json(structured)) => Ok(tool_success(&structured)),
+                Ok(_) => unreachable!(),
+                Err(error) => Ok(tool_error(&error)),
+            }
+        }
         "renx_exec" => {
             let arguments = json_field_raw(params, "arguments")
                 .ok_or_else(|| (-32602, "renx_exec requires arguments".to_string()))?;
@@ -2114,6 +2274,18 @@ fn required_usize(arguments: &str, key: &str) -> Result<usize, (i32, String)> {
         })
 }
 
+fn optional_usize(arguments: &str, key: &str) -> Result<Option<usize>, (i32, String)> {
+    let Some(raw) = json_field_raw(arguments, key) else {
+        return Ok(None);
+    };
+    raw.parse::<usize>().map(Some).map_err(|_| {
+        (
+            -32602,
+            format!("argument '{key}' must be a non-negative integer"),
+        )
+    })
+}
+
 fn json_field_bool(object: &str, key: &str) -> Option<bool> {
     match json_field_raw(object, key)? {
         "true" => Some(true),
@@ -2126,6 +2298,14 @@ fn tool_success(structured: &str) -> String {
     format!(
         "{{\"content\":[{{\"type\":\"text\",\"text\":\"{}\"}}],\"structuredContent\":{structured},\"isError\":false}}",
         json_escape(structured)
+    )
+}
+
+fn tool_image(mime_type: &str, data: &str, metadata: &str) -> String {
+    format!(
+        r#"{{"content":[{{"type":"image","data":"{data}","mimeType":"{}"}},{{"type":"text","text":"{}"}}],"structuredContent":{metadata},"isError":false}}"#,
+        json_escape(mime_type),
+        json_escape(metadata),
     )
 }
 
@@ -2335,7 +2515,7 @@ mod tests {
     use super::{
         editor_exec_this, handle_json_rpc, json_escape, json_field_raw, json_field_string,
         origin_allowed, policy, required_capability, tool_capability, tools_list_with, ActorAction,
-        EditorOperation,
+        EditorOperation, ViewportActorSource,
     };
     use std::ffi::c_void;
 
@@ -2357,6 +2537,9 @@ mod tests {
             "MAP SAVE FILE=x.udk".to_string()
         )));
         assert!(!super::is_mutation(&EditorOperation::MapInfo));
+        assert!(!super::is_mutation(&EditorOperation::FocusViewportActor {
+            source: ViewportActorSource::ScreenPoint { x: 10, y: 20 },
+        }));
         assert!(super::is_mutation(&EditorOperation::ActorAction {
             action: ActorAction::Delete
         }));
@@ -2420,7 +2603,10 @@ mod tests {
         );
     }
 
-    const READ_TOOLS: [&str; 6] = [
+    const READ_TOOLS: [&str; 9] = [
+        "renx_get_viewport_context",
+        "renx_focus_viewport_actor",
+        "renx_capture_viewport",
         "renx_editor_status",
         "renx_get_selection_counts",
         "renx_get_selected_actors",
@@ -2465,9 +2651,27 @@ mod tests {
     #[test]
     fn operations_are_classified_consistently() {
         use policy::Capability;
-        let cases: [(EditorOperation, Capability); 6] = [
+        let cases: [(EditorOperation, Capability); 9] = [
             (EditorOperation::SelectionCounts, Capability::ReadSelection),
             (EditorOperation::MapInfo, Capability::ReadMap),
+            (
+                EditorOperation::ViewportContext {
+                    grid_width: 17,
+                    grid_height: 11,
+                    max_actors: 32,
+                },
+                Capability::ReadViewport,
+            ),
+            (
+                EditorOperation::ViewportScreenshot { max_width: 640 },
+                Capability::ReadViewport,
+            ),
+            (
+                EditorOperation::FocusViewportActor {
+                    source: ViewportActorSource::Selected(0),
+                },
+                Capability::ControlViewport,
+            ),
             (
                 EditorOperation::Exec("MAP REBUILD".to_string()),
                 Capability::Exec,

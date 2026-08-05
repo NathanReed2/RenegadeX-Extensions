@@ -154,21 +154,6 @@ use crate::patch_utils::{debug_log, find_signature_offset};
 /// `UCookPackagesCommandlet::StartChildren` in the 12791 (UDK-2015-01) x64 build.
 const START_CHILDREN_OFFSET: usize = 0x0011_BC6E0;
 
-/// Where the signature above resolved to, published for
-/// [`crate::udk_cook_mt_transition`] - which calls `StartChildren` by hand and
-/// must not re-run the signature search, because by then the detour below has
-/// replaced the prologue it would be matching against.
-static START_CHILDREN_ADDRESS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-/// The address `StartChildren` was found at, once [`init`] has run.
-pub(crate) fn start_children_address() -> Option<usize> {
-    match START_CHILDREN_ADDRESS.load(Ordering::Relaxed) {
-        0 => None,
-        address => Some(address),
-    }
-}
-
 /// Prologue of `StartChildren`, up to the stack cookie load:
 ///
 /// ```asm
@@ -1112,12 +1097,6 @@ fn generate_package_list_hook(
         _ => None,
     };
 
-    // This return is also the point that separates `Init` from `CookPackages`,
-    // which is the guard the serial->MT transition needs before it can trust a
-    // `.udk` load to belong to the package loop. It gets the map count from the
-    // same reading.
-    crate::udk_cook_mt_transition::arm(maps);
-
     // Logged rather than trusted silently: the four out-parameters are positional
     // and only their order in the source distinguishes them, so this line is what
     // confirms the mapping on a real cook. FirstScriptIndex <= FirstStartupIndex
@@ -1226,7 +1205,6 @@ pub fn init() -> anyhow::Result<()> {
 
     unsafe {
         let udk = get_udk_ptr();
-        START_CHILDREN_ADDRESS.store(udk.add(offset) as usize, Ordering::Relaxed);
         StartChildrenHook
             .initialize(std::mem::transmute(udk.add(offset)), start_children_hook)
             .context("Failed to setup StartChildren hook")?;

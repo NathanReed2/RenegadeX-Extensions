@@ -21,7 +21,7 @@
 //!
 //! | mode | what it grants |
 //! |---|---|
-//! | `context` | every read. No mutation of any kind. **The default.** |
+//! | `context` | inspection plus camera-only navigation. No map/package mutation. **The default.** |
 //! | `edit` | reads, property writes, transforms, duplicate. No delete, no exec. |
 //! | `full` | everything, including `renx_exec`. |
 //! | `custom` | whatever the advanced menu set, bit by bit. |
@@ -61,6 +61,8 @@ pub enum Capability {
     WriteDuplicate = 7,
     WriteDelete = 8,
     Exec = 9,
+    ReadViewport = 10,
+    ControlViewport = 11,
 }
 
 impl Capability {
@@ -82,6 +84,8 @@ impl Capability {
             Capability::WriteDuplicate => "write.duplicate",
             Capability::WriteDelete => "write.delete",
             Capability::Exec => "exec.command",
+            Capability::ReadViewport => "read.viewport",
+            Capability::ControlViewport => "control.viewport",
         }
     }
 
@@ -98,6 +102,12 @@ impl Capability {
             Capability::WriteDuplicate => "Duplicate selected actors.",
             Capability::WriteDelete => "Delete selected actors.",
             Capability::Exec => "Run arbitrary UE3 editor Exec commands.",
+            Capability::ReadViewport => {
+                "Read the active viewport camera, visible actors, and an on-demand screenshot."
+            }
+            Capability::ControlViewport => {
+                "Move only the active viewport camera to frame an actor; does not edit the map."
+            }
         }
     }
 
@@ -108,9 +118,10 @@ impl Capability {
         matches!(self, Capability::WriteDelete | Capability::Exec)
     }
 
-    /// Whether this only reads. Used to build the `context` preset, so a
-    /// capability added later is excluded from read-only mode unless it says
-    /// otherwise here.
+    /// Whether this is safe for map context. Camera navigation is included: it
+    /// changes transient editor UI state, but never a map or package. Used to
+    /// build the `context` preset, so a capability added later is excluded
+    /// unless it explicitly opts in here.
     pub const fn is_read_only(self) -> bool {
         matches!(
             self,
@@ -118,11 +129,15 @@ impl Capability {
                 | Capability::ReadSelection
                 | Capability::ReadProperties
                 | Capability::ReadMap
+                | Capability::ReadViewport
+                // Camera navigation changes editor UI state, but not map or
+                // package state. It is intentionally available in context mode.
+                | Capability::ControlViewport
         )
     }
 }
 
-pub const ALL: [Capability; 10] = [
+pub const ALL: [Capability; 12] = [
     Capability::ReadStatus,
     Capability::ReadSelection,
     Capability::ReadProperties,
@@ -133,6 +148,8 @@ pub const ALL: [Capability; 10] = [
     Capability::WriteDuplicate,
     Capability::WriteDelete,
     Capability::Exec,
+    Capability::ReadViewport,
+    Capability::ControlViewport,
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -164,7 +181,9 @@ impl Mode {
 
     pub const fn describe(self) -> &'static str {
         match self {
-            Mode::Context => "Read-only. The model can inspect the editor but cannot change it.",
+            Mode::Context => {
+                "Map-safe context. The model can inspect and navigate the camera but cannot change maps or packages."
+            }
             Mode::Edit => "Read, edit properties, and move actors. No deleting, no Exec.",
             Mode::Full => "Everything, including arbitrary editor commands.",
             Mode::Custom => "Per-capability, as set in the advanced menu.",

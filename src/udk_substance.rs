@@ -10,14 +10,11 @@
 //! region (via the `region` crate) rather than just checking for NULL.
 //!
 //! This was reached (indirectly) while loading a SubstanceAir texture with
-//! no `ParentInstance` during `CookPackages`, but the function itself is
-//! generic engine code used broadly, so the guard below is intentionally
-//! generic too (not SubstanceAir-specific): if `param_2` isn't safely
-//! readable, we skip the dereference and set up the iterator fields to look
-//! like an already-exhausted/empty iterator (mirroring the original
-//! function's own "ran out of bits" exit path, which sets `param_1[5]` to
-//! the array's count and returns `param_1`), instead of calling into the
-//! original crashing logic.
+//! no `ParentInstance` during `CookPackages`. The function itself is generic
+//! engine code with more than a thousand call sites, so validating every call
+//! with `VirtualQuery` roughly doubles UnrealScript `make` time. The hook is
+//! therefore installed only for `CookPackages`, the workflow where the bad
+//! reference was observed.
 use crate::dll::{get_udk_ptr, UDK_RANGE};
 use crate::patch_utils::debug_log;
 #[cfg(target_arch = "x86_64")]
@@ -79,6 +76,20 @@ fn is_readable(addr: usize, len: usize) -> bool {
 // move the crash into that later read. Pointing at this zeroed buffer makes
 // that read come back as `0`, which every observed caller treats as "empty".
 static SAFE_EMPTY_ARRAY: [u8; 0x20] = [0u8; 0x20];
+
+/// This guard protects a crash observed only while cooking. Installing its
+/// generic iterator detour in `make`, the editor, or the game would put a
+/// `VirtualQuery` system call on an extremely hot engine path for no benefit.
+fn is_cook_argument(argument: &std::ffi::OsStr) -> bool {
+    argument
+        .to_string_lossy()
+        .trim_start_matches(['-', '/'])
+        .eq_ignore_ascii_case("cookpackages")
+}
+
+fn is_cook_run() -> bool {
+    std::env::args_os().any(|argument| is_cook_argument(&argument))
+}
 
 /// Scans the loaded `udk.exe` image for [`FUN_1401491B0_SIG`] and returns
 /// the best matching function-entry offset (closest to the known
@@ -164,6 +175,10 @@ fn fun_1401491b0_hook(this: i64, array_ref: i64, start_index: u32) -> i64 {
 /// array references can no longer crash the game during operations like
 /// `CookPackages`.
 pub fn init() -> anyhow::Result<()> {
+    if !is_cook_run() {
+        return Ok(());
+    }
+
     let udk = get_udk_ptr();
     debug_log!("udk_substance::init start");
 
@@ -202,4 +217,19 @@ pub fn init() -> anyhow::Result<()> {
     debug_log!("udk_substance::init done");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsStr;
+
+    use super::is_cook_argument;
+
+    #[test]
+    fn installs_only_for_the_cookpackages_commandlet() {
+        assert!(is_cook_argument(OsStr::new("CookPackages")));
+        assert!(is_cook_argument(OsStr::new("-cookpackages")));
+        assert!(!is_cook_argument(OsStr::new("make")));
+        assert!(!is_cook_argument(OsStr::new("editor")));
+    }
 }
