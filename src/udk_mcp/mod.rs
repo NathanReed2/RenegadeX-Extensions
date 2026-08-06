@@ -6,6 +6,7 @@
 
 use anyhow::{bail, Context};
 use retour::static_detour;
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::ffi::c_void;
 use std::io::{Read, Write};
@@ -13,7 +14,7 @@ use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, SyncSender};
 use std::sync::{Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::dll::UDK_RANGE;
 use crate::patch_utils::debug_log;
@@ -267,7 +268,61 @@ impl Guards {
 struct EditorRequest {
     operation: EditorOperation,
     guards: Guards,
-    response: SyncSender<Result<EditorValue, String>>,
+    queued_at: Instant,
+    /// Raised by the drain the instant before the work begins.
+    ///
+    /// The split below cannot describe a call that timed out, because nothing
+    /// ever came back to describe it - and that is the case a user most needs
+    /// explained. This flag answers the one question that separates the two
+    /// remedies: an operation that never started means the editor thread is not
+    /// reaching the bridge at all, and one that started and did not finish means
+    /// the work itself is too big. Reading it is only valid after the wait has
+    /// expired, which is the only place it is read.
+    started: std::sync::Arc<AtomicBool>,
+    response: SyncSender<(Result<EditorValue, String>, EditorTiming)>,
+}
+
+/// What a queued operation cost, split at the only boundary that matters.
+///
+/// A single wall-clock number cannot separate "the editor was busy and did not
+/// reach the drain" from "the work itself was slow", and those two have nothing
+/// in common: the first is answered by closing a modal dialog, the second by
+/// asking for less. The split is measured where both facts are known - on the
+/// editor thread, either side of the call - rather than inferred afterwards.
+#[derive(Clone, Copy)]
+struct EditorTiming {
+    queue_wait: Duration,
+    execution: Duration,
+}
+
+thread_local! {
+    /// Filled in by [`submit_guarded`] and drained by [`tools_call`], both of
+    /// which run on the connection thread that is serving this one call.
+    ///
+    /// A thread-local rather than a value threaded back through every handler:
+    /// `submit_guarded` returns `Result<EditorValue, String>` to eighteen call
+    /// sites, and widening all of them to carry a measurement none of them use
+    /// would be a large diff in service of a small fact.
+    static EDITOR_TIMING: Cell<Option<EditorTiming>> = const { Cell::new(None) };
+}
+
+/// Accumulates, because a tool is free to submit more than one operation and
+/// the audit line describes the call rather than any one of them.
+fn record_editor_timing(timing: EditorTiming) {
+    EDITOR_TIMING.with(|slot| {
+        let total = match slot.get() {
+            Some(previous) => EditorTiming {
+                queue_wait: previous.queue_wait.saturating_add(timing.queue_wait),
+                execution: previous.execution.saturating_add(timing.execution),
+            },
+            None => timing,
+        };
+        slot.set(Some(total));
+    });
+}
+
+fn take_editor_timing() -> Option<EditorTiming> {
+    EDITOR_TIMING.with(|slot| slot.take())
 }
 
 enum EditorValue {
@@ -442,8 +497,18 @@ fn drain_editor_requests(editor: *mut c_void) {
         let Some(request) = request else {
             break;
         };
+        // Read before the work starts and again after, on this thread, so
+        // neither number includes the other and neither includes the time the
+        // caller spent on its own side of the socket.
+        let queue_wait = request.queued_at.elapsed();
+        let started = Instant::now();
+        request.started.store(true, Ordering::Release);
         let result = guard_and_execute(editor, request.operation, &request.guards);
-        let _ = request.response.send(result);
+        let timing = EditorTiming {
+            queue_wait,
+            execution: started.elapsed(),
+        };
+        let _ = request.response.send((result, timing));
     }
 }
 
@@ -1409,6 +1474,45 @@ fn submit_editor_operation(operation: EditorOperation) -> Result<EditorValue, St
     submit_guarded(operation, Guards::default())
 }
 
+/// A timeout means one of two unrelated things, and the fix for one is the
+/// opposite of the fix for the other.
+///
+/// The old wording described only the first: it told every caller to go and
+/// look for an open dialog, including the caller whose real problem was that it
+/// had asked for a whole-heap scan. Both branches also say what happened to the
+/// request, because giving up waiting is not the same as cancelling - nothing
+/// here can recall an operation once it is queued, and a caller that assumes
+/// otherwise will retry a mutation that is about to apply anyway.
+fn timeout_message(started: bool, timeout: Duration) -> String {
+    let seconds = timeout.as_secs();
+    if started {
+        format!(
+            "The editor started this operation but had not finished it after {seconds} seconds, \
+             so the bridge stopped waiting. This is not a policy refusal and not a bridge fault: \
+             the work itself is larger than the budget for it. The editor is still running it and \
+             will finish it - do not retry the same request, and expect the editor to be \
+             unresponsive until it is done. Ask for less instead: a smaller volume, a lower \
+             limit, or the version of the check that skips the slow passes."
+        )
+    } else {
+        // Measured on CNC-Field, 2026-08-06: an open menu bar took an
+        // ordinarily 16ms map query to 4.2s and a dropped-down menu to 7.0s,
+        // both of which completed. So a menu defers this work by seconds rather
+        // than stopping it, and something that has held the loop for a whole
+        // timeout is more likely a modal dialog or a long build than a menu -
+        // which is the order they are listed in.
+        format!(
+            "The editor never started this operation within {seconds} seconds. This is not a \
+             policy refusal and not a bridge fault: the editor runs bridge work between frames, \
+             so anything holding its main loop defers it. A modal dialog or a long operation such \
+             as a build, import or light bake stops it outright; an open menu merely slows it, by \
+             seconds. Ask the user to close any dialog or menu in the editor. The request is \
+             still queued and will run once the editor frees up, so do not assume nothing \
+             happened."
+        )
+    }
+}
+
 fn submit_guarded(operation: EditorOperation, guards: Guards) -> Result<EditorValue, String> {
     // Before the readiness check and before anything is queued: a denied
     // operation must never reach the editor thread, and must not be able to
@@ -1482,6 +1586,7 @@ fn submit_guarded(operation: EditorOperation, guards: Guards) -> Result<EditorVa
         _ => REQUEST_TIMEOUT,
     };
     let (sender, receiver) = mpsc::sync_channel(1);
+    let started = std::sync::Arc::new(AtomicBool::new(false));
     {
         let mut queue = request_queue()
             .lock()
@@ -1492,6 +1597,8 @@ fn submit_guarded(operation: EditorOperation, guards: Guards) -> Result<EditorVa
         queue.push_back(EditorRequest {
             operation,
             guards,
+            queued_at: Instant::now(),
+            started: started.clone(),
             response: sender,
         });
     }
@@ -1500,13 +1607,16 @@ fn submit_guarded(operation: EditorOperation, guards: Guards) -> Result<EditorVa
     // dialog, a long import or build - stops that thread from getting here, and
     // the symptom is this timeout. Saying so matters because the alternative
     // reading is "the bridge is broken", which it is not.
-    receiver.recv_timeout(timeout).map_err(|_| {
-        "The editor did not process this within the timeout. This is not a policy refusal and not \
-         a bridge fault: the editor runs bridge work between frames, so anything holding its main \
-         loop - an open menu, a modal dialog, or a long operation such as a build or import - \
-         defers it. Ask the user to close any open menu or dialog in the editor, then retry."
-            .to_string()
-    })?
+    let (result, timing) = receiver
+        .recv_timeout(timeout)
+        .map_err(|_| timeout_message(started.load(Ordering::Acquire), timeout))?;
+    // A timeout leaves this unrecorded on purpose. The request is still in the
+    // queue and may run minutes later against a receiver nobody holds, so there
+    // is no honest split to report for the call that gave up - only the total,
+    // which is the timeout itself. What the split would have said is in the
+    // message instead, which lands in the audit note for that line.
+    record_editor_timing(timing);
+    result
 }
 
 fn configured_port() -> u16 {
@@ -2169,7 +2279,7 @@ fn handle_json_rpc(body: &str) -> Option<String> {
 fn initialize_result() -> String {
     let mode = policy::current_mode();
     format!(
-        "{{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{{\"tools\":{{\"listChanged\":false}}}},\"serverInfo\":{{\"name\":\"renx-udk-editor\",\"version\":\"0.10.0\"}},\"instructions\":\"Controls the local Renegade X Win64 UDK editor. Actor indices refer to the current selection and can change whenever selection changes. Object paths returned by scene search are stable for the current loaded map. Viewport point inspection returns an exact UE3 scene-view ray; check cameraRay.approximate before trusting a world hit position. Mutation tools participate in UE3 undo transactions.\\n\\nEditor policy mode is '{}': {} Only the tools this mode permits are listed; the operator sets this in the RenX MCP control panel and it cannot be changed through this connection. If a task needs something the mode forbids, say so rather than looking for another route to the same effect.\"}}",
+        "{{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{{\"tools\":{{\"listChanged\":false}}}},\"serverInfo\":{{\"name\":\"renx-udk-editor\",\"version\":\"0.11.0\"}},\"instructions\":\"Controls the local Renegade X Win64 UDK editor. Actor indices refer to the current selection and can change whenever selection changes. Object paths returned by scene search are stable for the current loaded map. Viewport point inspection returns an exact UE3 scene-view ray; check cameraRay.approximate before trusting a world hit position. Mutation tools participate in UE3 undo transactions.\\n\\nEditor policy mode is '{}': {} Only the tools this mode permits are listed; the operator sets this in the RenX MCP control panel and it cannot be changed through this connection. If a task needs something the mode forbids, say so rather than looking for another route to the same effect.\"}}",
         mode.id(),
         json_escape(mode.describe())
     )
@@ -2270,7 +2380,7 @@ const TOOL_DEFINITIONS: &[(&str, &str)] = &[
     ("renx_find_actors", r#"{"name":"renx_find_actors","description":"Search loaded actors without changing selection. Returns paginated stable object paths, actual classes, levels, maps, and UE3 memory figures. Use a narrow class filter when possible.","inputSchema":{"type":"object","properties":{"class":{"type":"string","default":"Actor","description":"UE3 class; subclasses are included."},"query":{"type":"string","default":"","description":"Case-insensitive substring matched against name, path, or actual class."},"level":{"type":"string","default":"","description":"Optional case-insensitive level-path substring."},"offset":{"type":"integer","minimum":0,"maximum":50000,"default":0},"limit":{"type":"integer","minimum":1,"maximum":200,"default":50}},"additionalProperties":false}}"#),
     ("renx_capture_editor_state", r#"{"name":"renx_capture_editor_state","description":"Store a bounded semantic snapshot of the map, loaded actor identities, selection and selected transforms, plus active camera. Returns a stable snapshotId; no map or selection changes are made.","inputSchema":{"type":"object","properties":{},"additionalProperties":false}}"#),
     ("renx_diff_editor_state", r#"{"name":"renx_diff_editor_state","description":"Compare two retained semantic editor snapshots, or compare one snapshot with a newly captured current state. Reports map, actor, selection, selected-transform, and camera changes without returning bulky unchanged state.","inputSchema":{"type":"object","properties":{"fromSnapshot":{"type":"string","description":"snapshotId returned by renx_capture_editor_state."},"toSnapshot":{"type":"string","description":"Optional retained snapshotId; omit to capture and compare current state."}},"required":["fromSnapshot"],"additionalProperties":false}}"#),
-    ("renx_get_recent_events", r#"{"name":"renx_get_recent_events","description":"Read a bounded structured tail of MCP calls, policy refusals, failures, and timings from this editor session. Use sinceSequence to poll incrementally; the durable JSONL audit remains on disk.","inputSchema":{"type":"object","properties":{"sinceSequence":{"type":"integer","minimum":0,"default":0},"limit":{"type":"integer","minimum":1,"maximum":200,"default":50}},"additionalProperties":false}}"#),
+    ("renx_get_recent_events", r#"{"name":"renx_get_recent_events","description":"Read a bounded structured tail of MCP calls, policy refusals, failures, and timings from this editor session. Each call reports ms (total), queueWaitMs (time waiting for the editor thread) and executionMs (time on it), so a slow call can be attributed to a busy editor rather than to the bridge; both are null when the call never crossed to the editor thread. Use sinceSequence to poll incrementally; the durable JSONL audit remains on disk.","inputSchema":{"type":"object","properties":{"sinceSequence":{"type":"integer","minimum":0,"default":0},"limit":{"type":"integer","minimum":1,"maximum":200,"default":50}},"additionalProperties":false}}"#),
     ("renx_get_exception_context", r#"{"name":"renx_get_exception_context","description":"Read persistent first-chance Windows exception context, register state, possible previous-session crash candidates, and nearby dump artifacts. First-chance records may have been handled and never imply a confirmed crash by themselves.","inputSchema":{"type":"object","properties":{"sinceSequence":{"type":"integer","minimum":0,"default":0},"limit":{"type":"integer","minimum":1,"maximum":64,"default":32},"includePreviousSessions":{"type":"boolean","default":true}},"additionalProperties":false}}"#),
     ("renx_get_change_state", r#"{"name":"renx_get_change_state","description":"Inspect UE3's native undo/redo history and loaded dirty packages without changing either. Undo and redo entries are ordered with the next action first.","inputSchema":{"type":"object","properties":{"historyLimit":{"type":"integer","minimum":1,"maximum":128,"default":32},"includeCleanPackages":{"type":"boolean","default":false},"packageQuery":{"type":"string","default":"","description":"Optional case-insensitive loaded-package path substring."},"packageLimit":{"type":"integer","minimum":1,"maximum":500,"default":100}},"additionalProperties":false}}"#),
     ("renx_get_asset_usage", r#"{"name":"renx_get_asset_usage","description":"Find loaded objects that reference one exact loaded asset/object path using UE3's native reference serializer. Returns external/internal referencers and referencing properties without changing selection.","inputSchema":{"type":"object","properties":{"objectPath":{"type":"string","description":"Exact loaded object path without a class prefix."},"scope":{"type":"string","enum":["all","external","internal"],"default":"all"},"limit":{"type":"integer","minimum":1,"maximum":200,"default":50}},"required":["objectPath"],"additionalProperties":false}}"#),
@@ -2298,7 +2408,11 @@ const TOOL_DEFINITIONS: &[(&str, &str)] = &[
 /// added later is logged whether or not its author remembered to, which is the
 /// same reason the policy check lives on the one path to the editor thread.
 fn tools_call(body: &str) -> Result<String, (i32, String)> {
-    let started = std::time::Instant::now();
+    let started = Instant::now();
+    // Anything still in the slot belongs to an earlier call on this connection
+    // that never reached its own audit line. Dropping it loses a measurement;
+    // keeping it would file that measurement under the wrong tool.
+    let _ = take_editor_timing();
     let name = json_field_raw(body, "params")
         .and_then(|params| json_field_string(params, "name"))
         .unwrap_or_else(|| "?".to_string());
@@ -2332,12 +2446,21 @@ fn tools_call(body: &str) -> Result<String, (i32, String)> {
         Err((_, message)) => message.clone(),
         _ => String::new(),
     };
-    audit::record(
-        audit::Entry::new("tool", &name, outcome)
-            .detail(&arguments)
-            .note(&note)
-            .millis(started.elapsed().as_millis() as u64),
-    );
+    let mut entry = audit::Entry::new("tool", &name, outcome)
+        .detail(&arguments)
+        .note(&note)
+        .millis(started.elapsed().as_millis() as u64);
+    // Note what this does *not* cover: an approval prompt is answered on this
+    // thread before anything is queued, so a person taking a minute to click
+    // Yes lands in neither half and shows up as bridge overhead. The `note`
+    // field says "approved by the user" on exactly those lines.
+    if let Some(timing) = take_editor_timing() {
+        entry = entry.editor_timing(
+            timing.queue_wait.as_millis() as u64,
+            timing.execution.as_millis() as u64,
+        );
+    }
+    audit::record(entry);
     result
 }
 
@@ -3266,6 +3389,68 @@ mod tests {
     /// decode what it finds. An earlier version skipped escaped characters
     /// instead, which quietly deleted every newline, quote and backslash from
     /// the field whose only job is to record what happened.
+    /// A tool that submits twice should be described by one audit line, so the
+    /// halves add rather than the last one winning.
+    #[test]
+    fn editor_timings_accumulate_within_a_call() {
+        use std::time::Duration;
+
+        assert!(super::take_editor_timing().is_none());
+        super::record_editor_timing(super::EditorTiming {
+            queue_wait: Duration::from_millis(30),
+            execution: Duration::from_millis(4),
+        });
+        super::record_editor_timing(super::EditorTiming {
+            queue_wait: Duration::from_millis(12),
+            execution: Duration::from_millis(9),
+        });
+
+        let total = super::take_editor_timing().expect("two operations were recorded");
+        assert_eq!(total.queue_wait, Duration::from_millis(42));
+        assert_eq!(total.execution, Duration::from_millis(13));
+
+        // Taken, not read: the next call on this connection starts unmeasured,
+        // which is what keeps one tool's wait off another tool's line.
+        assert!(super::take_editor_timing().is_none());
+    }
+
+    /// A timeout is the one case the split cannot describe, so the message has
+    /// to carry the distinction instead - and the two must not give the same
+    /// advice, which is the whole reason for splitting them.
+    #[test]
+    fn a_timeout_says_which_of_the_two_things_went_wrong() {
+        let budget = std::time::Duration::from_secs(60);
+        let never_started = super::timeout_message(false, budget);
+        let did_not_finish = super::timeout_message(true, budget);
+
+        assert!(never_started.contains("never started"), "{never_started}");
+        assert!(never_started.contains("modal dialog"), "{never_started}");
+        assert!(!never_started.contains("Ask for less"), "{never_started}");
+        // A menu was measured to defer this work, not stop it, so the message
+        // must not send the user hunting for a menu as the likely cause.
+        assert!(
+            never_started.contains("merely slows it"),
+            "{never_started}"
+        );
+
+        assert!(did_not_finish.contains("Ask for less"), "{did_not_finish}");
+        assert!(
+            !did_not_finish.contains("close any open menu"),
+            "{did_not_finish}"
+        );
+
+        // Neither may imply the request was cancelled: nothing here can recall
+        // a queued operation, and a caller that believes otherwise will retry a
+        // mutation that is about to apply.
+        for message in [&never_started, &did_not_finish] {
+            assert!(message.contains("60 seconds"), "{message}");
+            assert!(
+                message.contains("still queued") || message.contains("still running"),
+                "{message}"
+            );
+        }
+    }
+
     /// The mutation count is what tells a user how far to undo, so a read must
     /// never inflate it - including a read that arrives as an Exec.
     #[test]
