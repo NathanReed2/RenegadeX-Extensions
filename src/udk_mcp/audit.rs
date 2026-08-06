@@ -35,6 +35,14 @@ const MAX_RECENT_EVENTS: usize = 256;
 pub const DEFAULT_RECENT_LIMIT: usize = 50;
 pub const MAX_RECENT_LIMIT: usize = 200;
 
+/// Carried in every reply because the three numbers are only useful together,
+/// and a reader that guesses at them will reach for the wrong one. Kept to a
+/// sentence: it is a legend, not documentation.
+const TIMING_FIELDS_NOTE: &str = "ms is the whole call; queueWaitMs is time spent waiting for the \
+     editor thread and executionMs is time spent on it, so ms minus both is bridge overhead. Both \
+     are null when the call never crossed to the editor thread - answered in-process, refused, or \
+     timed out.";
+
 static WRITE_LOCK: Mutex<()> = Mutex::new(());
 static WRITTEN: AtomicU64 = AtomicU64::new(0);
 static NEXT_SEQUENCE: AtomicU64 = AtomicU64::new(1);
@@ -51,6 +59,8 @@ struct RecentEvent {
     detail: String,
     note: String,
     millis: u64,
+    queue_wait_millis: Option<u64>,
+    execution_millis: Option<u64>,
 }
 
 fn recent_events() -> &'static Mutex<VecDeque<RecentEvent>> {
@@ -87,7 +97,16 @@ pub struct Entry<'a> {
     pub outcome: Outcome,
     pub detail: &'a str,
     pub note: &'a str,
+    /// Wall time for the whole call, measured on the connection thread.
     pub millis: u64,
+    /// How long the operation sat in the queue before the editor thread reached
+    /// it, and how long that thread then spent on it. `None` means the call
+    /// never crossed to the editor thread - either it was answered entirely in
+    /// this process, or it was refused, or it timed out before an answer came
+    /// back. That is why these are optional rather than zero: "did not happen"
+    /// and "took under a millisecond" are different findings.
+    pub queue_wait_millis: Option<u64>,
+    pub execution_millis: Option<u64>,
 }
 
 impl<'a> Entry<'a> {
@@ -99,6 +118,8 @@ impl<'a> Entry<'a> {
             detail: "",
             note: "",
             millis: 0,
+            queue_wait_millis: None,
+            execution_millis: None,
         }
     }
 
@@ -115,6 +136,22 @@ impl<'a> Entry<'a> {
     pub fn millis(mut self, millis: u64) -> Self {
         self.millis = millis;
         self
+    }
+
+    /// Both halves at once, because recording one without the other would
+    /// invite the subtraction that this whole split exists to make unnecessary.
+    pub fn editor_timing(mut self, queue_wait_millis: u64, execution_millis: u64) -> Self {
+        self.queue_wait_millis = Some(queue_wait_millis);
+        self.execution_millis = Some(execution_millis);
+        self
+    }
+}
+
+/// JSON has a word for "not measured" and it is not `0`.
+fn millis_or_null(millis: Option<u64>) -> String {
+    match millis {
+        Some(value) => value.to_string(),
+        None => "null".to_string(),
     }
 }
 
@@ -149,6 +186,8 @@ pub fn record(entry: Entry<'_>) {
         detail: detail.clone(),
         note: note.clone(),
         millis: entry.millis,
+        queue_wait_millis: entry.queue_wait_millis,
+        execution_millis: entry.execution_millis,
     };
     {
         let mut events = recent_events()
@@ -161,7 +200,7 @@ pub fn record(entry: Entry<'_>) {
     }
     let line = format!(
         "{{\"time\":\"{}\",\"kind\":\"{}\",\"tool\":\"{}\",\"outcome\":\"{}\",\"mode\":\"{}\",\
-         \"detail\":\"{}\",\"note\":\"{}\",\"ms\":{}}}\n",
+         \"detail\":\"{}\",\"note\":\"{}\",\"ms\":{},\"queueWaitMs\":{},\"executionMs\":{}}}\n",
         stamp,
         super::json_escape(entry.kind),
         super::json_escape(entry.tool),
@@ -170,6 +209,8 @@ pub fn record(entry: Entry<'_>) {
         super::json_escape(&detail),
         super::json_escape(&note),
         entry.millis,
+        millis_or_null(entry.queue_wait_millis),
+        millis_or_null(entry.execution_millis),
     );
 
     let Ok(_guard) = WRITE_LOCK.lock() else {
@@ -190,6 +231,25 @@ pub fn record(entry: Entry<'_>) {
             WRITTEN.fetch_add(1, Ordering::Relaxed);
         }
     }
+}
+
+/// One ring entry as JSON. Its own function so the shape can be tested against
+/// a known event rather than against whatever the process happened to log.
+fn event_json(event: &RecentEvent) -> String {
+    format!(
+        r#"{{"sequence":{},"time":"{}","kind":"{}","tool":"{}","outcome":"{}","mode":"{}","detail":"{}","note":"{}","ms":{},"queueWaitMs":{},"executionMs":{}}}"#,
+        event.sequence,
+        super::json_escape(&event.time),
+        super::json_escape(&event.kind),
+        super::json_escape(&event.tool),
+        super::json_escape(&event.outcome),
+        super::json_escape(&event.mode),
+        super::json_escape(&event.detail),
+        super::json_escape(&event.note),
+        event.millis,
+        millis_or_null(event.queue_wait_millis),
+        millis_or_null(event.execution_millis),
+    )
 }
 
 pub fn validate_recent(limit: usize) -> Result<(), String> {
@@ -215,20 +275,7 @@ pub fn recent_json(since_sequence: u64, limit: usize) -> Result<String, String> 
         .iter()
         .filter(|event| event.sequence > since_sequence)
         .take(limit)
-        .map(|event| {
-            format!(
-                r#"{{"sequence":{},"time":"{}","kind":"{}","tool":"{}","outcome":"{}","mode":"{}","detail":"{}","note":"{}","ms":{}}}"#,
-                event.sequence,
-                super::json_escape(&event.time),
-                super::json_escape(&event.kind),
-                super::json_escape(&event.tool),
-                super::json_escape(&event.outcome),
-                super::json_escape(&event.mode),
-                super::json_escape(&event.detail),
-                super::json_escape(&event.note),
-                event.millis,
-            )
-        })
+        .map(event_json)
         .collect::<Vec<_>>();
     let next_sequence = matches
         .last()
@@ -236,7 +283,7 @@ pub fn recent_json(since_sequence: u64, limit: usize) -> Result<String, String> 
         .and_then(|value| value.parse::<u64>().ok())
         .unwrap_or(since_sequence);
     Ok(format!(
-        r#"{{"source":"in-process MCP audit ring","oldestSequence":{oldest},"latestSequence":{latest},"sinceSequence":{since_sequence},"nextSequence":{next_sequence},"droppedBeforeWindow":{dropped_before_window},"returnedCount":{},"retainedEventLimit":{MAX_RECENT_EVENTS},"events":[{}]}}"#,
+        r#"{{"source":"in-process MCP audit ring","oldestSequence":{oldest},"latestSequence":{latest},"sinceSequence":{since_sequence},"nextSequence":{next_sequence},"droppedBeforeWindow":{dropped_before_window},"returnedCount":{},"retainedEventLimit":{MAX_RECENT_EVENTS},"timingFields":"{TIMING_FIELDS_NOTE}","events":[{}]}}"#,
         matches.len(),
         matches.join(","),
     ))
@@ -341,5 +388,93 @@ mod tests {
         assert!(validate_recent(DEFAULT_RECENT_LIMIT).is_ok());
         assert!(validate_recent(0).is_err());
         assert!(validate_recent(MAX_RECENT_LIMIT + 1).is_err());
+    }
+
+    fn sample_event() -> RecentEvent {
+        RecentEvent {
+            sequence: 7,
+            time: "2026-08-06T00:00:00Z".to_string(),
+            kind: "tool".to_string(),
+            tool: "renx_get_viewport_context".to_string(),
+            outcome: "ok".to_string(),
+            mode: "context".to_string(),
+            detail: "{}".to_string(),
+            note: String::new(),
+            millis: 3570,
+            queue_wait_millis: None,
+            execution_millis: None,
+        }
+    }
+
+    /// The distinction the split exists for: a call that never reached the
+    /// editor thread must not be indistinguishable from one that got there in
+    /// under a millisecond.
+    #[test]
+    fn unmeasured_timings_serialise_as_null_not_zero() {
+        let unmeasured = event_json(&sample_event());
+        assert_eq!(
+            super::super::json_field_raw(&unmeasured, "queueWaitMs"),
+            Some("null")
+        );
+        assert_eq!(
+            super::super::json_field_raw(&unmeasured, "executionMs"),
+            Some("null")
+        );
+
+        let measured = event_json(&RecentEvent {
+            queue_wait_millis: Some(0),
+            execution_millis: Some(0),
+            ..sample_event()
+        });
+        assert_eq!(
+            super::super::json_field_raw(&measured, "queueWaitMs"),
+            Some("0")
+        );
+        assert_eq!(
+            super::super::json_field_raw(&measured, "executionMs"),
+            Some("0")
+        );
+    }
+
+    /// The 3.57s viewport call that prompted this: the total alone said
+    /// nothing, and these two say the editor thread was busy rather than the
+    /// work being slow.
+    #[test]
+    fn attribution_survives_the_round_trip_through_json() {
+        let event = RecentEvent {
+            queue_wait_millis: Some(3540),
+            execution_millis: Some(28),
+            ..sample_event()
+        };
+        let line = event_json(&event);
+        assert_eq!(super::super::json_field_raw(&line, "ms"), Some("3570"));
+        assert_eq!(
+            super::super::json_field_raw(&line, "queueWaitMs"),
+            Some("3540")
+        );
+        assert_eq!(
+            super::super::json_field_raw(&line, "executionMs"),
+            Some("28")
+        );
+    }
+
+    #[test]
+    fn the_timing_legend_needs_no_escaping() {
+        // Emitted into the reply unescaped, so it must not contain anything
+        // that would end the string it is placed in.
+        assert!(!TIMING_FIELDS_NOTE.contains('"'));
+        assert!(!TIMING_FIELDS_NOTE.contains('\\'));
+        assert!(!TIMING_FIELDS_NOTE.contains('\n'));
+    }
+
+    #[test]
+    fn an_entry_is_unmeasured_until_it_is_told_otherwise() {
+        let plain = Entry::new("tool", "renx_editor_status", Outcome::Ok);
+        assert_eq!(plain.queue_wait_millis, None);
+        assert_eq!(plain.execution_millis, None);
+
+        let timed = Entry::new("tool", "renx_get_map_info", Outcome::Ok).editor_timing(4, 91);
+        assert_eq!(timed.queue_wait_millis, Some(4));
+        assert_eq!(timed.execution_millis, Some(91));
     }
 }
