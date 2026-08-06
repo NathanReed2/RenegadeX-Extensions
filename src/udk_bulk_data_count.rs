@@ -309,8 +309,32 @@ fn bulk_data_serialize_hook(
     BulkDataSerializeHook.call(bulk_data, archive, owner, index, attempt_file_mapping);
 }
 
+/// Set to `1` to leave this hook uninstalled for one run.
+///
+/// A detour is two separate things - the replacement body, and the trampoline
+/// that relocates the original's prologue so it can be resumed. Skipping the
+/// body still leaves the trampoline in the call path, so the only way to clear
+/// the trampoline of suspicion is to not install the detour at all. An
+/// environment variable rather than an edit, so the tree is never left carrying
+/// a disabled cook-guard by accident.
+const DISABLE_VARIABLE: &str = "RENX_DISABLE_BULKDATA_HOOK";
+
+fn hook_disabled() -> bool {
+    std::env::var(DISABLE_VARIABLE).is_ok_and(|value| value == "1")
+}
+
 pub fn init() -> anyhow::Result<()> {
     debug_log!("udk_bulk_data_count::init start");
+
+    // Deliberately silent. `init` runs from `DLL_PROCESS_ATTACH`, before the
+    // executable's own static initialisers, so `GLog` is still unconstructed -
+    // calling `udk_log::log` here takes down DllMain and Windows reports
+    // 0xC0000142 with no other explanation. The switch is observable by whether
+    // the guard's warnings appear during a cook, which is enough for a
+    // diagnostic that is off by default.
+    if hook_disabled() {
+        return Ok(());
+    }
 
     #[cfg(target_arch = "x86_64")]
     {
