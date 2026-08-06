@@ -66,6 +66,8 @@ pub enum Capability {
     ReadScene = 12,
     ReadState = 13,
     ReadLog = 14,
+    ReadPie = 15,
+    ControlPie = 16,
 }
 
 impl Capability {
@@ -92,6 +94,8 @@ impl Capability {
             Capability::ReadScene => "read.scene",
             Capability::ReadState => "read.state",
             Capability::ReadLog => "read.log",
+            Capability::ReadPie => "read.pie",
+            Capability::ControlPie => "control.pie",
         }
     }
 
@@ -123,14 +127,29 @@ impl Capability {
             Capability::ReadLog => {
                 "Read the editor's own log output - warnings, errors, and load/save messages."
             }
+            Capability::ReadPie => {
+                "Report whether a Play In Editor session is running, and where it started."
+            }
+            Capability::ControlPie => {
+                "Start and stop Play In Editor. Changes made to actors during play are discarded."
+            }
         }
     }
 
-    /// Whether the GUI should mark this as needing a deliberate choice. Both of
-    /// these can lose work that is not recoverable through undo - `Exec` because
-    /// it covers saving and rebuilding as well as editing.
+    /// Whether the GUI should mark this as needing a deliberate choice, and
+    /// whether `edit` mode should withhold it.
+    ///
+    /// `WriteDelete` and `Exec` are here because they lose work that undo cannot
+    /// recover - `Exec` because it covers saving and rebuilding as well as
+    /// editing. `ControlPie` is here for a different reason: starting or
+    /// stopping a play session takes the whole editor somewhere the user did not
+    /// ask to go, and stopping one throws away everything that happened during
+    /// play. Neither is an edit, which is why `edit` mode does not grant it.
     pub const fn is_destructive(self) -> bool {
-        matches!(self, Capability::WriteDelete | Capability::Exec)
+        matches!(
+            self,
+            Capability::WriteDelete | Capability::Exec | Capability::ControlPie
+        )
     }
 
     /// Whether this is safe for map context. Camera navigation is included: it
@@ -148,6 +167,7 @@ impl Capability {
                 | Capability::ReadScene
                 | Capability::ReadState
                 | Capability::ReadLog
+                | Capability::ReadPie
                 // Camera navigation changes editor UI state, but not map or
                 // package state. It is intentionally available in context mode.
                 | Capability::ControlViewport
@@ -155,7 +175,7 @@ impl Capability {
     }
 }
 
-pub const ALL: [Capability; 15] = [
+pub const ALL: [Capability; 17] = [
     Capability::ReadStatus,
     Capability::ReadSelection,
     Capability::ReadProperties,
@@ -171,6 +191,8 @@ pub const ALL: [Capability; 15] = [
     Capability::ReadScene,
     Capability::ReadState,
     Capability::ReadLog,
+    Capability::ReadPie,
+    Capability::ControlPie,
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
