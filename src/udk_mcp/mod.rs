@@ -33,6 +33,7 @@ pub(crate) mod flight;
 mod health;
 mod mapped;
 mod object;
+mod provenance;
 mod scene;
 mod spatial;
 mod state;
@@ -539,7 +540,7 @@ fn drain_editor_requests(editor: *mut c_void) {
         let editor_intent = request
             .intent
             .as_ref()
-            .and_then(|work| flight::enter_editor(work));
+            .and_then(flight::enter_editor);
         let result = guard_and_execute(editor, request.operation, &request.guards);
         drop(editor_intent);
         let timing = EditorTiming {
@@ -924,21 +925,48 @@ fn transaction_label(what: &str) -> String {
     )
 }
 
-/// Adds `selectionToken` to a JSON object this module built.
+/// Adds one already-encoded field to a JSON object this module built.
 ///
 /// Safe as string surgery only because every value here is constructed by this
 /// module and is always an object; it is never applied to anything parsed from
-/// the wire.
-fn with_selection_token(structured: &str, token: &str) -> String {
+/// the wire. `value` is raw JSON, not a string literal - the caller has already
+/// decided whether it is quoting.
+fn with_field(structured: &str, name: &str, value: &str) -> String {
     let trimmed = structured.trim_end();
     let Some(head) = trimmed.strip_suffix('}') else {
         return structured.to_string();
     };
     if head.trim_end().ends_with('{') {
-        format!("{head}\"selectionToken\":\"{token}\"}}")
+        format!("{head}\"{name}\":{value}}}")
     } else {
-        format!("{head},\"selectionToken\":\"{token}\"}}")
+        format!("{head},\"{name}\":{value}}}")
     }
+}
+
+fn with_selection_token(structured: &str, token: &str) -> String {
+    with_field(structured, "selectionToken", &format!("\"{token}\""))
+}
+
+/// Attaches the files an answer actually depended on.
+///
+/// Every tool that reads from disk gets this, so a caller can tell a fresh
+/// result from one derived from a file that was already there. The list is
+/// omitted entirely rather than sent empty: an empty array reads as "this tool
+/// touched no files", which is a different claim from "this tool found none".
+fn with_artifacts(structured: &str, artifacts: &[(&str, std::path::PathBuf)]) -> String {
+    if artifacts.is_empty() {
+        return structured.to_string();
+    }
+    let listed = with_field(
+        structured,
+        "artifacts",
+        &format!("[{}]", provenance::artifacts_json(artifacts)),
+    );
+    with_field(
+        &listed,
+        "artifactFields",
+        &format!("\"{}\"", provenance::ARTIFACT_FIELDS_NOTE),
+    )
 }
 
 /// Whether this operation actually changes the map, for accounting and for the
@@ -2614,7 +2642,13 @@ fn dispatch_tool_call(body: &str) -> Result<String, (i32, String)> {
                 std::process::id(),
                 policy::current_mode().id()
             );
-            Ok(tool_success(&structured))
+            // The policy file, because the mode above is only as current as it
+            // is: the operator can change it mid-session, and a caller that was
+            // refused something has a real interest in when the rules moved.
+            Ok(tool_success(&with_artifacts(
+                &structured,
+                &[("policyFile", policy::policy_file_path())],
+            )))
         }
         "renx_get_recent_events" => {
             let arguments = json_field_raw(params, "arguments").unwrap_or("{}");
@@ -2796,23 +2830,49 @@ fn dispatch_tool_call(body: &str) -> Result<String, (i32, String)> {
                 Err(error) => Ok(tool_error(&error)),
             }
         }
+        // All three report the packages a play session reads and writes. The
+        // timestamps are the point: a run whose package was never rewritten
+        // produced no new evidence, and three such runs in a row look like
+        // agreement rather than like nothing happening.
         "renx_get_pie_status" => match submit_editor_operation(EditorOperation::PieStatus) {
-            Ok(EditorValue::Json(structured)) => Ok(tool_success(&structured)),
+            Ok(EditorValue::Json(structured)) => Ok(tool_success(&with_artifacts(
+                &structured,
+                &provenance::play_in_editor_packages(),
+            ))),
             Ok(_) => Err((-32603, "unexpected editor result".to_string())),
             Err(error) => Ok(tool_error(&error)),
         },
         "renx_start_pie" => match submit_editor_operation(EditorOperation::PieStart) {
-            Ok(EditorValue::Json(structured)) => Ok(tool_success(&structured)),
+            // Captured after the request is queued and therefore before the
+            // engine has acted on it, which is exactly the useful moment: it is
+            // the "before" of a comparison the caller makes by polling status.
+            Ok(EditorValue::Json(structured)) => Ok(tool_success(&with_artifacts(
+                &structured,
+                &provenance::play_in_editor_packages(),
+            ))),
             Ok(_) => Err((-32603, "unexpected editor result".to_string())),
             Err(error) => Ok(tool_error(&error)),
         },
         "renx_stop_pie" => match submit_editor_operation(EditorOperation::PieStop) {
-            Ok(EditorValue::Json(structured)) => Ok(tool_success(&structured)),
+            Ok(EditorValue::Json(structured)) => Ok(tool_success(&with_artifacts(
+                &structured,
+                &provenance::play_in_editor_packages(),
+            ))),
             Ok(_) => Err((-32603, "unexpected editor result".to_string())),
             Err(error) => Ok(tool_error(&error)),
         },
         "renx_get_map_info" => match submit_editor_operation(EditorOperation::MapInfo) {
-            Ok(EditorValue::Json(structured)) => Ok(tool_success(&structured)),
+            Ok(EditorValue::Json(structured)) => {
+                // The editor's copy is the live one; this is the file it came
+                // from, so a caller can see how far the two have drifted.
+                let package = json_field_string(&structured, "map")
+                    .and_then(|map| provenance::map_package(&map))
+                    .map(|path| ("mapPackage", path));
+                Ok(tool_success(&with_artifacts(
+                    &structured,
+                    package.as_slice(),
+                )))
+            }
             Ok(_) => unreachable!(),
             Err(error) => Ok(tool_error(&error)),
         },

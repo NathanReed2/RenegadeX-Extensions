@@ -665,6 +665,13 @@ pub(super) struct Sessions {
     pub previous_clean: Option<bool>,
 }
 
+/// When this session started, as Unix milliseconds, or `0` before the recorder
+/// opened. The session id is that instant, which is what lets a file's mtime be
+/// compared against it without carrying a second clock.
+pub(super) fn session_started_unix_ms() -> u64 {
+    SESSION_ID.load(Ordering::Acquire)
+}
+
 pub(super) fn sessions() -> Sessions {
     let Some(recorder) = active() else {
         return Sessions {
