@@ -39,7 +39,23 @@ pub extern "system" fn DllMain(
         }
         DLL_PROCESS_DETACH => {
             #[cfg(target_arch = "x86_64")]
-            crate::udk_mcp::exceptions::mark_clean_shutdown();
+            {
+                crate::udk_mcp::exceptions::mark_clean_shutdown();
+                // A non-null reserved parameter means the process is exiting: the
+                // loader has already stopped every other thread, `GLog` has
+                // normally torn its device array down through `appExit`, and the
+                // image stays mapped regardless. Taking the engine's logging
+                // critical section from inside the loader lock at that point
+                // could only deadlock.
+                //
+                // A null one means `FreeLibrary` with the process still running,
+                // which is the case that matters: leaving the device registered
+                // would leave the engine holding a vtable of function pointers
+                // into an image about to be unmapped.
+                if _lpv_reserved == 0 {
+                    crate::udk_mcp::events::detach();
+                }
+            }
         }
 
         DLL_THREAD_ATTACH => {}
