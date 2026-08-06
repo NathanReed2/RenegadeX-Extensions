@@ -52,9 +52,31 @@
 //! `BulkDataSizeOnDisk` that the caller recomputes from `Ar.Tell()`
 //! afterwards (udk.exe+0x213F43..0x213F51) all agree on zero.
 //!
-//! The clamp is deliberately direction-agnostic: a negative `ElementCount` is
-//! never valid, and guarding both paths also defuses the load-side
-//! `appRealloc` above.
+//! # Why the clamp only runs when saving
+//!
+//! This originally ran in both directions, on the reasoning that a negative
+//! `ElementCount` is never valid and that guarding both paths would also defuse
+//! the load-side `appRealloc` above. The second half of that is not achievable
+//! from here, and the disassembly directly above says why: on load,
+//! `ElementCount` is *read out of the archive by the function being hooked*. A
+//! check that runs before the original therefore inspects whatever the field
+//! held beforehand - typically zero on a freshly constructed bulk data - and
+//! never sees the value that reaches `appRealloc`. It cost a virtual
+//! `GetElementSize()` call on every bulk-data load in the engine and bought
+//! nothing.
+//!
+//! Worse, it put this hook on the async loading path, `FArchiveAsync::Serialize`,
+//! which is the one place it was never diagnosed against: the crash it was
+//! written for is a *save* path crash reached through `UObject::SavePackage`.
+//! A Play In Editor session loads its map through that async path and died
+//! inside it with this detour on the stack.
+//!
+//! So the inspection is now skipped when `Ar.IsLoading()`. Loading is detected
+//! through `FArchive::ArIsLoading` at `+0x1C`, which is not a guess - it is the
+//! field the hooked function's own prologue tests, and that `CMP` is inside the
+//! byte signature this hook already matches to find the function at all.
+//! Defusing the load-side `appRealloc` needs a separate hook placed after the
+//! header read, and is deliberately left undone rather than faked.
 //!
 //! # Why this only bites PC cooks
 //!
@@ -110,6 +132,12 @@ const BULK_DATA_SERIALIZE_SIG: [u8; 28] = [
 /// at the top of `SerializeBulkData`.
 const BULK_DATA_FLAGS_OFFSET: usize = 0x08;
 
+/// `FArchive::ArIsLoading`. Confirmed by the hooked function's own prologue,
+/// `CMP dword ptr [RDX+0x1C], 0x0` - and that instruction is part of
+/// [`BULK_DATA_SERIALIZE_SIG`], so the offset is verified by the same signature
+/// match that locates the function.
+const ARCHIVE_IS_LOADING_OFFSET: usize = 0x1C;
+
 /// `FUntypedBulkData::ElementCount`, confirmed by `MOV EBX, dword ptr [RDI+0xc]`
 /// feeding the `IMUL` in `SerializeBulkData`.
 const ELEMENT_COUNT_OFFSET: usize = 0x0C;
@@ -159,6 +187,20 @@ fn image_address(rva: usize) -> Option<usize> {
     let range = UDK_RANGE.get()?;
     let address = range.start.checked_add(rva)?;
     (address < range.end).then_some(address)
+}
+
+/// Whether the archive is being read rather than written.
+///
+/// A null archive is treated as loading, so the inspection is skipped: with no
+/// archive there is no save in progress worth clamping for, and the safe answer
+/// to "should this hook touch anything" is no.
+fn archive_is_loading(archive: *mut c_void) -> bool {
+    if archive.is_null() {
+        return true;
+    }
+    unsafe {
+        ((archive as *const u8).add(ARCHIVE_IS_LOADING_OFFSET) as *const i32).read_unaligned() != 0
+    }
 }
 
 /// Calls the bulk data's virtual `GetElementSize()`.
@@ -234,7 +276,11 @@ fn bulk_data_serialize_hook(
     index: i32,
     attempt_file_mapping: i32,
 ) {
-    if !bulk_data.is_null() {
+    // Saving only. On load the field this inspects is filled in by the original
+    // below, so checking it here reads a value from before the read and buys
+    // nothing - see the module docs. Skipping keeps this detour off the async
+    // loading path entirely.
+    if !bulk_data.is_null() && !archive_is_loading(archive) {
         let count_ptr = unsafe { (bulk_data as *mut u8).add(ELEMENT_COUNT_OFFSET) as *mut i32 };
         let count = unsafe { count_ptr.read_unaligned() };
         let element_size = element_size_of(bulk_data);
@@ -292,4 +338,39 @@ pub fn init() -> anyhow::Result<()> {
     debug_log!("udk_bulk_data_count::init done");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The loading test is only trustworthy because the `CMP` that reads this
+    /// field is inside the signature used to find the function. If the offset
+    /// and the signature ever disagree, the hook would be reading some other
+    /// field of `FArchive` to decide whether to touch memory.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn the_is_loading_offset_is_the_one_the_prologue_tests() {
+        // CMP dword ptr [RDX + 0x1C], 0x0
+        let compare = [0x83, 0x7A, ARCHIVE_IS_LOADING_OFFSET as u8, 0x00];
+        assert!(
+            BULK_DATA_SERIALIZE_SIG
+                .windows(compare.len())
+                .any(|window| window == compare),
+            "the signature no longer contains the ArIsLoading test"
+        );
+    }
+
+    /// A save still gets inspected; a load never does.
+    #[test]
+    fn loading_is_decided_by_the_field_and_null_is_treated_as_loading() {
+        let mut archive = [0u8; 0x40];
+        assert!(
+            archive_is_loading(std::ptr::null_mut()),
+            "a null archive must skip the inspection, not read through it"
+        );
+        assert!(!archive_is_loading(archive.as_mut_ptr().cast()));
+        archive[ARCHIVE_IS_LOADING_OFFSET] = 1;
+        assert!(archive_is_loading(archive.as_mut_ptr().cast()));
+    }
 }
