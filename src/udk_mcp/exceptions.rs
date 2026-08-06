@@ -6,30 +6,20 @@
 //! previous process ended before a clean DLL detach.
 
 use std::cell::UnsafeCell;
-use std::fs::{self, File, OpenOptions};
-use std::os::windows::io::AsRawHandle;
-use std::path::{Path, PathBuf};
+use std::fs;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{bail, Context};
-use windows::{
-    core::PCWSTR,
-    Win32::{
-        Foundation::{CloseHandle, HANDLE},
-        System::{
-            Diagnostics::Debug::{AddVectoredExceptionHandler, EXCEPTION_POINTERS},
-            Memory::{
-                CreateFileMappingW, FlushViewOfFile, MapViewOfFile, FILE_MAP_ALL_ACCESS,
-                MEMORY_MAPPED_VIEW_ADDRESS, PAGE_READWRITE,
-            },
-            SystemInformation::GetSystemTimeAsFileTime,
-            Threading::{GetCurrentProcessId, GetCurrentThreadId},
-        },
-    },
+use windows::Win32::System::{
+    Diagnostics::Debug::{AddVectoredExceptionHandler, EXCEPTION_POINTERS},
+    SystemInformation::GetSystemTimeAsFileTime,
+    Threading::{GetCurrentProcessId, GetCurrentThreadId},
 };
 
+use super::mapped::{Region, Zeroable};
 use super::{assets, json_escape};
 
 pub(super) const DEFAULT_LIMIT: usize = 32;
@@ -98,123 +88,17 @@ struct PersistentLog {
     slots: [ExceptionSlot; SLOT_COUNT],
 }
 
-enum Backing {
-    Mapped {
-        _file: File,
-        mapping: HANDLE,
-        view: MEMORY_MAPPED_VIEW_ADDRESS,
-    },
-    Memory { _log: Box<PersistentLog> },
-}
+unsafe impl Zeroable for PersistentLog {}
 
-struct Storage {
-    log: *mut PersistentLog,
-    backing: Backing,
-    path: Option<PathBuf>,
-    persistence_error: Option<String>,
-}
-
-unsafe impl Send for Storage {}
-unsafe impl Sync for Storage {}
-
-impl Storage {
-    fn flush(&self) {
-        if let Backing::Mapped { view, .. } = &self.backing {
-            let _ = unsafe { FlushViewOfFile(view.Value, std::mem::size_of::<PersistentLog>()) };
-        }
-    }
-}
-
-impl Drop for Storage {
-    fn drop(&mut self) {
-        if let Backing::Mapped { mapping, .. } = &self.backing {
-            let _ = unsafe { CloseHandle(*mapping) };
-        }
-    }
-}
-
-static STORAGE: OnceLock<Storage> = OnceLock::new();
+static STORAGE: OnceLock<Region<PersistentLog>> = OnceLock::new();
 static ACTIVE_LOG: AtomicPtr<PersistentLog> = AtomicPtr::new(std::ptr::null_mut());
 static SESSION_ID: AtomicU64 = AtomicU64::new(0);
 static HANDLER_INSTALLED: AtomicBool = AtomicBool::new(false);
 static DIAGNOSTIC_FINGERPRINTS: [AtomicU64; DIAGNOSTIC_SLOT_COUNT] =
     [const { AtomicU64::new(0) }; DIAGNOSTIC_SLOT_COUNT];
 
-fn zeroed_log() -> Box<PersistentLog> {
-    let mut value = Box::<PersistentLog>::new_uninit();
-    unsafe {
-        value.as_mut_ptr().write_bytes(0, 1);
-        value.assume_init()
-    }
-}
-
-fn exception_file_path() -> Result<PathBuf, String> {
-    let directory = assets::editor_log_directory()
-        .or_else(|| std::env::current_exe().ok()?.parent().map(Path::to_path_buf))
-        .ok_or_else(|| "could not choose an exception-context directory".to_string())?;
-    fs::create_dir_all(&directory).map_err(|error| error.to_string())?;
-    Ok(directory.join("RenXMCPExceptionContext.bin"))
-}
-
-fn mapped_backing() -> Result<(Backing, *mut PersistentLog, PathBuf), String> {
-    let path = exception_file_path()?;
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .open(&path)
-        .map_err(|error| error.to_string())?;
-    let size = std::mem::size_of::<PersistentLog>();
-    file.set_len(size as u64)
-        .map_err(|error| error.to_string())?;
-    let handle = HANDLE(file.as_raw_handle() as isize);
-    let mapping = unsafe {
-        CreateFileMappingW(
-            handle,
-            None,
-            PAGE_READWRITE,
-            0,
-            size as u32,
-            PCWSTR::null(),
-        )
-    }
-    .map_err(|error| error.to_string())?;
-    let view = unsafe { MapViewOfFile(mapping, FILE_MAP_ALL_ACCESS, 0, 0, size) };
-    if view.Value.is_null() {
-        let _ = unsafe { CloseHandle(mapping) };
-        return Err("MapViewOfFile returned null".to_string());
-    }
-    let log = view.Value.cast::<PersistentLog>();
-    Ok((
-        Backing::Mapped {
-            _file: file,
-            mapping,
-            view,
-        },
-        log,
-        path,
-    ))
-}
-
-fn make_storage() -> Storage {
-    match mapped_backing() {
-        Ok((backing, log, path)) => Storage {
-            log,
-            backing,
-            path: Some(path),
-            persistence_error: None,
-        },
-        Err(error) => {
-            let mut memory = zeroed_log();
-            let log = (&mut *memory) as *mut PersistentLog;
-            Storage {
-                log,
-                backing: Backing::Memory { _log: memory },
-                path: None,
-                persistence_error: Some(error),
-            }
-        }
-    }
+fn make_storage() -> Region<PersistentLog> {
+    Region::open("RenXMCPExceptionContext.bin")
 }
 
 unsafe fn initialize_header(log: *mut PersistentLog, session_id: u64) {
@@ -368,9 +252,9 @@ pub(super) fn init() -> anyhow::Result<()> {
         .context("system time is before Unix epoch")?
         .as_millis() as u64;
     let storage = STORAGE.get_or_init(make_storage);
-    unsafe { initialize_header(storage.log, session_id) };
+    unsafe { initialize_header(storage.get(), session_id) };
     SESSION_ID.store(session_id, Ordering::Release);
-    ACTIVE_LOG.store(storage.log, Ordering::Release);
+    ACTIVE_LOG.store(storage.get(), Ordering::Release);
     let handler = unsafe { AddVectoredExceptionHandler(1, Some(vectored_handler)) };
     if handler.is_null() {
         ACTIVE_LOG.store(std::ptr::null_mut(), Ordering::Release);
@@ -607,7 +491,7 @@ pub(super) fn query(
     let storage = STORAGE
         .get()
         .ok_or_else(|| "exception capture is not initialized".to_string())?;
-    let log = storage.log;
+    let log = storage.get();
     let current_session = SESSION_ID.load(Ordering::Acquire);
     let previous_session = unsafe { (*log).previous_session_id.load(Ordering::Acquire) };
     let previous_clean =
@@ -631,13 +515,13 @@ pub(super) fn query(
         .collect::<Vec<_>>()
         .join(",");
     let artifacts = crash_artifacts();
-    let persistence_path = storage.path.as_ref().map(|path| path.display().to_string());
+    let persistence_path = storage.path().map(|path| path.display().to_string());
     Ok(format!(
         "{{\"capture\":{{\"handlerInstalled\":{},\"scope\":\"first-chance Windows exceptions\",\"capacity\":{SLOT_COUNT},\"fatalCapacity\":{FATAL_SLOT_COUNT},\"diagnosticCapacity\":{DIAGNOSTIC_SLOT_COUNT},\"diagnosticsDeduplicatedByCodeAndAddress\":true,\"persistent\":{},\"path\":{},\"persistenceError\":{}}},\"currentSessionId\":{current_session},\"previousSessionId\":{},\"previousSessionEndedCleanly\":{},\"sinceSequence\":{since_sequence},\"latestSequence\":{latest_sequence},\"earliestAvailableSequence\":{earliest_available},\"includePreviousSessions\":{include_previous_sessions},\"totalMatches\":{total_matches},\"returnedCount\":{},\"truncated\":{},\"events\":[{event_json}],\"crashArtifacts\":[{}],\"interpretation\":\"These are first-chance records: handled exceptions are included. Fatal-candidate records have a protected 48-slot partition; ordinary diagnostics are code/address deduplicated into 16 slots. possibleCrash additionally requires an unclean previous-session end. Neither field confirms a crash; correlate with a dump or UE3 log.\"}}",
         HANDLER_INSTALLED.load(Ordering::Acquire),
-        storage.path.is_some(),
+        storage.is_persistent(),
         optional_json(persistence_path.as_deref()),
-        optional_json(storage.persistence_error.as_deref()),
+        optional_json(storage.error()),
         if previous_session == 0 {
             "null".to_string()
         } else {

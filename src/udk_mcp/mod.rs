@@ -30,6 +30,7 @@ pub(crate) mod events;
 mod pie;
 pub(crate) mod exceptions;
 mod health;
+mod mapped;
 mod object;
 mod scene;
 mod spatial;
