@@ -26,6 +26,7 @@ pub mod policy;
 mod assets;
 mod changes;
 mod dependencies;
+mod experiment;
 pub(crate) mod events;
 mod pie;
 pub(crate) mod exceptions;
@@ -1554,6 +1555,21 @@ fn submit_editor_operation(operation: EditorOperation) -> Result<EditorValue, St
     submit_guarded(operation, Guards::default())
 }
 
+/// How long to wait for one operation, by how much work it is known to be.
+fn operation_timeout(operation: &EditorOperation) -> Duration {
+    match operation {
+        EditorOperation::MapHealth {
+            include_slow_reference_checks: true,
+            ..
+        } => MAP_HEALTH_SLOW_TIMEOUT,
+        EditorOperation::MapHealth { .. } => MAP_HEALTH_TIMEOUT,
+        EditorOperation::AssetUsage { .. } => ASSET_USAGE_TIMEOUT,
+        EditorOperation::ReferenceGraph { .. } => REFERENCE_GRAPH_TIMEOUT,
+        EditorOperation::SpatialQuery(_) => SPATIAL_QUERY_TIMEOUT,
+        _ => REQUEST_TIMEOUT,
+    }
+}
+
 /// A timeout means one of two unrelated things, and the fix for one is the
 /// opposite of the fix for the other.
 ///
@@ -1589,6 +1605,164 @@ fn timeout_message(started: bool, timeout: Duration) -> String {
              seconds. Ask the user to close any dialog or menu in the editor. The request has \
              been cancelled and will NOT run later, so nothing was changed and retrying is safe."
         )
+    }
+}
+
+/// The most reads one batch may carry. Bounded because the whole batch shares
+/// one deadline, so a long list would let one caller hold the drain's attention
+/// for a stretch nobody else can interrupt.
+const MAX_BATCH_CALLS: usize = 16;
+
+/// One entry in a batch: either refused before it was queued, or waiting.
+enum BatchEntry {
+    Refused(String),
+    Waiting {
+        receiver: mpsc::Receiver<(Result<EditorValue, String>, EditorTiming)>,
+        started: std::sync::Arc<AtomicBool>,
+        cancelled: std::sync::Arc<AtomicBool>,
+        timeout: Duration,
+    },
+}
+
+/// Queues several read operations together and waits for all of them.
+///
+/// The saving is the editor frame, not the socket. [`submit_guarded`] pays one
+/// queue wait before its work begins, and N sequential calls pay N of them: on
+/// an idle editor that was measured at 6ms each, but with a menu open the same
+/// wait was 4.2 seconds. The drain already takes up to [`MAX_QUEUED_REQUESTS`]
+/// requests per tick, so operations queued together are served in a single pass
+/// and the wait is paid once however many reads are in the batch.
+///
+/// Every operation is still checked against the policy individually, before
+/// anything is queued. Batching is a way to spend fewer frames, never a way to
+/// reach an operation the caller could not have made on its own.
+fn submit_batch(operations: Vec<EditorOperation>) -> Vec<Result<EditorValue, String>> {
+    if EDITOR_THIS.load(Ordering::Acquire) == 0 {
+        return operations
+            .iter()
+            .map(|_| {
+                Err("The editor is still starting up and has not run a frame yet. This is not a \
+                     policy refusal - retry in a few seconds."
+                    .to_string())
+            })
+            .collect();
+    }
+    let intent = flight::handoff();
+    let mut entries = Vec::with_capacity(operations.len());
+    let mut requests = Vec::with_capacity(operations.len());
+    for operation in operations {
+        let capability = required_capability(&operation);
+        if !policy::allows(capability) {
+            POLICY_REFUSALS.fetch_add(1, Ordering::Relaxed);
+            entries.push(BatchEntry::Refused(policy::deny_message(capability)));
+            continue;
+        }
+        let timeout = operation_timeout(&operation);
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let started = std::sync::Arc::new(AtomicBool::new(false));
+        let cancelled = std::sync::Arc::new(AtomicBool::new(false));
+        requests.push(EditorRequest {
+            operation,
+            guards: Guards::default(),
+            queued_at: Instant::now(),
+            started: started.clone(),
+            cancelled: cancelled.clone(),
+            intent: intent.clone(),
+            response: sender,
+        });
+        entries.push(BatchEntry::Waiting {
+            receiver,
+            started,
+            cancelled,
+            timeout,
+        });
+    }
+
+    {
+        let mut queue = request_queue()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Room for the whole batch or none of it. A partially queued batch
+        // would return some results and some queue-full errors for work that
+        // was never attempted, which reads as the editor having refused it.
+        if queue.len() + requests.len() > MAX_QUEUED_REQUESTS {
+            return entries
+                .iter()
+                .map(|_| Err("the editor request queue is too full to take this batch".to_string()))
+                .collect();
+        }
+        for request in requests {
+            queue.push_back(request);
+        }
+    }
+    flight::set_phase(flight::Phase::Queued);
+
+    // One deadline for the batch, taken from its most expensive member, so a
+    // slow read cannot be starved by the cheap ones queued in front of it.
+    let deadline = Instant::now()
+        + entries
+            .iter()
+            .filter_map(|entry| match entry {
+                BatchEntry::Waiting { timeout, .. } => Some(*timeout),
+                BatchEntry::Refused(_) => None,
+            })
+            .max()
+            .unwrap_or(REQUEST_TIMEOUT);
+    let results = entries
+        .into_iter()
+        .map(|entry| match entry {
+            BatchEntry::Refused(message) => Err(message),
+            BatchEntry::Waiting {
+                receiver,
+                started,
+                cancelled,
+                timeout,
+            } => match receiver.recv_timeout(deadline.saturating_duration_since(Instant::now())) {
+                Ok((result, timing)) => {
+                    record_editor_timing(timing);
+                    result
+                }
+                Err(_) => {
+                    cancelled.store(true, Ordering::SeqCst);
+                    Err(timeout_message(started.load(Ordering::SeqCst), timeout))
+                }
+            },
+        })
+        .collect();
+    flight::set_phase(flight::Phase::Bridge);
+    results
+}
+
+/// Maps a tool name and its arguments to the one read operation behind it.
+///
+/// A deliberate subset of the read tools rather than all of them. A batch of
+/// mutations would need each one's confirmation prompt, blast-radius check and
+/// rate accounting, and running that unattended in a loop is the exact thing
+/// those guards exist to prevent - so nothing that writes is reachable here.
+fn batch_read_operation(name: &str, arguments: &str) -> Result<EditorOperation, String> {
+    match name {
+        "renx_get_selection_counts" => Ok(EditorOperation::SelectionCounts),
+        "renx_get_selected_actors" => Ok(EditorOperation::SelectedActors),
+        "renx_get_map_info" => Ok(EditorOperation::MapInfo),
+        "renx_get_pie_status" => Ok(EditorOperation::PieStatus),
+        "renx_list_actor_properties" => Ok(EditorOperation::ListActorProperties {
+            actor_index: required_usize(arguments, "actorIndex").map_err(|error| error.1)?,
+            pattern: json_field_string(arguments, "pattern").unwrap_or_else(|| "*".to_string()),
+        }),
+        "renx_get_actor_property" => Ok(EditorOperation::GetActorProperty {
+            actor_index: required_usize(arguments, "actorIndex").map_err(|error| error.1)?,
+            property: required_string(arguments, "property").map_err(|error| error.1)?,
+        }),
+        "renx_get_object_property" => Ok(EditorOperation::GetObjectProperty {
+            object_path: required_string(arguments, "objectPath").map_err(|error| error.1)?,
+            property: required_string(arguments, "property").map_err(|error| error.1)?,
+        }),
+        other => Err(format!(
+            "'{other}' cannot be batched. Batching is limited to reads that take no confirmation \
+             and change nothing: renx_get_selection_counts, renx_get_selected_actors, \
+             renx_get_map_info, renx_get_pie_status, renx_list_actor_properties, \
+             renx_get_actor_property, renx_get_object_property. Call anything else on its own."
+        )),
     }
 }
 
@@ -1653,17 +1827,7 @@ fn submit_guarded(operation: EditorOperation, guards: Guards) -> Result<EditorVa
                     policy refusal - retry in a few seconds."
             .to_string());
     }
-    let timeout = match &operation {
-        EditorOperation::MapHealth {
-            include_slow_reference_checks: true,
-            ..
-        } => MAP_HEALTH_SLOW_TIMEOUT,
-        EditorOperation::MapHealth { .. } => MAP_HEALTH_TIMEOUT,
-        EditorOperation::AssetUsage { .. } => ASSET_USAGE_TIMEOUT,
-        EditorOperation::ReferenceGraph { .. } => REFERENCE_GRAPH_TIMEOUT,
-        EditorOperation::SpatialQuery(_) => SPATIAL_QUERY_TIMEOUT,
-        _ => REQUEST_TIMEOUT,
-    };
+    let timeout = operation_timeout(&operation);
     let (sender, receiver) = mpsc::sync_channel(1);
     let started = std::sync::Arc::new(AtomicBool::new(false));
     let cancelled = std::sync::Arc::new(AtomicBool::new(false));
@@ -1721,6 +1885,75 @@ fn configured_port() -> u16 {
         .and_then(|value| value.parse::<u16>().ok())
         .filter(|port| *port != 0)
         .unwrap_or(DEFAULT_PORT)
+}
+
+/// How many connections may be served at once.
+///
+/// Matched to the flight recorder's intent slots, and that is the binding
+/// constraint rather than a round number: every concurrent connection should be
+/// able to publish what it is doing, and a ninth would be invisible in exactly
+/// the report used to explain a crash.
+///
+/// Bounded at all because each connection can queue work for the editor thread.
+/// A client opening sockets in a loop would otherwise spawn threads in a loop,
+/// and the editor - which has one thread and runs bridge work between frames -
+/// is the thing that would fall over.
+const MAX_CONCURRENT_CONNECTIONS: usize = 8;
+static LIVE_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
+
+/// Releases the connection count however the connection ends, including a panic
+/// in the handler. Leaking one would permanently shrink the limit above.
+struct ConnectionSlot;
+
+impl Drop for ConnectionSlot {
+    fn drop(&mut self) {
+        LIVE_CONNECTIONS.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+/// Serves one accepted connection, on its own thread.
+///
+/// Previously this ran inline in the accept loop, so the bridge served exactly
+/// one client at a time and everything else waited in the TCP backlog - invisible
+/// to the caller and to the bridge's own timing, which measured two concurrent
+/// five-second calls at 5.2s and 10.3s while both audit lines read 5.1s. The
+/// cost was not only latency: a status poll asking what the editor was doing
+/// queued behind the very call it was asking about, and one wedged request
+/// blocked every client for its whole timeout - up to five minutes.
+fn serve(stream: TcpStream) {
+    if LIVE_CONNECTIONS.fetch_add(1, Ordering::AcqRel) >= MAX_CONCURRENT_CONNECTIONS {
+        let _slot = ConnectionSlot;
+        let mut stream = stream;
+        // Answered rather than dropped. A closed socket looks identical to a
+        // crashed bridge from the client side, and this is the one refusal a
+        // client can fix by itself.
+        let _ = write_http(
+            &mut stream,
+            503,
+            "text/plain",
+            "Too many concurrent connections to the RenX MCP bridge. Retry in a moment; the \
+             editor serves a bounded number at once because every one of them can queue work \
+             for its single thread.",
+        );
+        return;
+    }
+    let spawned = std::thread::Builder::new()
+        .name("renx-mcp-connection".to_string())
+        .spawn(move || {
+            let _slot = ConnectionSlot;
+            if let Err(error) = handle_connection(stream) {
+                debug_log!("RenX MCP connection error: {error}");
+            }
+        });
+    if spawned.is_err() {
+        // The closure owned the stream, so a failed spawn has already dropped
+        // it and the client sees a closed connection. Nothing better is
+        // available here - the failure means the process could not create a
+        // thread at all - but the count has to come back, because no thread
+        // took the slot and a leak would shrink the limit for good.
+        LIVE_CONNECTIONS.fetch_sub(1, Ordering::AcqRel);
+        debug_log!("RenX MCP could not spawn a connection thread; the connection was dropped");
+    }
 }
 
 fn start_server_once() {
@@ -1851,9 +2084,7 @@ fn server_main(port: u16, generation: u32, ready: mpsc::SyncSender<Result<(), St
         match connection {
             Ok(stream) => {
                 CONNECTIONS_ACCEPTED.fetch_add(1, Ordering::Relaxed);
-                if let Err(error) = handle_connection(stream) {
-                    debug_log!("RenX MCP connection error: {error}");
-                }
+                serve(stream);
             }
             Err(error) => {
                 record_server_error(&format!("accept failed: {error}"));
@@ -2375,7 +2606,7 @@ fn handle_json_rpc(body: &str) -> Option<String> {
 fn initialize_result() -> String {
     let mode = policy::current_mode();
     format!(
-        "{{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{{\"tools\":{{\"listChanged\":false}}}},\"serverInfo\":{{\"name\":\"renx-udk-editor\",\"version\":\"0.13.0\"}},\"instructions\":\"Controls the local Renegade X Win64 UDK editor. Actor indices refer to the current selection and can change whenever selection changes. Object paths returned by scene search are stable for the current loaded map. Viewport point inspection returns an exact UE3 scene-view ray; check cameraRay.approximate before trusting a world hit position. Mutation tools participate in UE3 undo transactions.\\n\\nEditor policy mode is '{}': {} Only the tools this mode permits are listed; the operator sets this in the RenX MCP control panel and it cannot be changed through this connection. If a task needs something the mode forbids, say so rather than looking for another route to the same effect.\"}}",
+        "{{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{{\"tools\":{{\"listChanged\":false}}}},\"serverInfo\":{{\"name\":\"renx-udk-editor\",\"version\":\"0.14.0\"}},\"instructions\":\"Controls the local Renegade X Win64 UDK editor. Actor indices refer to the current selection and can change whenever selection changes. Object paths returned by scene search are stable for the current loaded map. Viewport point inspection returns an exact UE3 scene-view ray; check cameraRay.approximate before trusting a world hit position. Mutation tools participate in UE3 undo transactions.\\n\\nEditor policy mode is '{}': {} Only the tools this mode permits are listed; the operator sets this in the RenX MCP control panel and it cannot be changed through this connection. If a task needs something the mode forbids, say so rather than looking for another route to the same effect.\"}}",
         mode.id(),
         json_escape(mode.describe())
     )
@@ -2391,6 +2622,14 @@ fn tool_capability(tool: &str) -> Option<policy::Capability> {
         "renx_editor_status" | "renx_get_recent_events" | "renx_get_exception_context" => {
             policy::Capability::ReadStatus
         }
+        // The batch itself grants nothing: every operation inside it is checked
+        // against the policy on its own, so the outer tool only needs to be
+        // reachable by a session that is allowed to read at all.
+        "renx_batch" => policy::Capability::ReadStatus,
+        // Clearing the play scratch packages is a play-session operation, and
+        // the only files this tool can touch are the ones a play session writes.
+        // The act it then runs is checked under its own capability.
+        "renx_run_experiment" => policy::Capability::ControlPie,
         "renx_get_selection_counts" | "renx_get_selected_actors" => {
             policy::Capability::ReadSelection
         }
@@ -2490,6 +2729,8 @@ const TOOL_DEFINITIONS: &[(&str, &str)] = &[
     ("renx_get_engine_log", r#"{"name":"renx_get_engine_log","description":"Read a bounded structured tail of the editor's own UE3 log: warnings, errors, script warnings, load/save and build messages, with category, verbosity and sequence. Omit sinceSequence to get the newest lines, then poll with the returned nextSequence. Lines logged before the editor's first tick are not here and categories the engine suppresses never reach it; the on-disk logs cover startup.","inputSchema":{"type":"object","properties":{"sinceSequence":{"type":"integer","minimum":0,"default":0,"description":"Return lines after this sequence. Omit or 0 for the newest page."},"limit":{"type":"integer","minimum":1,"maximum":500,"default":100},"category":{"type":"string","default":"","description":"Optional exact UE3 log category such as Warning, Error, DevLoad, DevSave, or DevShaders."},"minVerbosity":{"type":"string","enum":["log","warning","error"],"default":"log"},"query":{"type":"string","default":"","description":"Optional case-insensitive message substring."}},"additionalProperties":false}}"#),
     ("renx_get_missing_asset_diagnostics", r#"{"name":"renx_get_missing_asset_diagnostics","description":"Scan bounded tails of recent UE3 editor logs for failed asset/package loads and unresolved imports, including referring object/property when UE3 logged them.","inputSchema":{"type":"object","properties":{"query":{"type":"string","default":"","description":"Optional case-insensitive missing path or message substring."},"limit":{"type":"integer","minimum":1,"maximum":200,"default":50},"maxLogFiles":{"type":"integer","minimum":1,"maximum":8,"default":3}},"additionalProperties":false}}"#),
     ("renx_editor_status", "{\"name\":\"renx_editor_status\",\"description\":\"Report whether the Renegade X editor-thread bridge is ready.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}}"),
+    ("renx_run_experiment", r#"{"name":"renx_run_experiment","description":"Run one tool call from a known-clean state and report whether it actually produced anything. Deletes the Play-In-Editor scratch packages first (it can delete nothing else, and takes no path from you); if any of them will not delete the act is NOT run, because a run whose starting state could not be established is invalid before it begins. After the act it watches those packages until one is written or settleSeconds passes, since starting play only queues a request that the engine acts on frames later. Read producedNoArtifact first: when it is true the run was inert and its result describes the state from before it, so do not draw a conclusion from it. Use this for any repeated PIE experiment - three identical runs against one stale package look exactly like three runs that agree.","inputSchema":{"type":"object","properties":{"call":{"type":"object","properties":{"name":{"type":"string"},"arguments":{"type":"object"}},"required":["name"],"description":"The act to run, checked against editor policy exactly as if called directly."},"settleSeconds":{"type":"integer","minimum":0,"maximum":120,"default":30,"description":"How long to watch for a new artifact before calling the run inert."}},"required":["call"],"additionalProperties":false}}"#),
+    ("renx_batch", r#"{"name":"renx_batch","description":"Run several reads in one call. All of them are queued together and served in a single editor frame, so the batch waits for the editor once instead of once per read - on a busy editor that wait was measured at seconds each, so prefer this whenever you need more than one read at the same moment. Results come back in the order asked and one failure does not affect the others. Reads only, and only these: renx_get_selection_counts, renx_get_selected_actors, renx_get_map_info, renx_get_pie_status, renx_list_actor_properties, renx_get_actor_property, renx_get_object_property. Each is still checked against editor policy on its own.","inputSchema":{"type":"object","properties":{"calls":{"type":"array","minItems":1,"maxItems":16,"items":{"type":"object","properties":{"name":{"type":"string"},"arguments":{"type":"object"}},"required":["name"]}}},"required":["calls"],"additionalProperties":false}}"#),
     ("renx_get_selection_counts", "{\"name\":\"renx_get_selection_counts\",\"description\":\"Return selected actor and selected object counts from the editor.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}}"),
     ("renx_get_selected_actors", "{\"name\":\"renx_get_selected_actors\",\"description\":\"Return selected actor names, paths, classes, levels, locations, rotations, and scales. Also returns selectionToken: pass it to a later mutation and that mutation is refused if the user changed the selection in between.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}}"),
     ("renx_list_actor_properties", "{\"name\":\"renx_list_actor_properties\",\"description\":\"List reflected properties on a selected actor class using UE3 UProperty metadata.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{\"actorIndex\":{\"type\":\"integer\",\"minimum\":0},\"pattern\":{\"type\":\"string\",\"default\":\"*\",\"description\":\"Property wildcard using * and ?\"}},\"required\":[\"actorIndex\"],\"additionalProperties\":false}}"),
@@ -2636,11 +2877,13 @@ fn dispatch_tool_call(body: &str) -> Result<String, (i32, String)> {
             let port = SERVER_PORT.load(Ordering::Relaxed);
             let listening = SERVER_LISTENING.load(Ordering::Acquire);
             let structured = format!(
-                "{{\"editorReady\":{},\"listening\":{},\"port\":{port},\"tickCount\":{ticks},\"processId\":{},\"policyMode\":\"{}\"}}",
+                "{{\"editorReady\":{},\"listening\":{},\"port\":{port},\"tickCount\":{ticks},\"processId\":{},\"policyMode\":\"{}\",\"liveConnections\":{},\"maxConcurrentConnections\":{MAX_CONCURRENT_CONNECTIONS}}}",
                 EDITOR_THIS.load(Ordering::Acquire) != 0,
                 listening,
                 std::process::id(),
-                policy::current_mode().id()
+                policy::current_mode().id(),
+                // Includes the connection asking, so one is the quiet case.
+                LIVE_CONNECTIONS.load(Ordering::Acquire),
             );
             // The policy file, because the mode above is only as current as it
             // is: the operator can change it mid-session, and a caller that was
@@ -2707,6 +2950,146 @@ fn dispatch_tool_call(body: &str) -> Result<String, (i32, String)> {
                 Ok(structured) => Ok(tool_success(&structured)),
                 Err(error) => Err((-32602, error)),
             }
+        }
+        "renx_run_experiment" => {
+            let arguments = tool_arguments(params, &name)?;
+            let call = json_field_raw(arguments, "call").ok_or((
+                -32602,
+                "renx_run_experiment requires a 'call' object naming the act to run".to_string(),
+            ))?;
+            let act_name = json_field_string(call, "name")
+                .ok_or((-32602, "the 'call' object requires a 'name'".to_string()))?;
+            if act_name == "renx_run_experiment" {
+                return Err((
+                    -32602,
+                    "an experiment cannot be its own act".to_string(),
+                ));
+            }
+            let act_arguments = json_field_raw(call, "arguments").unwrap_or("{}").to_string();
+            let settle = optional_usize(arguments, "settleSeconds")?
+                .unwrap_or(experiment::DEFAULT_SETTLE_SECONDS as usize)
+                as u64;
+            if settle > experiment::MAX_SETTLE_SECONDS {
+                return Err((
+                    -32602,
+                    format!(
+                        "settleSeconds must be at most {}",
+                        experiment::MAX_SETTLE_SECONDS
+                    ),
+                ));
+            }
+
+            let before_clear = provenance::play_in_editor_packages();
+            let cleared = experiment::clear();
+            // Refused rather than reported. A run whose starting state could
+            // not be established is invalid before it begins, and running it
+            // anyway is exactly the mistake this tool exists to prevent - the
+            // result would look like every other result.
+            if !cleared.established() {
+                return Ok(tool_success(&format!(
+                    r#"{{"ran":false,"preconditions":{},"verdict":"{}"}}"#,
+                    experiment::cleared_json(&cleared),
+                    json_escape(&experiment::verdict(false, false, Duration::ZERO)),
+                )));
+            }
+
+            let baseline = experiment::sample();
+            // Through the ordinary dispatch, so the act is checked against
+            // policy, audited and guarded exactly as if it had been called
+            // directly. An experiment is a wrapper, not a second door.
+            let act = dispatch_tool_call(&format!(
+                r#"{{"params":{{"name":"{}","arguments":{}}}}}"#,
+                json_escape(&act_name),
+                act_arguments
+            ));
+            let (act_ok, act_body) = match &act {
+                Ok(payload) if !payload.contains("\"isError\":true") => (true, payload.clone()),
+                Ok(payload) => (false, payload.clone()),
+                Err((_, message)) => (
+                    false,
+                    format!(r#"{{"error":"{}"}}"#, json_escape(message)),
+                ),
+            };
+
+            let (produced, waited, after) =
+                experiment::wait_for_change(&baseline, Duration::from_secs(settle));
+            let _ = after;
+            Ok(tool_success(&format!(
+                r#"{{"ran":true,"preconditions":{},"act":{{"name":"{}","ok":{act_ok},"payload":{act_body}}},"observedForSeconds":{},"producedNoArtifact":{},"artifactsBefore":[{}],"artifactsAfter":[{}],"verdict":"{}"}}"#,
+                experiment::cleared_json(&cleared),
+                json_escape(&act_name),
+                waited.as_secs(),
+                !produced,
+                provenance::artifacts_json(&before_clear),
+                provenance::artifacts_json(&provenance::play_in_editor_packages()),
+                json_escape(&experiment::verdict(true, produced, waited)),
+            )))
+        }
+        "renx_batch" => {
+            let arguments = tool_arguments(params, &name)?;
+            let calls = json_object_array(arguments, "calls")
+                .ok_or((-32602, "renx_batch requires a 'calls' array".to_string()))?;
+            if calls.is_empty() {
+                return Err((-32602, "renx_batch requires at least one call".to_string()));
+            }
+            if calls.len() > MAX_BATCH_CALLS {
+                return Err((
+                    -32602,
+                    format!("renx_batch accepts at most {MAX_BATCH_CALLS} calls"),
+                ));
+            }
+            // Parsed and mapped in full before anything is queued, so a batch
+            // with one bad entry fails as a batch rather than half-running.
+            let mut names = Vec::with_capacity(calls.len());
+            let mut operations = Vec::with_capacity(calls.len());
+            for call in &calls {
+                let call_name = json_field_string(call, "name")
+                    .ok_or((-32602, "each batch call requires a 'name'".to_string()))?;
+                let call_arguments = json_field_raw(call, "arguments").unwrap_or("{}");
+                let operation = batch_read_operation(&call_name, call_arguments)
+                    .map_err(|error| (-32602, error))?;
+                names.push(call_name);
+                operations.push(operation);
+            }
+            let results = submit_batch(operations);
+            let payload = names
+                .iter()
+                .zip(results)
+                .map(|(call_name, result)| match result {
+                    Ok(EditorValue::Json(structured)) => format!(
+                        r#"{{"name":"{}","ok":true,"result":{structured}}}"#,
+                        json_escape(call_name)
+                    ),
+                    Ok(EditorValue::SelectionCounts { actors, objects }) => format!(
+                        r#"{{"name":"{}","ok":true,"result":{{"actorCount":{actors},"objectCount":{objects},"selectionToken":"{}"}}}}"#,
+                        json_escape(call_name),
+                        guard::selection_token(actors.max(0) as usize)
+                    ),
+                    Ok(_) => format!(
+                        r#"{{"name":"{}","ok":false,"error":"this read returned a kind of value the batch cannot carry"}}"#,
+                        json_escape(call_name)
+                    ),
+                    // Per call, not per batch. One refused read among six is a
+                    // partial answer, and discarding the other five because of
+                    // it would cost a round trip to learn nothing new.
+                    Err(error) => format!(
+                        r#"{{"name":"{}","ok":false,"error":"{}"}}"#,
+                        json_escape(call_name),
+                        json_escape(&error)
+                    ),
+                })
+                .collect::<Vec<_>>();
+            let failed = payload.iter().filter(|entry| entry.contains(r#""ok":false"#)).count();
+            Ok(tool_success(&format!(
+                r#"{{"callCount":{},"failedCount":{failed},"note":"{}","results":[{}]}}"#,
+                payload.len(),
+                json_escape(
+                    "Every call was queued in one pass, so the batch waited for the editor once \
+                     rather than once per call. Results are in the order asked. A failure in one \
+                     does not affect the others."
+                ),
+                payload.join(",")
+            )))
         }
         "renx_get_selection_counts" => {
             match submit_editor_operation(EditorOperation::SelectionCounts) {
@@ -3260,6 +3643,77 @@ fn optional_bool(arguments: &str, key: &str) -> Result<Option<bool>, (i32, Strin
     }
 }
 
+/// Splits `key`'s array into its object elements, each still encoded.
+///
+/// Elements come back as the raw slices they occupy, so the caller reads fields
+/// out of them with the same reader it uses for every other object rather than
+/// this function inventing a second notion of what a call looks like. Depth is
+/// tracked through strings and their escapes, because a brace inside a property
+/// value is a character and not the end of an element.
+fn json_object_array<'a>(arguments: &'a str, key: &str) -> Option<Vec<&'a str>> {
+    let raw = json_field_raw(arguments, key)?;
+    let bytes = raw.as_bytes();
+    let mut cursor = skip_ws(bytes, 0);
+    if bytes.get(cursor) != Some(&b'[') {
+        return None;
+    }
+    cursor += 1;
+    let mut items = Vec::new();
+    loop {
+        cursor = skip_ws(bytes, cursor);
+        match bytes.get(cursor) {
+            Some(b']') => return Some(items),
+            Some(b'{') => {}
+            _ => return None,
+        }
+        let start = cursor;
+        let mut depth = 0usize;
+        let mut in_string = false;
+        let mut escaped = false;
+        while cursor < bytes.len() {
+            let byte = bytes[cursor];
+            cursor += 1;
+            if in_string {
+                if escaped {
+                    escaped = false;
+                } else if byte == b'\\' {
+                    escaped = true;
+                } else if byte == b'"' {
+                    in_string = false;
+                }
+                continue;
+            }
+            match byte {
+                b'"' => in_string = true,
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if depth != 0 {
+            return None;
+        }
+        items.push(&raw[start..cursor]);
+        // One past the limit is enough for the caller to reject the batch with
+        // its own message; going further would only grow a list about to be
+        // thrown away.
+        if items.len() > MAX_BATCH_CALLS {
+            return Some(items);
+        }
+        cursor = skip_ws(bytes, cursor);
+        match bytes.get(cursor) {
+            Some(b',') => cursor += 1,
+            Some(b']') => return Some(items),
+            _ => return None,
+        }
+    }
+}
+
 fn optional_string_array(arguments: &str, key: &str) -> Result<Vec<String>, (i32, String)> {
     let Some(raw) = json_field_raw(arguments, key) else {
         return Ok(Vec::new());
@@ -3671,6 +4125,133 @@ mod tests {
         assert_eq!(
             super::with_selection_token("{}", "sel-1-0"),
             r#"{"selectionToken":"sel-1-0"}"#
+        );
+    }
+
+    #[test]
+    fn batch_calls_are_split_without_a_json_parser() {
+        let arguments = r#"{"calls":[{"name":"renx_get_map_info"},{"name":"renx_get_actor_property","arguments":{"actorIndex":0,"property":"Tag"}}]}"#;
+        let calls = super::json_object_array(arguments, "calls").unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            json_field_string(calls[1], "name"),
+            Some("renx_get_actor_property".to_string())
+        );
+    }
+
+    /// The reason the split is brace-aware rather than a search for `},{`: a
+    /// property value is arbitrary text, and material expressions in this
+    /// editor genuinely contain braces.
+    #[test]
+    fn a_brace_inside_a_property_value_does_not_end_a_call() {
+        let arguments = r#"{"calls":[{"name":"renx_get_object_property","arguments":{"objectPath":"A.B","property":"X{\"y\":1}"}},{"name":"renx_get_map_info"}]}"#;
+        let calls = super::json_object_array(arguments, "calls").unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            json_field_string(calls[1], "name"),
+            Some("renx_get_map_info".to_string())
+        );
+    }
+
+    #[test]
+    fn an_oversized_batch_is_reported_rather_than_truncated() {
+        let one = r#"{"name":"renx_get_map_info"}"#;
+        let arguments = format!(
+            "{{\"calls\":[{}]}}",
+            vec![one; super::MAX_BATCH_CALLS + 4].join(",")
+        );
+        let calls = super::json_object_array(&arguments, "calls").unwrap();
+        // Stops one past the limit, which is all the caller needs to refuse it.
+        assert!(calls.len() > super::MAX_BATCH_CALLS);
+    }
+
+    #[test]
+    fn a_malformed_batch_array_is_refused() {
+        assert!(super::json_object_array(r#"{"calls":"nope"}"#, "calls").is_none());
+        assert!(super::json_object_array(r#"{"calls":["a"]}"#, "calls").is_none());
+        assert!(super::json_object_array(r#"{"calls":[{"a":1}"#, "calls").is_none());
+        assert_eq!(
+            super::json_object_array(r#"{"calls":[]}"#, "calls").map(|calls| calls.len()),
+            Some(0)
+        );
+    }
+
+    /// The boundary the batch exists behind: it is a way to spend fewer editor
+    /// frames, never a way to reach an operation the caller could not make on
+    /// its own. Nothing that writes, prompts, or costs rate budget is mappable.
+    #[test]
+    fn nothing_that_changes_the_map_can_be_batched() {
+        for forbidden in [
+            "renx_set_actor_property",
+            "renx_set_object_property",
+            "renx_actor_action",
+            "renx_exec",
+            "renx_start_pie",
+            "renx_stop_pie",
+            "renx_focus_viewport_actor",
+        ] {
+            let mapped = super::batch_read_operation(forbidden, "{}");
+            assert!(mapped.is_err(), "{forbidden} was accepted by the batch");
+        }
+    }
+
+    #[test]
+    fn every_batchable_name_maps_to_a_read_operation() {
+        for (name, arguments) in [
+            ("renx_get_selection_counts", "{}"),
+            ("renx_get_selected_actors", "{}"),
+            ("renx_get_map_info", "{}"),
+            ("renx_get_pie_status", "{}"),
+            ("renx_list_actor_properties", r#"{"actorIndex":0}"#),
+            (
+                "renx_get_actor_property",
+                r#"{"actorIndex":0,"property":"Tag"}"#,
+            ),
+            (
+                "renx_get_object_property",
+                r#"{"objectPath":"A.B","property":"Tag"}"#,
+            ),
+        ] {
+            let Ok(operation) = super::batch_read_operation(name, arguments) else {
+                panic!("{name} is not batchable");
+            };
+            // Every one of them has to be a read, or the check above is
+            // enforcing a list rather than a property.
+            assert!(!super::is_mutation(&operation), "{name} mutates");
+        }
+    }
+
+    #[test]
+    fn a_batchable_call_with_bad_arguments_names_the_argument() {
+        let Err(error) = super::batch_read_operation("renx_get_actor_property", "{}") else {
+            panic!("a missing actorIndex was accepted");
+        };
+        assert!(error.contains("actorIndex"), "{error}");
+    }
+
+    /// A leaked count would permanently shrink how many clients the bridge can
+    /// serve, and the leak would be invisible until the ninth connection.
+    #[test]
+    fn a_connection_slot_is_released_even_when_the_handler_panics() {
+        let before = super::LIVE_CONNECTIONS.load(super::Ordering::Acquire);
+        super::LIVE_CONNECTIONS.fetch_add(1, super::Ordering::AcqRel);
+        let panicked = std::panic::catch_unwind(|| {
+            let _slot = super::ConnectionSlot;
+            panic!("handler blew up");
+        });
+        assert!(panicked.is_err());
+        assert_eq!(super::LIVE_CONNECTIONS.load(super::Ordering::Acquire), before);
+    }
+
+    /// The cap is not a round number: it is the number of flight-recorder slots,
+    /// so every concurrent connection can still say what it is doing. A ninth
+    /// would be missing from the report used to explain a crash.
+    #[test]
+    fn the_connection_limit_matches_the_number_of_intent_slots() {
+        assert_eq!(
+            super::MAX_CONCURRENT_CONNECTIONS,
+            super::flight::INTENT_SLOTS,
+            "the connection cap and the flight recorder's slots have drifted apart"
         );
     }
 

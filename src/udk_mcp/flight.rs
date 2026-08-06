@@ -49,7 +49,7 @@ const FORMAT_VERSION: u32 = 1;
 pub(super) const CALL_SLOTS: usize = 256;
 /// One per thread that can have a call in flight. The bridge serves connections
 /// serially today, so one is used; the rest are headroom for when it does not.
-const INTENT_SLOTS: usize = 8;
+pub(super) const INTENT_SLOTS: usize = 8;
 /// Only ever describes the session immediately before this one. Keeping more
 /// generations would need a retention rule to answer "which crash is this?",
 /// and the previous session is the one anybody is asking about.
