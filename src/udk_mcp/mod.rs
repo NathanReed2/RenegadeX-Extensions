@@ -283,6 +283,15 @@ struct EditorRequest {
     /// the work itself is too big. Reading it is only valid after the wait has
     /// expired, which is the only place it is read.
     started: std::sync::Arc<AtomicBool>,
+    /// Raised by a caller that has stopped waiting, so the drain can drop the
+    /// request instead of applying it to an editor nobody is watching.
+    ///
+    /// Giving up waiting was not the same as cancelling: a timed-out mutation
+    /// stayed queued and applied minutes later, which makes the obvious agent
+    /// reflex - retry on timeout - able to delete twice. This is the flag that
+    /// makes a retry safe, and it is paired with `started` rather than trusted
+    /// alone, because work already underway cannot be recalled.
+    cancelled: std::sync::Arc<AtomicBool>,
     response: SyncSender<(Result<EditorValue, String>, EditorTiming)>,
 }
 
@@ -506,7 +515,17 @@ fn drain_editor_requests(editor: *mut c_void) {
         // caller spent on its own side of the socket.
         let queue_wait = request.queued_at.elapsed();
         let started = Instant::now();
-        request.started.store(true, Ordering::Release);
+        // Claim the request, then look for a cancellation. The caller does the
+        // mirror of this - raises `cancelled`, then reads `started` - and both
+        // sides are SeqCst, so the two cannot miss each other. Whoever loses
+        // the race errs towards "may have run", which is the safe direction to
+        // be wrong in for a mutation.
+        request.started.store(true, Ordering::SeqCst);
+        if request.cancelled.load(Ordering::SeqCst) {
+            // Nobody is listening. Dropping the request also drops the sender,
+            // which is what the caller's `recv` already gave up on.
+            continue;
+        }
         let result = guard_and_execute(editor, request.operation, &request.guards);
         let timing = EditorTiming {
             queue_wait,
@@ -1524,9 +1543,8 @@ fn timeout_message(started: bool, timeout: Duration) -> String {
              policy refusal and not a bridge fault: the editor runs bridge work between frames, \
              so anything holding its main loop defers it. A modal dialog or a long operation such \
              as a build, import or light bake stops it outright; an open menu merely slows it, by \
-             seconds. Ask the user to close any dialog or menu in the editor. The request is \
-             still queued and will run once the editor frees up, so do not assume nothing \
-             happened."
+             seconds. Ask the user to close any dialog or menu in the editor. The request has \
+             been cancelled and will NOT run later, so nothing was changed and retrying is safe."
         )
     }
 }
@@ -1605,6 +1623,7 @@ fn submit_guarded(operation: EditorOperation, guards: Guards) -> Result<EditorVa
     };
     let (sender, receiver) = mpsc::sync_channel(1);
     let started = std::sync::Arc::new(AtomicBool::new(false));
+    let cancelled = std::sync::Arc::new(AtomicBool::new(false));
     {
         let mut queue = request_queue()
             .lock()
@@ -1617,6 +1636,7 @@ fn submit_guarded(operation: EditorOperation, guards: Guards) -> Result<EditorVa
             guards,
             queued_at: Instant::now(),
             started: started.clone(),
+            cancelled: cancelled.clone(),
             response: sender,
         });
     }
@@ -1625,9 +1645,13 @@ fn submit_guarded(operation: EditorOperation, guards: Guards) -> Result<EditorVa
     // dialog, a long import or build - stops that thread from getting here, and
     // the symptom is this timeout. Saying so matters because the alternative
     // reading is "the bridge is broken", which it is not.
-    let (result, timing) = receiver
-        .recv_timeout(timeout)
-        .map_err(|_| timeout_message(started.load(Ordering::Acquire), timeout))?;
+    let (result, timing) = receiver.recv_timeout(timeout).map_err(|_| {
+        // Cancel first, then ask whether it had already begun - the drain does
+        // the mirror of this, so between them the outcome is never ambiguous in
+        // the unsafe direction.
+        cancelled.store(true, Ordering::SeqCst);
+        timeout_message(started.load(Ordering::SeqCst), timeout)
+    })?;
     // A timeout leaves this unrecorded on purpose. The request is still in the
     // queue and may run minutes later against a receiver nobody holds, so there
     // is no honest split to report for the call that gave up - only the total,
@@ -3477,15 +3501,25 @@ mod tests {
             "{did_not_finish}"
         );
 
-        // Neither may imply the request was cancelled: nothing here can recall
-        // a queued operation, and a caller that believes otherwise will retry a
-        // mutation that is about to apply.
+        // The two make opposite promises about retrying, and each must only
+        // make the one it can keep. A request that never started is genuinely
+        // cancelled and cannot apply later; one already underway cannot be
+        // recalled and must not invite a second copy of itself.
+        assert!(never_started.contains("retrying is safe"), "{never_started}");
+        assert!(
+            never_started.contains("will NOT run later"),
+            "{never_started}"
+        );
+        assert!(
+            did_not_finish.contains("do not retry"),
+            "{did_not_finish}"
+        );
+        assert!(
+            !did_not_finish.contains("retrying is safe"),
+            "{did_not_finish}"
+        );
         for message in [&never_started, &did_not_finish] {
             assert!(message.contains("60 seconds"), "{message}");
-            assert!(
-                message.contains("still queued") || message.contains("still running"),
-                "{message}"
-            );
         }
     }
 
