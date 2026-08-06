@@ -54,6 +54,12 @@ pub extern "system" fn DllMain(
                 // into an image about to be unmapped.
                 if _lpv_reserved == 0 {
                     crate::udk_mcp::events::detach();
+                    // Same reasoning, for the two things the panel leaves with
+                    // Windows: a frame subclass and a message hook, both of them
+                    // pointers into an image that is about to go away. The hook
+                    // is the pressing one - it is called for every message the
+                    // editor pumps.
+                    crate::udk_mcp::panel::shutdown();
                 }
             }
         }
