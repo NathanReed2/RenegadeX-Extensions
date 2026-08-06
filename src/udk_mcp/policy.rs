@@ -65,6 +65,7 @@ pub enum Capability {
     ControlViewport = 11,
     ReadScene = 12,
     ReadState = 13,
+    ReadLog = 14,
 }
 
 impl Capability {
@@ -90,6 +91,7 @@ impl Capability {
             Capability::ControlViewport => "control.viewport",
             Capability::ReadScene => "read.scene",
             Capability::ReadState => "read.state",
+            Capability::ReadLog => "read.log",
         }
     }
 
@@ -118,6 +120,9 @@ impl Capability {
             Capability::ReadState => {
                 "Capture and compare bounded map, actor, selection, transform, and camera state."
             }
+            Capability::ReadLog => {
+                "Read the editor's own log output - warnings, errors, and load/save messages."
+            }
         }
     }
 
@@ -142,6 +147,7 @@ impl Capability {
                 | Capability::ReadViewport
                 | Capability::ReadScene
                 | Capability::ReadState
+                | Capability::ReadLog
                 // Camera navigation changes editor UI state, but not map or
                 // package state. It is intentionally available in context mode.
                 | Capability::ControlViewport
@@ -149,7 +155,7 @@ impl Capability {
     }
 }
 
-pub const ALL: [Capability; 14] = [
+pub const ALL: [Capability; 15] = [
     Capability::ReadStatus,
     Capability::ReadSelection,
     Capability::ReadProperties,
@@ -164,6 +170,7 @@ pub const ALL: [Capability; 14] = [
     Capability::ControlViewport,
     Capability::ReadScene,
     Capability::ReadState,
+    Capability::ReadLog,
 ];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
