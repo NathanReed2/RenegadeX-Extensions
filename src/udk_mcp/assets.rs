@@ -315,10 +315,14 @@ fn parse_missing_line(line: &str) -> Option<MissingReference> {
     None
 }
 
-pub(super) fn editor_log_directory() -> Option<PathBuf> {
+/// `UDKGame`, from `UDKGame/Binaries/Win64/UDK.exe`.
+pub(super) fn udk_game_directory() -> Option<PathBuf> {
     let executable = std::env::current_exe().ok()?;
-    let root = executable.parent()?.parent()?.parent()?;
-    Some(root.join("UDKGame").join("Logs"))
+    Some(executable.parent()?.parent()?.parent()?.join("UDKGame"))
+}
+
+pub(super) fn editor_log_directory() -> Option<PathBuf> {
+    Some(udk_game_directory()?.join("Logs"))
 }
 
 fn recent_log_files(max_files: usize) -> (Option<PathBuf>, Vec<(PathBuf, u64)>, Vec<String>) {
@@ -501,11 +505,19 @@ pub(super) fn missing_diagnostics(
         .map(|error| format!("\"{}\"", json_escape(error)))
         .collect::<Vec<_>>()
         .join(",");
+    // Which logs, not just how many. A diagnostic recovered from a log written
+    // last week is a fact about last week, and the count alone cannot say so.
+    let scanned = files
+        .iter()
+        .map(|(path, _)| ("editorLog", path.clone()))
+        .collect::<Vec<_>>();
     Ok(format!(
-        "{{\"source\":\"bounded tails of UE3 editor log files\",\"logDirectory\":{},\"query\":\"{}\",\"filesScanned\":{},\"scannedBytes\":{scanned_bytes},\"maxBytesPerFile\":{MAX_LOG_BYTES},\"tailTruncated\":{tail_truncated},\"totalMatches\":{total_matches},\"duplicatesSkipped\":{duplicate_count},\"returnedCount\":{},\"truncated\":{},\"scanErrors\":[{error_json}],\"diagnostics\":[{}]}}",
+        "{{\"source\":\"bounded tails of UE3 editor log files\",\"logDirectory\":{},\"query\":\"{}\",\"filesScanned\":{},\"artifacts\":[{}],\"artifactFields\":\"{}\",\"scannedBytes\":{scanned_bytes},\"maxBytesPerFile\":{MAX_LOG_BYTES},\"tailTruncated\":{tail_truncated},\"totalMatches\":{total_matches},\"duplicatesSkipped\":{duplicate_count},\"returnedCount\":{},\"truncated\":{},\"scanErrors\":[{error_json}],\"diagnostics\":[{}]}}",
         optional_json(directory.as_ref().map(|path| path.to_string_lossy()).as_deref()),
         json_escape(query),
         files.len(),
+        super::provenance::artifacts_json(&scanned),
+        super::provenance::ARTIFACT_FIELDS_NOTE,
         diagnostics.len(),
         total_matches > diagnostics.len(),
         diagnostics.join(","),

@@ -470,15 +470,13 @@ fn crash_artifacts() -> Vec<String> {
     }
     artifacts.sort_by(|left, right| right.2.cmp(&left.2).then_with(|| left.0.cmp(&right.0)));
     artifacts.truncate(8);
+    // Through the shared describer rather than formatted here, so a dump says
+    // whether it belongs to this session. "Is this the crash I am looking at,
+    // or one from last week?" is the first question anyone asks of a dump, and
+    // a bare timestamp makes the reader do that arithmetic themselves.
     artifacts
         .into_iter()
-        .map(|(path, size, modified)| {
-            format!(
-                "{{\"path\":\"{}\",\"fileName\":\"{}\",\"sizeBytes\":{size},\"modifiedUnixMs\":{modified}}}",
-                json_escape(&path.display().to_string()),
-                json_escape(path.file_name().and_then(|value| value.to_str()).unwrap_or("")),
-            )
-        })
+        .map(|(path, _, _)| super::provenance::artifact_json("crashDump", &path))
         .collect()
 }
 
