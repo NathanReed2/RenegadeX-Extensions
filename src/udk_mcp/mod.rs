@@ -27,6 +27,7 @@ mod assets;
 mod changes;
 mod dependencies;
 pub(crate) mod events;
+mod pie;
 pub(crate) mod exceptions;
 mod health;
 mod object;
@@ -165,6 +166,9 @@ enum EditorOperation {
         action: ActorAction,
     },
     MapInfo,
+    PieStatus,
+    PieStart,
+    PieStop,
     MapHealth {
         include_slow_reference_checks: bool,
         categories: Vec<String>,
@@ -939,6 +943,9 @@ fn operation_touches_selection(operation: &EditorOperation) -> bool {
         EditorOperation::Exec(_)
         | EditorOperation::GetObjectProperty { .. }
         | EditorOperation::SetObjectProperty { .. }
+        | EditorOperation::PieStatus
+        | EditorOperation::PieStart
+        | EditorOperation::PieStop
         | EditorOperation::MapInfo
         | EditorOperation::MapHealth { .. }
         | EditorOperation::FindActors { .. }
@@ -994,6 +1001,9 @@ fn operation_description(operation: &EditorOperation) -> String {
             ActorAction::MoveToGrid => "ACTOR ALIGN MOVETOGRID",
         }),
         EditorOperation::MapInfo => "read map info".to_string(),
+        EditorOperation::PieStatus => "read play-in-editor status".to_string(),
+        EditorOperation::PieStart => "start a play-in-editor session".to_string(),
+        EditorOperation::PieStop => "stop the play-in-editor session".to_string(),
         EditorOperation::MapHealth { .. } => {
             "run UE3's bounded, read-only map validation".to_string()
         }
@@ -1255,6 +1265,9 @@ fn execute_editor_operation(
                 json_escape(&output)
             )))
         }
+        EditorOperation::PieStatus => Ok(EditorValue::Json(pie::status(editor)?)),
+        EditorOperation::PieStart => Ok(EditorValue::Json(pie::start(editor)?)),
+        EditorOperation::PieStop => Ok(EditorValue::Json(pie::stop(editor)?)),
         EditorOperation::MapInfo => {
             let actors = selected_actor_pointers(editor)?;
             let mut levels = Vec::new();
@@ -1445,6 +1458,11 @@ fn required_capability(operation: &EditorOperation) -> policy::Capability {
         EditorOperation::SetActorProperty { .. } => policy::Capability::WriteActorProperty,
         EditorOperation::SetObjectProperty { .. } => policy::Capability::WriteObjectProperty,
         EditorOperation::MapInfo | EditorOperation::MapHealth { .. } => policy::Capability::ReadMap,
+        EditorOperation::PieStatus => policy::Capability::ReadPie,
+        // Both directions, deliberately. A model that could stop a session it
+        // was not allowed to start could still take the editor out from under
+        // whoever was using it.
+        EditorOperation::PieStart | EditorOperation::PieStop => policy::Capability::ControlPie,
         EditorOperation::ViewportContext { .. }
         | EditorOperation::InspectViewportPoint { .. }
         | EditorOperation::ViewportScreenshot { .. } => policy::Capability::ReadViewport,
@@ -2279,7 +2297,7 @@ fn handle_json_rpc(body: &str) -> Option<String> {
 fn initialize_result() -> String {
     let mode = policy::current_mode();
     format!(
-        "{{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{{\"tools\":{{\"listChanged\":false}}}},\"serverInfo\":{{\"name\":\"renx-udk-editor\",\"version\":\"0.11.0\"}},\"instructions\":\"Controls the local Renegade X Win64 UDK editor. Actor indices refer to the current selection and can change whenever selection changes. Object paths returned by scene search are stable for the current loaded map. Viewport point inspection returns an exact UE3 scene-view ray; check cameraRay.approximate before trusting a world hit position. Mutation tools participate in UE3 undo transactions.\\n\\nEditor policy mode is '{}': {} Only the tools this mode permits are listed; the operator sets this in the RenX MCP control panel and it cannot be changed through this connection. If a task needs something the mode forbids, say so rather than looking for another route to the same effect.\"}}",
+        "{{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{{\"tools\":{{\"listChanged\":false}}}},\"serverInfo\":{{\"name\":\"renx-udk-editor\",\"version\":\"0.12.0\"}},\"instructions\":\"Controls the local Renegade X Win64 UDK editor. Actor indices refer to the current selection and can change whenever selection changes. Object paths returned by scene search are stable for the current loaded map. Viewport point inspection returns an exact UE3 scene-view ray; check cameraRay.approximate before trusting a world hit position. Mutation tools participate in UE3 undo transactions.\\n\\nEditor policy mode is '{}': {} Only the tools this mode permits are listed; the operator sets this in the RenX MCP control panel and it cannot be changed through this connection. If a task needs something the mode forbids, say so rather than looking for another route to the same effect.\"}}",
         mode.id(),
         json_escape(mode.describe())
     )
@@ -2304,6 +2322,8 @@ fn tool_capability(tool: &str) -> Option<policy::Capability> {
             policy::Capability::ReadProperties
         }
         "renx_get_map_info" | "renx_get_map_health" => policy::Capability::ReadMap,
+        "renx_get_pie_status" => policy::Capability::ReadPie,
+        "renx_start_pie" | "renx_stop_pie" => policy::Capability::ControlPie,
         "renx_get_viewport_context"
         | "renx_inspect_viewport_point"
         | "renx_capture_viewport" => {
@@ -2380,6 +2400,9 @@ const TOOL_DEFINITIONS: &[(&str, &str)] = &[
     ("renx_find_actors", r#"{"name":"renx_find_actors","description":"Search loaded actors without changing selection. Returns paginated stable object paths, actual classes, levels, maps, and UE3 memory figures. Use a narrow class filter when possible.","inputSchema":{"type":"object","properties":{"class":{"type":"string","default":"Actor","description":"UE3 class; subclasses are included."},"query":{"type":"string","default":"","description":"Case-insensitive substring matched against name, path, or actual class."},"level":{"type":"string","default":"","description":"Optional case-insensitive level-path substring."},"offset":{"type":"integer","minimum":0,"maximum":50000,"default":0},"limit":{"type":"integer","minimum":1,"maximum":200,"default":50}},"additionalProperties":false}}"#),
     ("renx_capture_editor_state", r#"{"name":"renx_capture_editor_state","description":"Store a bounded semantic snapshot of the map, loaded actor identities, selection and selected transforms, plus active camera. Returns a stable snapshotId; no map or selection changes are made.","inputSchema":{"type":"object","properties":{},"additionalProperties":false}}"#),
     ("renx_diff_editor_state", r#"{"name":"renx_diff_editor_state","description":"Compare two retained semantic editor snapshots, or compare one snapshot with a newly captured current state. Reports map, actor, selection, selected-transform, and camera changes without returning bulky unchanged state.","inputSchema":{"type":"object","properties":{"fromSnapshot":{"type":"string","description":"snapshotId returned by renx_capture_editor_state."},"toSnapshot":{"type":"string","description":"Optional retained snapshotId; omit to capture and compare current state."}},"required":["fromSnapshot"],"additionalProperties":false}}"#),
+    ("renx_get_pie_status", r#"{"name":"renx_get_pie_status","description":"Report whether a Play In Editor session is running or queued. Check this before reading or editing anything: while a session runs, property reads see the play world's copy of the map rather than the map on disk, and edits made then are discarded when it ends. pieQueued means a start was requested but has not happened yet.","inputSchema":{"type":"object","properties":{},"additionalProperties":false}}"#),
+    ("renx_start_pie", r#"{"name":"renx_start_pie","description":"Queue a Play In Editor session on the current map, started from its own PlayerStart. This returns as soon as the request is queued - the editor begins the session on one of its own next frames, so poll renx_get_pie_status until pieActive is true rather than assuming it started.","inputSchema":{"type":"object","properties":{},"additionalProperties":false}}"#),
+    ("renx_stop_pie", r#"{"name":"renx_stop_pie","description":"End the running Play In Editor session and return the editor to its own world. Anything that happened during play is discarded. Refuses if no session is running.","inputSchema":{"type":"object","properties":{},"additionalProperties":false}}"#),
     ("renx_get_recent_events", r#"{"name":"renx_get_recent_events","description":"Read a bounded structured tail of MCP calls, policy refusals, failures, and timings from this editor session. Each call reports ms (total), queueWaitMs (time waiting for the editor thread) and executionMs (time on it), so a slow call can be attributed to a busy editor rather than to the bridge; both are null when the call never crossed to the editor thread. Use sinceSequence to poll incrementally; the durable JSONL audit remains on disk.","inputSchema":{"type":"object","properties":{"sinceSequence":{"type":"integer","minimum":0,"default":0},"limit":{"type":"integer","minimum":1,"maximum":200,"default":50}},"additionalProperties":false}}"#),
     ("renx_get_exception_context", r#"{"name":"renx_get_exception_context","description":"Read persistent first-chance Windows exception context, register state, possible previous-session crash candidates, and nearby dump artifacts. First-chance records may have been handled and never imply a confirmed crash by themselves.","inputSchema":{"type":"object","properties":{"sinceSequence":{"type":"integer","minimum":0,"default":0},"limit":{"type":"integer","minimum":1,"maximum":64,"default":32},"includePreviousSessions":{"type":"boolean","default":true}},"additionalProperties":false}}"#),
     ("renx_get_change_state", r#"{"name":"renx_get_change_state","description":"Inspect UE3's native undo/redo history and loaded dirty packages without changing either. Undo and redo entries are ordered with the next action first.","inputSchema":{"type":"object","properties":{"historyLimit":{"type":"integer","minimum":1,"maximum":128,"default":32},"includeCleanPackages":{"type":"boolean","default":false},"packageQuery":{"type":"string","default":"","description":"Optional case-insensitive loaded-package path substring."},"packageLimit":{"type":"integer","minimum":1,"maximum":500,"default":100}},"additionalProperties":false}}"#),
@@ -2715,6 +2738,21 @@ fn dispatch_tool_call(body: &str) -> Result<String, (i32, String)> {
                 Err(error) => Ok(tool_error(&error)),
             }
         }
+        "renx_get_pie_status" => match submit_editor_operation(EditorOperation::PieStatus) {
+            Ok(EditorValue::Json(structured)) => Ok(tool_success(&structured)),
+            Ok(_) => Err((-32603, "unexpected editor result".to_string())),
+            Err(error) => Ok(tool_error(&error)),
+        },
+        "renx_start_pie" => match submit_editor_operation(EditorOperation::PieStart) {
+            Ok(EditorValue::Json(structured)) => Ok(tool_success(&structured)),
+            Ok(_) => Err((-32603, "unexpected editor result".to_string())),
+            Err(error) => Ok(tool_error(&error)),
+        },
+        "renx_stop_pie" => match submit_editor_operation(EditorOperation::PieStop) {
+            Ok(EditorValue::Json(structured)) => Ok(tool_success(&structured)),
+            Ok(_) => Err((-32603, "unexpected editor result".to_string())),
+            Err(error) => Ok(tool_error(&error)),
+        },
         "renx_get_map_info" => match submit_editor_operation(EditorOperation::MapInfo) {
             Ok(EditorValue::Json(structured)) => Ok(tool_success(&structured)),
             Ok(_) => unreachable!(),
@@ -3550,8 +3588,9 @@ mod tests {
         );
     }
 
-    const READ_TOOLS: [&str; 23] = [
+    const READ_TOOLS: [&str; 24] = [
         "renx_get_engine_log",
+        "renx_get_pie_status",
         "renx_get_viewport_context",
         "renx_inspect_viewport_point",
         "renx_focus_viewport_actor",
