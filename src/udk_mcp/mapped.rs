@@ -123,6 +123,11 @@ impl<T: Zeroable> Region<T> {
             .read(true)
             .write(true)
             .create(true)
+            // Stated rather than left to the default, because it is the whole
+            // point: the previous session's contents are the payload, and
+            // truncating on open would discard the evidence at the exact moment
+            // a new session opens the file to read it.
+            .truncate(false)
             .open(&path)
             .map_err(|error| error.to_string())?;
         let size = std::mem::size_of::<T>();
