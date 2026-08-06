@@ -25,6 +25,7 @@ pub mod policy;
 mod assets;
 mod changes;
 mod dependencies;
+pub(crate) mod events;
 pub(crate) mod exceptions;
 mod health;
 mod object;
@@ -410,6 +411,10 @@ extern "C" fn editor_tick_hook(editor: *mut c_void, delta_seconds: f32) {
 
     EDITOR_THIS.store(editor as usize, Ordering::Release);
     let ticks = TICK_COUNT.fetch_add(1, Ordering::Relaxed);
+    // Registered here rather than at DLL attach because `GLog` points at a
+    // static that the executable's own initialisers have not constructed yet at
+    // that point - its critical section does not exist until they run.
+    events::attach();
     start_server_once();
     drain_editor_requests(editor);
     drain_confirmations();
@@ -2164,7 +2169,7 @@ fn handle_json_rpc(body: &str) -> Option<String> {
 fn initialize_result() -> String {
     let mode = policy::current_mode();
     format!(
-        "{{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{{\"tools\":{{\"listChanged\":false}}}},\"serverInfo\":{{\"name\":\"renx-udk-editor\",\"version\":\"0.9.0\"}},\"instructions\":\"Controls the local Renegade X Win64 UDK editor. Actor indices refer to the current selection and can change whenever selection changes. Object paths returned by scene search are stable for the current loaded map. Viewport point inspection returns an exact UE3 scene-view ray; check cameraRay.approximate before trusting a world hit position. Mutation tools participate in UE3 undo transactions.\\n\\nEditor policy mode is '{}': {} Only the tools this mode permits are listed; the operator sets this in the RenX MCP control panel and it cannot be changed through this connection. If a task needs something the mode forbids, say so rather than looking for another route to the same effect.\"}}",
+        "{{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{{\"tools\":{{\"listChanged\":false}}}},\"serverInfo\":{{\"name\":\"renx-udk-editor\",\"version\":\"0.10.0\"}},\"instructions\":\"Controls the local Renegade X Win64 UDK editor. Actor indices refer to the current selection and can change whenever selection changes. Object paths returned by scene search are stable for the current loaded map. Viewport point inspection returns an exact UE3 scene-view ray; check cameraRay.approximate before trusting a world hit position. Mutation tools participate in UE3 undo transactions.\\n\\nEditor policy mode is '{}': {} Only the tools this mode permits are listed; the operator sets this in the RenX MCP control panel and it cannot be changed through this connection. If a task needs something the mode forbids, say so rather than looking for another route to the same effect.\"}}",
         mode.id(),
         json_escape(mode.describe())
     )
@@ -2203,6 +2208,7 @@ fn tool_capability(tool: &str) -> Option<policy::Capability> {
         "renx_get_change_state" | "renx_capture_editor_state" | "renx_diff_editor_state" => {
             policy::Capability::ReadState
         }
+        "renx_get_engine_log" => policy::Capability::ReadLog,
         "renx_set_actor_property" => policy::Capability::WriteActorProperty,
         "renx_set_object_property" => policy::Capability::WriteObjectProperty,
         "renx_exec" => policy::Capability::Exec,
@@ -2270,6 +2276,7 @@ const TOOL_DEFINITIONS: &[(&str, &str)] = &[
     ("renx_get_asset_usage", r#"{"name":"renx_get_asset_usage","description":"Find loaded objects that reference one exact loaded asset/object path using UE3's native reference serializer. Returns external/internal referencers and referencing properties without changing selection.","inputSchema":{"type":"object","properties":{"objectPath":{"type":"string","description":"Exact loaded object path without a class prefix."},"scope":{"type":"string","enum":["all","external","internal"],"default":"all"},"limit":{"type":"integer","minimum":1,"maximum":200,"default":50}},"required":["objectPath"],"additionalProperties":false}}"#),
     ("renx_find_actors_in_volume", r#"{"name":"renx_find_actors_in_volume","description":"Find loaded actors by position: inside a sphere or box, inside the active viewport's view frustum, or nearest to a point. Tests real attached-component bounds by default, so a large actor whose pivot is outside the volume is still found. Results are sorted nearest first then by path. Makes no selection or map change.","inputSchema":{"type":"object","properties":{"shape":{"type":"string","enum":["sphere","box","frustum","nearest"],"default":"sphere"},"originX":{"type":"number"},"originY":{"type":"number"},"originZ":{"type":"number"},"originActor":{"type":"string","description":"Exact loaded actor path to measure from. Omit both this and originX/Y/Z to use the active viewport camera."},"radius":{"type":"number","default":2048,"description":"Sphere and nearest only."},"extentX":{"type":"number","default":1024,"description":"Box half-size along X."},"extentY":{"type":"number","default":1024},"extentZ":{"type":"number","default":1024},"class":{"type":"string","default":"","description":"Optional UE3 class name; subclasses are included."},"level":{"type":"string","default":"","description":"Optional case-insensitive level-path substring."},"useBounds":{"type":"boolean","default":true,"description":"Test component bounds. Set false to test the actor pivot only."},"lineOfSight":{"type":"boolean","default":false,"description":"Trace from the origin to each returned actor and report what blocks it."},"limit":{"type":"integer","minimum":1,"maximum":200,"default":25},"maxScan":{"type":"integer","minimum":1,"maximum":200000,"default":20000}},"additionalProperties":false}}"#),
     ("renx_get_reference_graph", r#"{"name":"renx_get_reference_graph","description":"Walk the reference graph around one exact loaded object. Outbound edges come from UE3's reflected property export and are cheap to follow; inbound edges come from the native referencer scan, where every hop re-serialises all loaded objects, so inbound depth is bounded by maxInboundScans rather than by maxDepth. Native C++ references are visible inbound but not outbound. Makes no selection or map change.","inputSchema":{"type":"object","properties":{"objectPath":{"type":"string","description":"Exact loaded object path without a class prefix."},"direction":{"type":"string","enum":["outbound","inbound","both"],"default":"outbound"},"classFilter":{"type":"string","default":"","description":"Optional bare UE3 class name; only edges whose far end has this exact class are followed."},"maxDepth":{"type":"integer","minimum":1,"maximum":8,"default":2},"maxNodes":{"type":"integer","minimum":1,"maximum":400,"default":60},"maxInboundScans":{"type":"integer","minimum":1,"maximum":8,"default":1,"description":"How many whole-heap referencer scans this call may spend. Each one can take seconds."}},"required":["objectPath"],"additionalProperties":false}}"#),
+    ("renx_get_engine_log", r#"{"name":"renx_get_engine_log","description":"Read a bounded structured tail of the editor's own UE3 log: warnings, errors, script warnings, load/save and build messages, with category, verbosity and sequence. Omit sinceSequence to get the newest lines, then poll with the returned nextSequence. Lines logged before the editor's first tick are not here and categories the engine suppresses never reach it; the on-disk logs cover startup.","inputSchema":{"type":"object","properties":{"sinceSequence":{"type":"integer","minimum":0,"default":0,"description":"Return lines after this sequence. Omit or 0 for the newest page."},"limit":{"type":"integer","minimum":1,"maximum":500,"default":100},"category":{"type":"string","default":"","description":"Optional exact UE3 log category such as Warning, Error, DevLoad, DevSave, or DevShaders."},"minVerbosity":{"type":"string","enum":["log","warning","error"],"default":"log"},"query":{"type":"string","default":"","description":"Optional case-insensitive message substring."}},"additionalProperties":false}}"#),
     ("renx_get_missing_asset_diagnostics", r#"{"name":"renx_get_missing_asset_diagnostics","description":"Scan bounded tails of recent UE3 editor logs for failed asset/package loads and unresolved imports, including referring object/property when UE3 logged them.","inputSchema":{"type":"object","properties":{"query":{"type":"string","default":"","description":"Optional case-insensitive missing path or message substring."},"limit":{"type":"integer","minimum":1,"maximum":200,"default":50},"maxLogFiles":{"type":"integer","minimum":1,"maximum":8,"default":3}},"additionalProperties":false}}"#),
     ("renx_editor_status", "{\"name\":\"renx_editor_status\",\"description\":\"Report whether the Renegade X editor-thread bridge is ready.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}}"),
     ("renx_get_selection_counts", "{\"name\":\"renx_get_selection_counts\",\"description\":\"Return selected actor and selected object counts from the editor.\",\"inputSchema\":{\"type\":\"object\",\"properties\":{},\"additionalProperties\":false}}"),
@@ -2423,6 +2430,31 @@ fn dispatch_tool_call(body: &str) -> Result<String, (i32, String)> {
             let include_previous_sessions =
                 optional_bool(arguments, "includePreviousSessions")?.unwrap_or(true);
             match exceptions::query(since_sequence, limit, include_previous_sessions) {
+                Ok(structured) => Ok(tool_success(&structured)),
+                Err(error) => Err((-32602, error)),
+            }
+        }
+        // Deliberately answered without the editor thread. The ring lives in
+        // this DLL, so the one moment the log matters most - the editor busy or
+        // wedged - is the moment a queued editor operation would never return.
+        "renx_get_engine_log" => {
+            let arguments = json_field_raw(params, "arguments").unwrap_or("{}");
+            let since_sequence = optional_usize(arguments, "sinceSequence")?.unwrap_or(0) as u64;
+            let limit = optional_usize(arguments, "limit")?.unwrap_or(events::DEFAULT_LIMIT);
+            let category = json_field_string(arguments, "category").unwrap_or_default();
+            let query = json_field_string(arguments, "query").unwrap_or_default();
+            let min_verbosity = match json_field_string(arguments, "minVerbosity") {
+                Some(value) => events::Verbosity::parse(&value).map_err(|error| (-32602, error))?,
+                None => events::Verbosity::Log,
+            };
+            let filters = events::Filters {
+                since_sequence,
+                limit,
+                category: &category,
+                min_verbosity,
+                query: &query,
+            };
+            match events::query(&filters) {
                 Ok(structured) => Ok(tool_success(&structured)),
                 Err(error) => Err((-32602, error)),
             }
@@ -3333,7 +3365,8 @@ mod tests {
         );
     }
 
-    const READ_TOOLS: [&str; 22] = [
+    const READ_TOOLS: [&str; 23] = [
+        "renx_get_engine_log",
         "renx_get_viewport_context",
         "renx_inspect_viewport_point",
         "renx_focus_viewport_actor",
