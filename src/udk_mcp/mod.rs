@@ -29,6 +29,7 @@ mod dependencies;
 pub(crate) mod events;
 mod pie;
 pub(crate) mod exceptions;
+pub(crate) mod flight;
 mod health;
 mod mapped;
 mod object;
@@ -293,6 +294,11 @@ struct EditorRequest {
     /// makes a retry safe, and it is paired with `started` rather than trusted
     /// alone, because work already underway cannot be recalled.
     cancelled: std::sync::Arc<AtomicBool>,
+    /// What to say the editor thread is doing while it runs this, copied from
+    /// the submitting thread's flight record. A crash with that record still
+    /// published is the only direct evidence that the editor died *inside* a
+    /// bridge operation rather than merely during one.
+    intent: Option<flight::Handoff>,
     response: SyncSender<(Result<EditorValue, String>, EditorTiming)>,
 }
 
@@ -527,7 +533,15 @@ fn drain_editor_requests(editor: *mut c_void) {
             // which is what the caller's `recv` already gave up on.
             continue;
         }
+        // Bracketing the one call that can take the process down with it. If
+        // the editor slot is found still published afterwards, the fault
+        // happened between this line and the guard's drop.
+        let editor_intent = request
+            .intent
+            .as_ref()
+            .and_then(|work| flight::enter_editor(work));
         let result = guard_and_execute(editor, request.operation, &request.guards);
+        drop(editor_intent);
         let timing = EditorTiming {
             queue_wait,
             execution: started.elapsed(),
@@ -1625,6 +1639,10 @@ fn submit_guarded(operation: EditorOperation, guards: Guards) -> Result<EditorVa
     let (sender, receiver) = mpsc::sync_channel(1);
     let started = std::sync::Arc::new(AtomicBool::new(false));
     let cancelled = std::sync::Arc::new(AtomicBool::new(false));
+    // Copied here rather than read from the drain: by the time the editor
+    // thread reaches the request, this thread may have given up waiting and
+    // released its record to the next call.
+    let intent = flight::handoff();
     {
         let mut queue = request_queue()
             .lock()
@@ -1638,21 +1656,28 @@ fn submit_guarded(operation: EditorOperation, guards: Guards) -> Result<EditorVa
             queued_at: Instant::now(),
             started: started.clone(),
             cancelled: cancelled.clone(),
+            intent,
             response: sender,
         });
     }
+    flight::set_phase(flight::Phase::Queued);
     // Work is done on the editor's own thread, which only runs it between
     // frames. Anything that suspends the editor's loop - an open menu, a modal
     // dialog, a long import or build - stops that thread from getting here, and
     // the symptom is this timeout. Saying so matters because the alternative
     // reading is "the bridge is broken", which it is not.
-    let (result, timing) = receiver.recv_timeout(timeout).map_err(|_| {
+    let waited = receiver.recv_timeout(timeout).map_err(|_| {
         // Cancel first, then ask whether it had already begun - the drain does
         // the mirror of this, so between them the outcome is never ambiguous in
         // the unsafe direction.
         cancelled.store(true, Ordering::SeqCst);
         timeout_message(started.load(Ordering::SeqCst), timeout)
-    })?;
+    });
+    // On both paths, including the timeout: this thread is no longer waiting on
+    // the editor, and a record left saying otherwise would describe a queue
+    // position that no longer exists.
+    flight::set_phase(flight::Phase::Bridge);
+    let (result, timing) = waited?;
     // A timeout leaves this unrecorded on purpose. The request is still in the
     // queue and may run minutes later against a receiver nobody holds, so there
     // is no honest split to report for the call that gave up - only the total,
@@ -2322,7 +2347,7 @@ fn handle_json_rpc(body: &str) -> Option<String> {
 fn initialize_result() -> String {
     let mode = policy::current_mode();
     format!(
-        "{{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{{\"tools\":{{\"listChanged\":false}}}},\"serverInfo\":{{\"name\":\"renx-udk-editor\",\"version\":\"0.12.0\"}},\"instructions\":\"Controls the local Renegade X Win64 UDK editor. Actor indices refer to the current selection and can change whenever selection changes. Object paths returned by scene search are stable for the current loaded map. Viewport point inspection returns an exact UE3 scene-view ray; check cameraRay.approximate before trusting a world hit position. Mutation tools participate in UE3 undo transactions.\\n\\nEditor policy mode is '{}': {} Only the tools this mode permits are listed; the operator sets this in the RenX MCP control panel and it cannot be changed through this connection. If a task needs something the mode forbids, say so rather than looking for another route to the same effect.\"}}",
+        "{{\"protocolVersion\":\"2025-11-25\",\"capabilities\":{{\"tools\":{{\"listChanged\":false}}}},\"serverInfo\":{{\"name\":\"renx-udk-editor\",\"version\":\"0.13.0\"}},\"instructions\":\"Controls the local Renegade X Win64 UDK editor. Actor indices refer to the current selection and can change whenever selection changes. Object paths returned by scene search are stable for the current loaded map. Viewport point inspection returns an exact UE3 scene-view ray; check cameraRay.approximate before trusting a world hit position. Mutation tools participate in UE3 undo transactions.\\n\\nEditor policy mode is '{}': {} Only the tools this mode permits are listed; the operator sets this in the RenX MCP control panel and it cannot be changed through this connection. If a task needs something the mode forbids, say so rather than looking for another route to the same effect.\"}}",
         mode.id(),
         json_escape(mode.describe())
     )
@@ -2428,7 +2453,7 @@ const TOOL_DEFINITIONS: &[(&str, &str)] = &[
     ("renx_get_pie_status", r#"{"name":"renx_get_pie_status","description":"Report whether a Play In Editor session is running or queued. Check this before reading or editing anything: while a session runs, property reads see the play world's copy of the map rather than the map on disk, and edits made then are discarded when it ends. pieQueued means a start was requested but has not happened yet.","inputSchema":{"type":"object","properties":{},"additionalProperties":false}}"#),
     ("renx_start_pie", r#"{"name":"renx_start_pie","description":"Queue a Play In Editor session on the current map, started from its own PlayerStart. This returns as soon as the request is queued - the editor begins the session on one of its own next frames, so poll renx_get_pie_status until pieActive is true rather than assuming it started.","inputSchema":{"type":"object","properties":{},"additionalProperties":false}}"#),
     ("renx_stop_pie", r#"{"name":"renx_stop_pie","description":"End the running Play In Editor session and return the editor to its own world. Anything that happened during play is discarded. Refuses if no session is running.","inputSchema":{"type":"object","properties":{},"additionalProperties":false}}"#),
-    ("renx_get_recent_events", r#"{"name":"renx_get_recent_events","description":"Read a bounded structured tail of MCP calls, policy refusals, failures, and timings from this editor session. Each call reports ms (total), queueWaitMs (time waiting for the editor thread) and executionMs (time on it), so a slow call can be attributed to a busy editor rather than to the bridge; both are null when the call never crossed to the editor thread. Use sinceSequence to poll incrementally; the durable JSONL audit remains on disk.","inputSchema":{"type":"object","properties":{"sinceSequence":{"type":"integer","minimum":0,"default":0},"limit":{"type":"integer","minimum":1,"maximum":200,"default":50}},"additionalProperties":false}}"#),
+    ("renx_get_recent_events", r#"{"name":"renx_get_recent_events","description":"Read a bounded structured tail of MCP calls, policy refusals, failures, and timings. Records are kept in a memory-mapped file and survive a crash, so this also reports the previous editor session: interruptedCalls lists calls that never returned because that session ended, with a phase saying how far each got (only the editor phase means the editor thread was inside the operation), and previousSessionEndedCleanly separates a crash from a normal close. Call this first after an unexpected disconnect. Each call reports ms (total), queueWaitMs (time waiting for the editor thread) and executionMs (time on it), both null when the call never crossed to the editor thread. Sequence numbers do not restart between sessions, so sinceSequence polls incrementally across a restart; the durable JSONL audit remains on disk.","inputSchema":{"type":"object","properties":{"sinceSequence":{"type":"integer","minimum":0,"default":0},"limit":{"type":"integer","minimum":1,"maximum":200,"default":50},"includePreviousSessions":{"type":"boolean","default":true,"description":"Set false to see only this session's calls."}},"additionalProperties":false}}"#),
     ("renx_get_exception_context", r#"{"name":"renx_get_exception_context","description":"Read persistent first-chance Windows exception context, register state, possible previous-session crash candidates, and nearby dump artifacts. First-chance records may have been handled and never imply a confirmed crash by themselves.","inputSchema":{"type":"object","properties":{"sinceSequence":{"type":"integer","minimum":0,"default":0},"limit":{"type":"integer","minimum":1,"maximum":64,"default":32},"includePreviousSessions":{"type":"boolean","default":true}},"additionalProperties":false}}"#),
     ("renx_get_change_state", r#"{"name":"renx_get_change_state","description":"Inspect UE3's native undo/redo history and loaded dirty packages without changing either. Undo and redo entries are ordered with the next action first.","inputSchema":{"type":"object","properties":{"historyLimit":{"type":"integer","minimum":1,"maximum":128,"default":32},"includeCleanPackages":{"type":"boolean","default":false},"packageQuery":{"type":"string","default":"","description":"Optional case-insensitive loaded-package path substring."},"packageLimit":{"type":"integer","minimum":1,"maximum":500,"default":100}},"additionalProperties":false}}"#),
     ("renx_get_asset_usage", r#"{"name":"renx_get_asset_usage","description":"Find loaded objects that reference one exact loaded asset/object path using UE3's native reference serializer. Returns external/internal referencers and referencing properties without changing selection.","inputSchema":{"type":"object","properties":{"objectPath":{"type":"string","description":"Exact loaded object path without a class prefix."},"scope":{"type":"string","enum":["all","external","internal"],"default":"all"},"limit":{"type":"integer","minimum":1,"maximum":200,"default":50}},"required":["objectPath"],"additionalProperties":false}}"#),
@@ -2468,6 +2493,12 @@ fn tools_call(body: &str) -> Result<String, (i32, String)> {
         .and_then(|params| json_field_raw(params, "arguments"))
         .unwrap_or("{}")
         .to_string();
+
+    // Published before the work starts, cleared when it returns, and written
+    // somewhere that outlives this process. The audit line below is only
+    // reachable by a call that came back; this is the record for one that does
+    // not, which is the case nobody could previously reconstruct.
+    let _intent = flight::begin(&name, &arguments);
 
     let result = dispatch_tool_call(body);
 
@@ -2589,7 +2620,9 @@ fn dispatch_tool_call(body: &str) -> Result<String, (i32, String)> {
             let arguments = json_field_raw(params, "arguments").unwrap_or("{}");
             let since_sequence = optional_usize(arguments, "sinceSequence")?.unwrap_or(0) as u64;
             let limit = optional_usize(arguments, "limit")?.unwrap_or(audit::DEFAULT_RECENT_LIMIT);
-            match audit::recent_json(since_sequence, limit) {
+            let include_previous_sessions =
+                optional_bool(arguments, "includePreviousSessions")?.unwrap_or(true);
+            match audit::recent_json(since_sequence, limit, include_previous_sessions) {
                 Ok(structured) => Ok(tool_success(&structured)),
                 Err(error) => Err((-32602, error)),
             }
@@ -3424,6 +3457,9 @@ pub fn init() -> anyhow::Result<()> {
     }
     let tick = validate_tick_hook()?;
     exceptions::init().context("failed to initialize persistent exception context capture")?;
+    // After the exception log, so both stamp their records with one session id
+    // and a crash can be matched to the call that was running when it happened.
+    flight::init();
     unsafe {
         EditorTickHook
             .initialize(tick, |editor, delta_seconds| {

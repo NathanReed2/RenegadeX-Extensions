@@ -41,6 +41,10 @@ pub extern "system" fn DllMain(
             #[cfg(target_arch = "x86_64")]
             {
                 crate::udk_mcp::exceptions::mark_clean_shutdown();
+                // Both records carry the flag, and both are read together: an
+                // unfinished call means a crash only if the session it belongs
+                // to also failed to reach this line.
+                crate::udk_mcp::flight::mark_clean_shutdown();
                 // A non-null reserved parameter means the process is exiting: the
                 // loader has already stopped every other thread, `GLog` has
                 // normally torn its device array down through `appExit`, and the
