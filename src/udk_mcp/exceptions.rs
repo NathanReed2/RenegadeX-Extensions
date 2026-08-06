@@ -265,6 +265,13 @@ pub(super) fn init() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The id this session's records are stamped with, or `0` before capture has
+/// started. Shared with the flight recorder so a crash and the call that was
+/// running when it happened can be recognised as the same event.
+pub(super) fn session_id() -> u64 {
+    SESSION_ID.load(Ordering::Acquire)
+}
+
 pub(crate) fn mark_clean_shutdown() {
     let log = ACTIVE_LOG.load(Ordering::Acquire);
     if !log.is_null() {
